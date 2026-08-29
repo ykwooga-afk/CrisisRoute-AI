@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 520" role="img" aria-labelledby="title desc">
+  <title id="title">CrisisRoute haze command map</title>
+  <desc id="desc">A stylized command map for Malaysia haze and fire-smoke response, showing campus incidents, volunteer routes, verification states and resource hub.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#09251f"/>
+      <stop offset="0.48" stop-color="#145746"/>
+      <stop offset="1" stop-color="#e2a53a"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.04"/>
+    </linearGradient>
+    <filter id="blur">
+      <feGaussianBlur stdDeviation="9"/>
+    </filter>
+  </defs>
+
+  <rect width="920" height="520" rx="8" fill="url(#bg)"/>
+  <g opacity="0.18" stroke="#fffdf8" stroke-width="1">
+    <path d="M0 86H920M0 174H920M0 262H920M0 350H920M0 438H920"/>
+    <path d="M95 0V520M218 0V520M341 0V520M464 0V520M587 0V520M710 0V520M833 0V520"/>
+  </g>
+  <path d="M-30 154 C120 92 260 152 382 118 C526 78 638 162 780 108 C860 78 908 86 960 104" fill="none" stroke="#f7f1d0" stroke-opacity="0.16" stroke-width="42" stroke-linecap="round" filter="url(#blur)"/>
+  <path d="M-20 372 C148 284 250 346 404 300 C540 260 668 308 812 228 C880 190 932 196 980 214" fill="none" stroke="#d5f2d4" stroke-opacity="0.18" stroke-width="38" stroke-linecap="round" filter="url(#blur)"/>
+
+  <rect x="34" y="34" width="852" height="452" rx="8" fill="url(#panel)" stroke="#fffdf8" stroke-opacity="0.26"/>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M190 148 L352 214 L476 170 L618 254 L744 208" stroke="#fffdf8" stroke-opacity="0.22" stroke-width="5"/>
+    <path d="M352 214 L426 356 L612 394 L744 208" stroke="#fffdf8" stroke-opacity="0.18" stroke-width="5"/>
+    <path d="M476 170 L548 96 L744 208" stroke="#fffdf8" stroke-opacity="0.16" stroke-width="5"/>
+    <path d="M190 148 C260 122 310 146 352 214" stroke="#4ade80" stroke-width="6" stroke-dasharray="10 12"/>
+    <path d="M190 148 C302 220 370 268 426 356" stroke="#fbbf24" stroke-width="6" stroke-dasharray="10 12"/>
+    <path d="M190 148 C356 192 464 230 618 254" stroke="#38bdf8" stroke-width="6" stroke-dasharray="10 12"/>
+  </g>
+
+  <g font-family="Segoe UI, Arial, sans-serif">
+    <g transform="translate(190 148)">
+      <rect x="-62" y="-36" width="124" height="72" rx="8" fill="#fffdf8"/>
+      <text x="0" y="-7" text-anchor="middle" fill="#103b33" font-size="15" font-weight="800">RESOURCE</text>
+      <text x="0" y="15" text-anchor="middle" fill="#0e9488" font-size="19" font-weight="900">HUB</text>
+    </g>
+
+    <g transform="translate(352 214)">
+      <rect x="-72" y="-42" width="144" height="84" rx="8" fill="#fff3ed" stroke="#fb8b74" stroke-width="2"/>
+      <text x="0" y="-13" text-anchor="middle" fill="#9f2419" font-size="14" font-weight="900">BLOCK C</text>
+      <text x="0" y="9" text-anchor="middle" fill="#172326" font-size="12" font-weight="700">asthma + cough</text>
+      <text x="0" y="29" text-anchor="middle" fill="#9f2419" font-size="12" font-weight="900">READY</text>
+    </g>
+
+    <g transform="translate(426 356)">
+      <rect x="-82" y="-42" width="164" height="84" rx="8" fill="#fff8e8" stroke="#f0b94b" stroke-width="2"/>
+      <text x="0" y="-13" text-anchor="middle" fill="#915c0c" font-size="14" font-weight="900">SHAH ALAM</text>
+      <text x="0" y="9" text-anchor="middle" fill="#172326" font-size="12" font-weight="700">elderly breathing risk</text>
+      <text x="0" y="29" text-anchor="middle" fill="#915c0c" font-size="12" font-weight="900">VERIFY FIRST</text>
+    </g>
+
+    <g transform="translate(618 254)">
+      <rect x="-76" y="-42" width="152" height="84" rx="8" fill="#eef3f1" stroke="#9eb5ae" stroke-width="2"/>
+      <text x="0" y="-13" text-anchor="middle" fill="#4f5d64" font-size="14" font-weight="900">HOSTEL B</text>
+      <text x="0" y="9" text-anchor="middle" fill="#172326" font-size="12" font-weight="700">duplicate forward</text>
+      <text x="0" y="29" text-anchor="middle" fill="#4f5d64" font-size="12" font-weight="900">MERGE</text>
+    </g>
+
+    <g transform="translate(744 208)">
+      <rect x="-80" y="-42" width="160" height="84" rx="8" fill="#f3efff" stroke="#a78bfa" stroke-width="2"/>
+      <text x="0" y="-13" text-anchor="middle" fill="#5d2bc1" font-size="14" font-weight="900">CAMPUS FIELD</text>
+      <text x="0" y="9" text-anchor="middle" fill="#172326" font-size="12" font-weight="700">notice conflict</text>
+      <text x="0" y="29" text-anchor="middle" fill="#5d2bc1" font-size="12" font-weight="900">REVIEW</text>
+    </g>
+
+    <g transform="translate(612 394)">
+      <rect x="-72" y="-38" width="144" height="76" rx="8" fill="#e7f7f4" stroke="#5eead4" stroke-width="2"/>
+      <text x="0" y="-9" text-anchor="middle" fill="#103b33" font-size="14" font-weight="900">SAFE ROOM</text>
+      <text x="0" y="13" text-anchor="middle" fill="#172326" font-size="12" font-weight="700">supply run</text>
+      <text x="0" y="31" text-anchor="middle" fill="#0e9488" font-size="12" font-weight="900">QUEUED</text>
+    </g>
+  </g>
+
+  <g font-family="Segoe UI, Arial, sans-serif" fill="#fffdf8">
+    <text x="58" y="78" font-size="25" font-weight="900">CrisisRoute AI Command Map</text>
+    <text x="58" y="106" font-size="14" opacity="0.78">Evidence, model challenge and human approval before dispatch</text>
+    <text x="58" y="462" font-size="13" opacity="0.80">Gonka Analyst + Skeptical Reviewer -> Safety Gates -> Action Brief</text>
+  </g>
+</svg>

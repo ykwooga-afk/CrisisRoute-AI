@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://crisisroute.ai/schemas/incident.schema.json",
+  "title": "CrisisRouteIncident",
+  "type": "object",
+  "required": [
+    "caseId",
+    "rawMessage",
+    "source",
+    "receivedAt",
+    "claims",
+    "evidence",
+    "scores",
+    "operationalState",
+    "missingFields",
+    "modelDebate",
+    "safetyGates",
+    "recommendedAction",
+    "gonka",
+    "humanDecision"
+  ],
+  "properties": {
+    "caseId": { "type": "string" },
+    "label": { "type": "string" },
+    "title": { "type": "string" },
+    "rawMessage": { "type": "string" },
+    "source": { "type": "string" },
+    "receivedAt": { "type": "string" },
+    "location": { "type": "string" },
+    "coordinates": { "type": "string" },
+    "aqi": { "type": "number" },
+    "peopleCount": { "type": ["number", "null"] },
+    "needs": { "type": "array", "items": { "type": "string" } },
+    "riskFlags": { "type": "array", "items": { "type": "string" } },
+    "knownFacts": { "type": "array", "items": { "type": "string" } },
+    "unknownFacts": { "type": "array", "items": { "type": "string" } },
+    "priorityRationale": { "type": "string" },
+    "insight": { "type": "string" },
+    "safeNextActions": { "type": "array", "items": { "type": "string" } },
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "text", "status", "evidenceIds"],
+        "properties": {
+          "id": { "type": "string" },
+          "text": { "type": "string" },
+          "status": { "type": "string" },
+          "evidenceIds": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "type", "summary", "retrievedAt"],
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "type": "string" },
+          "summary": { "type": "string" },
+          "retrievedAt": { "type": "string" },
+          "reliability": { "type": "string" },
+          "contradictions": { "type": "string" },
+          "uncertainties": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "scores": {
+      "type": "object",
+      "required": ["verification", "urgency", "actionability"],
+      "properties": {
+        "verification": { "type": "number", "minimum": 0, "maximum": 100 },
+        "urgency": { "type": "number", "minimum": 0, "maximum": 100 },
+        "actionability": { "type": "number", "minimum": 0, "maximum": 100 }
+      }
+    },
+    "operationalState": { "type": "string" },
+    "missingFields": { "type": "array", "items": { "type": "string" } },
+    "modelDebate": {
+      "type": "object",
+      "required": ["agreement", "disagreement", "counterEvidence", "consensus"],
+      "properties": {
+        "agreement": { "type": "array", "items": { "type": "string" } },
+        "disagreement": { "type": "array", "items": { "type": "string" } },
+        "counterEvidence": { "type": "array", "items": { "type": "string" } },
+        "consensus": { "type": "string" }
+      }
+    },
+    "safetyGates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "passed", "detail"],
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": "string" },
+          "status": { "type": "string" },
+          "passed": { "type": "boolean" },
+          "detail": { "type": "string" }
+        }
+      }
+    },
+    "recommendedAction": { "type": "string" },
+    "actionPlan": { "type": ["object", "null"] },
+    "actionBrief": { "type": ["object", "null"] },
+    "proofCapsule": { "type": ["object", "null"] },
+    "gonka": {
+      "type": "object",
+      "properties": {
+        "mode": { "type": "string" },
+        "analyst": {
+          "type": "object",
+          "properties": {
+            "model": { "type": "string" },
+            "responseId": { "type": "string" },
+            "promptVersion": { "type": "string" },
+            "latencyMs": { "type": "number" }
+          }
+        },
+        "reviewer": {
+          "type": "object",
+          "properties": {
+            "model": { "type": "string" },
+            "responseId": { "type": "string" },
+            "promptVersion": { "type": "string" },
+            "latencyMs": { "type": "number" }
+          }
+        }
+      }
+    },
+    "modelReviews": { "type": "object" },
+    "humanDecision": { "type": ["object", "null"] }
+  }
+}

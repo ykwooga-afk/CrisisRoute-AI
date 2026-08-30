@@ -3,8 +3,27 @@ const fs = require("fs");
 const path = require("path");
 
 const root = __dirname;
+const srcRoot = path.resolve(root, "src");
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 4173);
+
+const publicRootFiles = new Map([
+  ["/", "index.html"],
+  ["/index.html", "index.html"],
+  ["/CrisisRoute-AI-Latest-App.html", "CrisisRoute-AI-Latest-App.html"]
+]);
+
+const publicSrcExtensions = new Set([
+  ".html",
+  ".css",
+  ".js",
+  ".json",
+  ".svg",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".ico"
+]);
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -71,29 +90,110 @@ async function handleApi(req, res) {
   return sendJson(res, 404, { ok: false, message: "API route not found" });
 }
 
-function serveStatic(req, res) {
-  const url = new URL(req.url || "/", `http://${req.headers.host}`);
-  let pathname = decodeURIComponent(url.pathname);
-  if (pathname === "/") pathname = "/index.html";
+function sendStaticText(res, status, message, extraHeaders = {}, headOnly = false) {
+  const body = Buffer.from(message, "utf8");
+  res.writeHead(status, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Content-Length": body.length,
+    "X-Content-Type-Options": "nosniff",
+    ...extraHeaders
+  });
+  res.end(headOnly ? undefined : body);
+}
 
-  const filePath = path.normalize(path.join(root, pathname));
-  if (!filePath.startsWith(root)) {
-    res.writeHead(403);
-    res.end("Forbidden");
+function resolveStaticFile(requestTarget) {
+  if (
+    typeof requestTarget !== "string" ||
+    !requestTarget.startsWith("/") ||
+    requestTarget.startsWith("//") ||
+    requestTarget.includes("\\")
+  ) {
+    return null;
+  }
+
+  const separatorIndex = requestTarget.search(/[?#]/);
+  const rawPathname = separatorIndex === -1
+    ? requestTarget
+    : requestTarget.slice(0, separatorIndex);
+
+  let pathname;
+  try {
+    pathname = decodeURIComponent(rawPathname);
+  } catch {
+    return null;
+  }
+
+  if (
+    pathname.includes("\0") ||
+    pathname.includes("\\") ||
+    !pathname.startsWith("/") ||
+    pathname.startsWith("//")
+  ) {
+    return null;
+  }
+
+  const segments = pathname.split("/").slice(1);
+  if (segments.some(segment => segment.startsWith(".") || segment.includes(":"))) {
+    return null;
+  }
+
+  const rootFile = publicRootFiles.get(pathname);
+  if (rootFile) {
+    const filePath = path.resolve(root, rootFile);
+    return path.dirname(filePath) === root ? filePath : null;
+  }
+
+  if (!pathname.startsWith("/src/") || segments.length < 2) {
+    return null;
+  }
+
+  const relativeSegments = segments.slice(1);
+  if (relativeSegments.some(segment => segment.length === 0)) {
+    return null;
+  }
+
+  const filePath = path.resolve(srcRoot, ...relativeSegments);
+  const relativePath = path.relative(srcRoot, filePath);
+  const extension = path.extname(filePath).toLowerCase();
+  if (
+    !relativePath ||
+    relativePath.startsWith("..") ||
+    path.isAbsolute(relativePath) ||
+    !publicSrcExtensions.has(extension)
+  ) {
+    return null;
+  }
+
+  return filePath;
+}
+
+async function serveStatic(req, res) {
+  const filePath = resolveStaticFile(req.url || "/");
+  if (!filePath) {
+    sendStaticText(res, 404, "Not found", {}, req.method === "HEAD");
     return;
   }
 
-  fs.readFile(filePath, (error, content) => {
-    if (error) {
-      res.writeHead(404);
-      res.end("Not found");
-      return;
-    }
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    sendStaticText(res, 405, "Method not allowed", { Allow: "GET, HEAD" });
+    return;
+  }
 
-    const ext = path.extname(filePath).toLowerCase();
-    res.writeHead(200, { "Content-Type": mimeTypes[ext] || "application/octet-stream" });
-    res.end(content);
+  let content;
+  try {
+    content = await fs.promises.readFile(filePath);
+  } catch {
+    sendStaticText(res, 404, "Not found", {}, req.method === "HEAD");
+    return;
+  }
+
+  const ext = path.extname(filePath).toLowerCase();
+  res.writeHead(200, {
+    "Content-Type": mimeTypes[ext],
+    "Content-Length": content.length,
+    "X-Content-Type-Options": "nosniff"
   });
+  res.end(req.method === "HEAD" ? undefined : content);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -102,9 +202,9 @@ const server = http.createServer(async (req, res) => {
       await handleApi(req, res);
       return;
     }
-    serveStatic(req, res);
+    await serveStatic(req, res);
   } catch (error) {
-    sendJson(res, 500, { ok: false, message: error.message });
+    sendJson(res, 500, { ok: false, message: "Internal server error" });
   }
 });
 

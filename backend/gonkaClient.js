@@ -7,6 +7,7 @@ const DEFAULT_MODELS = Object.freeze({
 });
 
 const DEFAULT_TIMEOUT_MS = 20_000;
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const clientSecrets = new WeakMap();
 
 const ERROR_MESSAGES = Object.freeze({
@@ -235,6 +236,8 @@ class GonkaClient {
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const startedAt = performance.now();
     let response;
+    let rawResponse;
+    let payload;
 
     this.requestCount += 1;
     try {
@@ -254,62 +257,86 @@ class GonkaClient {
         }),
         signal: controller.signal
       });
-    } catch {
+      if (!response || typeof response.ok !== "boolean") {
+        throw new GonkaClientError("INVALID_RESPONSE");
+      }
+
+      if (!response.ok) {
+        if (response.body) await response.body.cancel().catch(() => {});
+        throw new GonkaClientError("HTTP_ERROR", {
+          status: response.status,
+          retryable: isRetryableHttpStatus(response.status)
+        });
+      }
+
+      const declaredLength = response.headers?.get?.("content-length");
+      if (typeof declaredLength === "string" && /^\d+$/.test(declaredLength.trim()) &&
+          BigInt(declaredLength.trim()) > BigInt(MAX_RESPONSE_BYTES)) {
+        if (response.body) await response.body.cancel().catch(() => {});
+        throw new GonkaClientError("INVALID_RESPONSE");
+      }
+
+      try {
+        rawResponse = await response.text();
+      } catch {
+        throw new GonkaClientError("INVALID_RESPONSE");
+      }
+      if (Buffer.byteLength(rawResponse, "utf8") > MAX_RESPONSE_BYTES) {
+        throw new GonkaClientError("INVALID_RESPONSE");
+      }
+
+      try {
+        payload = JSON.parse(rawResponse);
+      } catch {
+        throw new GonkaClientError("INVALID_RESPONSE");
+      }
+
+      if (!isJsonObject(payload) ||
+          typeof payload.id !== "string" ||
+          !payload.id.trim() ||
+          !Array.isArray(payload.choices) ||
+          payload.choices.length === 0) {
+        throw new GonkaClientError("INVALID_RESPONSE");
+      }
+
+      const choice = payload.choices[0];
+      if (!isJsonObject(choice) ||
+          !isJsonObject(choice.message) ||
+          typeof choice.message.content !== "string") {
+        throw new GonkaClientError("INVALID_RESPONSE", {
+          responseId: payload.id
+        });
+      }
+
+      const data = extractStructuredJson(choice.message.content);
+      const trace = {
+        responseId: payload.id,
+        model: typeof payload.model === "string" && payload.model.trim()
+          ? payload.model
+          : model,
+        finishReason: typeof choice.finish_reason === "string"
+          ? choice.finish_reason
+          : null,
+        latencyMs: Math.round(performance.now() - startedAt),
+        usage: normalizeUsage(payload.usage)
+      };
+
+      return { data, trace };
+    } catch (error) {
       if (controller.signal.aborted) {
         throw new GonkaClientError("TIMEOUT", { retryable: true });
       }
-      throw new GonkaClientError("NETWORK_ERROR", { retryable: true });
+      if (error instanceof GonkaClientError) throw error;
+      throw new GonkaClientError(
+        response ? "INVALID_RESPONSE" : "NETWORK_ERROR",
+        { retryable: response ? false : true }
+      );
     } finally {
       clearTimeout(timeout);
+      response = null;
+      rawResponse = null;
+      payload = null;
     }
-
-    if (!response.ok) {
-      if (response.body) await response.body.cancel().catch(() => {});
-      throw new GonkaClientError("HTTP_ERROR", {
-        status: response.status,
-        retryable: isRetryableHttpStatus(response.status)
-      });
-    }
-
-    let payload;
-    try {
-      payload = await response.json();
-    } catch {
-      throw new GonkaClientError("INVALID_RESPONSE");
-    }
-
-    if (!isJsonObject(payload) ||
-        typeof payload.id !== "string" ||
-        !payload.id.trim() ||
-        !Array.isArray(payload.choices) ||
-        payload.choices.length === 0) {
-      throw new GonkaClientError("INVALID_RESPONSE");
-    }
-
-    const choice = payload.choices[0];
-    if (!isJsonObject(choice) ||
-        !isJsonObject(choice.message) ||
-        typeof choice.message.content !== "string") {
-      throw new GonkaClientError("INVALID_RESPONSE", {
-        responseId: payload.id
-      });
-    }
-
-    const data = extractStructuredJson(choice.message.content);
-    const trace = {
-      responseId: payload.id,
-      model: typeof payload.model === "string" && payload.model.trim()
-        ? payload.model
-        : model,
-      finishReason: typeof choice.finish_reason === "string"
-        ? choice.finish_reason
-        : null,
-      latencyMs: Math.round(performance.now() - startedAt),
-      usage: normalizeUsage(payload.usage)
-    };
-
-    payload = null;
-    return { data, trace };
   }
 }
 
@@ -331,5 +358,6 @@ module.exports = {
   createGonkaClientFromEnv,
   extractStructuredJson,
   DEFAULT_GONKA_BASE_URL,
-  DEFAULT_MODELS
+  DEFAULT_MODELS,
+  MAX_RESPONSE_BYTES
 };

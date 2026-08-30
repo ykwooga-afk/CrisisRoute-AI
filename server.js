@@ -1,6 +1,16 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const {
+  GonkaClientError,
+  createGonkaClientFromEnv,
+  DEFAULT_GONKA_BASE_URL,
+  DEFAULT_MODELS
+} = require("./backend/gonkaClient");
+const {
+  IncidentPipelineError,
+  analyzeCase01
+} = require("./backend/incidentPipeline");
 
 const root = __dirname;
 const srcRoot = path.resolve(root, "src");
@@ -57,17 +67,133 @@ function readBody(req) {
   });
 }
 
-async function handleApi(req, res) {
+function getLiveConfiguration(gonkaClientFactory) {
+  try {
+    const client = gonkaClientFactory();
+    return { ready: true, client };
+  } catch {
+    return { ready: false, client: null };
+  }
+}
+
+function mapApiError(error) {
+  if (error instanceof IncidentPipelineError) {
+    if (error.code === "INVALID_REQUEST") {
+      return { status: 400, code: error.code, message: "Request body or messages are invalid.", retryable: false };
+    }
+    if (error.code === "INVALID_MODEL_DATA") {
+      return {
+        status: 502,
+        code: error.code,
+        message: error.message,
+        retryable: false,
+        role: error.role,
+        issues: error.issues
+      };
+    }
+    if (error.code === "CONFIGURATION_ERROR") {
+      return { status: 503, code: error.code, message: "Live Gonka configuration is unavailable.", retryable: false };
+    }
+    if (error.code === "TIMEOUT") {
+      return {
+        status: 504,
+        code: error.code,
+        message: error.message,
+        retryable: true,
+        role: error.role
+      };
+    }
+    if (error.code === "UPSTREAM_ERROR") {
+      return { status: 502, code: error.code, message: error.message, retryable: true };
+    }
+  }
+
+  if (error instanceof GonkaClientError) {
+    if (error.code === "MISSING_API_KEY" || error.code === "INVALID_BASE_URL") {
+      return { status: 503, code: error.code, message: "Live Gonka configuration is unavailable.", retryable: false };
+    }
+    if (error.code === "TIMEOUT") {
+      return { status: 504, code: error.code, message: "Gonka analysis timed out.", retryable: true };
+    }
+    if (["NETWORK_ERROR", "HTTP_ERROR", "INVALID_RESPONSE", "INVALID_JSON"].includes(error.code)) {
+      return {
+        status: 502,
+        code: error.code,
+        message: "Gonka analysis returned an unavailable or invalid upstream response.",
+        retryable: error.retryable === true
+      };
+    }
+  }
+
+  return { status: 500, code: "INTERNAL_ERROR", message: "Internal server error.", retryable: false };
+}
+
+function sendApiError(res, error) {
+  const mapped = mapApiError(error);
+  const publicError = {
+    code: mapped.code,
+    message: mapped.message,
+    retryable: mapped.retryable
+  };
+  if (["analyst", "reviewer", "both"].includes(mapped.role)) {
+    publicError.role = mapped.role;
+  }
+  if (Array.isArray(mapped.issues)) {
+    publicError.issues = mapped.issues.slice(0, 5);
+  }
+  return sendJson(res, mapped.status, {
+    ok: false,
+    error: publicError
+  });
+}
+
+async function parseJsonBody(req) {
+  let rawBody;
+  try {
+    rawBody = await readBody(req);
+  } catch {
+    throw new IncidentPipelineError("INVALID_REQUEST", "Request body is invalid.");
+  }
+  try {
+    return JSON.parse(rawBody);
+  } catch {
+    throw new IncidentPipelineError("INVALID_REQUEST", "Request body is invalid JSON.");
+  }
+}
+
+async function handleApi(req, res, { gonkaClientFactory }) {
   if (req.method === "GET" && req.url === "/api/health/gonka") {
+    const configuration = getLiveConfiguration(gonkaClientFactory);
     return sendJson(res, 200, {
-      ok: Boolean(process.env.GONKA_API_KEY),
-      baseUrl: process.env.GONKA_BASE_URL || "https://api.gonkarouter.io/v1",
-      analystModel: process.env.GONKA_ANALYST_MODEL || null,
-      reviewerModel: process.env.GONKA_REVIEWER_MODEL || null,
-      message: process.env.GONKA_API_KEY
-        ? "Gonka environment variables are present. Replace placeholder routes with real inference calls."
-        : "Gonka API key is not configured yet. Use mock or replay mode."
+      ok: configuration.ready,
+      liveRoutesReady: configuration.ready,
+      capabilities: {
+        analyzeCase01: configuration.ready,
+        fullScenario: false,
+        decision: false,
+        brief: false
+      },
+      baseUrl: configuration.client?.baseUrl || process.env.GONKA_BASE_URL || DEFAULT_GONKA_BASE_URL,
+      analystModel: configuration.client?.models.analyst || process.env.GONKA_ANALYST_MODEL || DEFAULT_MODELS.analyst,
+      reviewerModel: configuration.client?.models.reviewer || process.env.GONKA_REVIEWER_MODEL || DEFAULT_MODELS.reviewer,
+      message: configuration.ready
+        ? "Live CASE 01 analysis route is configured; human approval remains required."
+        : "Gonka configuration is missing or invalid."
     });
+  }
+
+  if (req.method === "POST" && req.url === "/api/incidents/analyze") {
+    try {
+      const payload = await parseJsonBody(req);
+      const client = gonkaClientFactory();
+      const result = await analyzeCase01({
+        payload,
+        client
+      });
+      return sendJson(res, 200, result);
+    } catch (error) {
+      return sendApiError(res, error);
+    }
   }
 
   if (req.method === "POST" && req.url?.startsWith("/api/incidents")) {
@@ -196,18 +322,31 @@ async function serveStatic(req, res) {
   res.end(req.method === "HEAD" ? undefined : content);
 }
 
-const server = http.createServer(async (req, res) => {
-  try {
-    if (req.url?.startsWith("/api/")) {
-      await handleApi(req, res);
-      return;
+function createServer({
+  gonkaClientFactory = createGonkaClientFromEnv
+} = {}) {
+  return http.createServer(async (req, res) => {
+    try {
+      if (req.url?.startsWith("/api/")) {
+        await handleApi(req, res, { gonkaClientFactory });
+        return;
+      }
+      await serveStatic(req, res);
+    } catch (error) {
+      if (req.url?.startsWith("/api/")) {
+        sendApiError(res, error);
+      } else {
+        sendJson(res, 500, { ok: false, message: "Internal server error" });
+      }
     }
-    await serveStatic(req, res);
-  } catch (error) {
-    sendJson(res, 500, { ok: false, message: "Internal server error" });
-  }
-});
+  });
+}
 
-server.listen(port, host, () => {
-  console.log(`CrisisRoute AI running at http://${host}:${port}`);
-});
+if (require.main === module) {
+  const server = createServer();
+  server.listen(port, host, () => {
+    console.log(`CrisisRoute AI running at http://${host}:${port}`);
+  });
+}
+
+module.exports = { createServer };

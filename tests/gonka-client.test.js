@@ -8,7 +8,8 @@ const {
   createGonkaClientFromEnv,
   extractStructuredJson,
   DEFAULT_GONKA_BASE_URL,
-  DEFAULT_MODELS
+  DEFAULT_MODELS,
+  MAX_RESPONSE_BYTES
 } = require("../backend/gonkaClient");
 
 const FAKE_TOKEN = "unit-test-token-not-a-real-secret";
@@ -316,17 +317,102 @@ test("marks HTTP 500 as retryable without retrying", async t => {
   assert.equal(mock.requestCount, 1);
 });
 
-test("aborts timed-out requests and returns TIMEOUT", async t => {
-  const mock = await createMockServer(t, async (req, res) => {
-    await readRequestBody(req);
-    await new Promise(resolve => setTimeout(resolve, 100));
-    if (!res.destroyed) sendJson(res, 200, successfulPayload());
+test("aborts timed-out requests without a loopback arrival race", async () => {
+  let fetchCount = 0;
+  const client = createClient("http://127.0.0.1:4173/v1", {
+    fetchImpl: (_url, options) => new Promise((resolve, reject) => {
+      fetchCount += 1;
+      options.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    })
   });
-  const client = createClient(mock.baseUrl);
   await assert.rejects(() => complete(client, { timeoutMs: 10 }), error => {
     return error.code === "TIMEOUT" && error.retryable === true;
   });
-  assert.equal(mock.requestCount, 1);
+  assert.equal(fetchCount, 1);
+  assert.equal(client.requestCount, 1);
+});
+
+test("timeout covers a delayed response body after headers", async () => {
+  let fetchCount = 0;
+  const secretBodyText = "BODY_SECRET_MUST_NOT_LEAK";
+  const fetchImpl = async (_url, options) => {
+    fetchCount += 1;
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        const completion = setTimeout(() => {
+          controller.enqueue(encoder.encode(JSON.stringify(successfulPayload(`{\"secret\":\"${secretBodyText}\"}`))));
+          controller.close();
+        }, 100);
+        options.signal.addEventListener("abort", () => {
+          clearTimeout(completion);
+          controller.error(new Error("body aborted"));
+        }, { once: true });
+      }
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+  const client = createClient("http://127.0.0.1:4173/v1", { fetchImpl });
+
+  await assert.rejects(() => complete(client, { timeoutMs: 20 }), error => {
+    const serialized = JSON.stringify(error);
+    return error.code === "TIMEOUT" &&
+      error.retryable === true &&
+      !serialized.includes(secretBodyText);
+  });
+  assert.equal(fetchCount, 1);
+  assert.equal(client.requestCount, 1);
+});
+
+test("successful completeJson clears its timeout timer", async () => {
+  let abortEvents = 0;
+  const fetchImpl = async (_url, options) => {
+    options.signal.addEventListener("abort", () => { abortEvents += 1; }, { once: true });
+    return new Response(JSON.stringify(successfulPayload()), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+  const client = createClient("http://127.0.0.1:4173/v1", { fetchImpl });
+  await complete(client, { timeoutMs: 100 });
+  await new Promise(resolve => setTimeout(resolve, 150));
+  assert.equal(abortEvents, 0);
+});
+
+test("rejects declared and actual responses larger than 2 MiB without retrying", async () => {
+  assert.equal(MAX_RESPONSE_BYTES, 2 * 1024 * 1024);
+  let declaredFetches = 0;
+  const declaredClient = createClient("http://127.0.0.1:4173/v1", {
+    fetchImpl: async () => {
+      declaredFetches += 1;
+      return new Response("{}", {
+        status: 200,
+        headers: { "Content-Length": String(MAX_RESPONSE_BYTES + 1) }
+      });
+    }
+  });
+  await assert.rejects(
+    () => complete(declaredClient),
+    error => error.code === "INVALID_RESPONSE" && !Object.hasOwn(error, "body")
+  );
+  assert.equal(declaredFetches, 1);
+
+  let actualFetches = 0;
+  const actualClient = createClient("http://127.0.0.1:4173/v1", {
+    fetchImpl: async () => {
+      actualFetches += 1;
+      return new Response("x".repeat(MAX_RESPONSE_BYTES + 1), { status: 200 });
+    }
+  });
+  await assert.rejects(
+    () => complete(actualClient),
+    error => error.code === "INVALID_RESPONSE" && !JSON.stringify(error).includes("xxxxx")
+  );
+  assert.equal(actualFetches, 1);
+  assert.equal(actualClient.requestCount, 1);
 });
 
 test("one completeJson call sends exactly one HTTP request", async t => {

@@ -4,7 +4,7 @@
   "private": true,
   "description": "CrisisRoute AI - evidence-backed crisis verification and triage demo for Gonka AI for Society.",
   "scripts": {
-    "dev": "node server.js",
+    "dev": "node --env-file-if-exists=.env.local server.js",
     "start": "node server.js"
   },
   "keywords": [

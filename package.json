@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node --env-file-if-exists=.env.local server.js",
     "start": "node server.js",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js",
+    "smoke:gonka": "node --env-file-if-exists=.env.local scripts/gonka-smoke.js"
   },
   "keywords": [
     "gonka",

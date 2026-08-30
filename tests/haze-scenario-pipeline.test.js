@@ -6,16 +6,23 @@ const {
   ANALYST_BATCH_MAX_TOKENS,
   REVIEWER_BATCH_MAX_TOKENS,
   BATCH_REVIEWER_TIMEOUT_MS,
+  SCORING_RUBRIC,
+  ANALYST_BATCH_SYSTEM_PROMPT,
   REVIEWER_BATCH_SYSTEM_PROMPT,
   IncidentPipelineError,
   normalizeCaseLabel,
   normalizeBatchAnalystData,
   normalizeBatchReviewerData,
+  buildBatchEvidencePrompt,
+  determineFullScenarioState,
+  buildFullScenarioGates,
+  buildQualityWarnings,
   analyzeFullHazeScenario
 } = require("../backend/incidentPipeline");
 const { DEFAULT_MODELS } = require("../backend/gonkaClient");
 const incidentSchema = require("../src/types/incident.schema.json");
-const { LOCAL_SCENARIO_TIMEOUT_MS } = require("../scripts/full-scenario-live-smoke");
+const { createHazeScenarioCases } = require("../backend/hazeScenario");
+const { run: runFullScenarioSmoke, LOCAL_SCENARIO_TIMEOUT_MS } = require("../scripts/full-scenario-live-smoke");
 
 const MESSAGES = [
   "Block C hostel: six students are coughing badly, one has asthma. Need N95 masks and clinic transport.",
@@ -27,6 +34,10 @@ const MESSAGES = [
 
 function payload() {
   return { scenario: "malaysia_haze_fire_smoke", messages: [...MESSAGES] };
+}
+
+function scenarioCases() {
+  return createHazeScenarioCases(MESSAGES);
 }
 
 function scores(index) {
@@ -202,19 +213,111 @@ test("Reviewer still rejects invalid required scores with safe role diagnostics"
   });
 });
 
-test("Reviewer prompt remains a low-burden scores-only contract", () => {
-  assert.ok(REVIEWER_BATCH_SYSTEM_PROMPT.length <= 600);
+test("both batch roles receive the same complete scoring rubric", () => {
+  assert.match(SCORING_RUBRIC, /Verification/);
+  assert.match(SCORING_RUBRIC, /Urgency/);
+  assert.match(SCORING_RUBRIC, /Actionability/);
+  assert.match(SCORING_RUBRIC, /0-29/);
+  assert.match(SCORING_RUBRIC, /30-59/);
+  assert.match(SCORING_RUBRIC, /60-79/);
+  assert.match(SCORING_RUBRIC, /80-100/);
+  assert.match(SCORING_RUBRIC, /harm IF TRUE/);
+  assert.match(SCORING_RUBRIC, /low verification must not reduce urgency/i);
+  assert.match(SCORING_RUBRIC, /Score each axis independently/i);
+  assert.ok(ANALYST_BATCH_SYSTEM_PROMPT.includes(SCORING_RUBRIC));
+  assert.ok(REVIEWER_BATCH_SYSTEM_PROMPT.includes(SCORING_RUBRIC));
+});
+
+test("Reviewer prompt remains a low-output-burden scores-only contract", () => {
   const expectedJson = REVIEWER_BATCH_SYSTEM_PROMPT.slice(REVIEWER_BATCH_SYSTEM_PROMPT.indexOf('{'));
   assert.ok(expectedJson.length <= 700);
   assert.doesNotMatch(REVIEWER_BATCH_SYSTEM_PROMPT, /counterEvidence|duplicateRisk|materialConflict|conclusion|recommendedAction|operationalState|safetyGates/);
   assert.match(REVIEWER_BATCH_SYSTEM_PROMPT, /independent blind reviewer/i);
-  assert.match(REVIEWER_BATCH_SYSTEM_PROMPT, /low verification does not mean low urgency/i);
+  assert.match(REVIEWER_BATCH_SYSTEM_PROMPT, /low verification must not reduce urgency/i);
 });
 
 test("B7-R1 uses bounded role and local smoke timeouts", () => {
   assert.equal(ANALYST_TIMEOUT_MS, 45_000);
   assert.equal(BATCH_REVIEWER_TIMEOUT_MS, 60_000);
   assert.equal(LOCAL_SCENARIO_TIMEOUT_MS, 75_000);
+});
+
+test("shared evidence prompt contains scoring facts without leaking expected outcomes", () => {
+  const prompt = buildBatchEvidencePrompt(scenarioCases());
+  assert.ok(prompt.length <= 1_800);
+  for (const label of ["01", "02", "03", "04", "05"]) assert.match(prompt, new RegExp(`CASE${label}`));
+  for (const fact of [
+    "severe", "asthma", "Block C lobby", "reliable hostel callback", "N95 masks and clinic transport",
+    "FORWARD", "not independent corroboration", "original source and callback",
+    "elderly", "breathing harm is severe/time-sensitive", "not U",
+    "Proceed/cancel notices conflict", "organizer confirmation",
+    "Hackathon Scenario Fixture", "about 20 people", "safe space available", "not delivered"
+  ]) assert.match(prompt, new RegExp(fact, "i"));
+  assert.doesNotMatch(prompt, /targetState|expectedScores|expectedConsensus|DISPATCH_CANDIDATE|MERGE_OR_VERIFY|URGENT_VERIFICATION|NEEDS_HUMAN_REVIEW|QUEUED_ACTION/);
+});
+
+test("full scenario state classification uses facts rather than case labels", () => {
+  assert.ok(scenarioCases().every(item => !Object.hasOwn(item, "targetState")));
+  const base = {
+    label: "01",
+    materialConflict: false,
+    duplicateOrForwardRisk: false,
+    medicalRedFlag: false,
+    locationKnown: false,
+    contactAvailable: false,
+    relevantResourceAvailable: false,
+    structuredResourceRequest: false
+  };
+  const cases = [
+    [{ ...base, materialConflict: true }, "NEEDS_HUMAN_REVIEW"],
+    [{ ...base, duplicateOrForwardRisk: true }, "MERGE_OR_VERIFY"],
+    [{ ...base, medicalRedFlag: true }, "URGENT_VERIFICATION"],
+    [{ ...base, medicalRedFlag: true, locationKnown: true, contactAvailable: true, relevantResourceAvailable: true }, "DISPATCH_CANDIDATE"],
+    [{ ...base, structuredResourceRequest: true }, "QUEUED_ACTION"],
+    [base, "NEEDS_HUMAN_REVIEW"]
+  ];
+  for (const [facts, expected] of cases) {
+    assert.equal(determineFullScenarioState(facts), expected);
+    assert.equal(determineFullScenarioState({ ...facts, label: "99" }), expected);
+  }
+});
+
+test("conflict and dispatch gates conservatively reflect model consensus", () => {
+  const case01 = scenarioCases()[0];
+  const case04 = scenarioCases()[3];
+  const agreement = { level: "AGREEMENT", maxScoreGap: 10 };
+  const disagreement = { level: "DISAGREEMENT", maxScoreGap: 20 };
+  const critical = { level: "CRITICAL_CONFLICT", maxScoreGap: 50 };
+
+  const agreedGates = buildFullScenarioGates(case01, agreement, determineFullScenarioState(case01));
+  assert.equal(agreedGates.find(gate => gate.id === "G_CONFLICT").status, "passed");
+  assert.equal(agreedGates.find(gate => gate.id === "G_DISPATCH").status, "passed");
+
+  for (const consensus of [disagreement, critical]) {
+    const gates = buildFullScenarioGates(case01, consensus, determineFullScenarioState(case01));
+    assert.equal(gates.find(gate => gate.id === "G_CONFLICT").status, "review");
+    assert.equal(gates.find(gate => gate.id === "G_DISPATCH").status, "review");
+    assert.equal(gates.find(gate => gate.id === "G_DISPATCH").passed, false);
+  }
+
+  const materialGates = buildFullScenarioGates(case04, agreement, determineFullScenarioState(case04));
+  assert.equal(materialGates.find(gate => gate.id === "G_CONFLICT").status, "review");
+});
+
+test("quality warnings flag incoherence without changing scores", () => {
+  const scores = { verification: 8, urgency: 30, actionability: 5 };
+  const original = structuredClone(scores);
+  assert.deepEqual(buildQualityWarnings({
+    operationalState: "URGENT_VERIFICATION",
+    consensus: { level: "CRITICAL_CONFLICT" },
+    scores
+  }), ["CRITICAL_MODEL_CONFLICT", "URGENT_STATE_LOW_URGENCY_SCORE"]);
+  assert.deepEqual(buildQualityWarnings({
+    operationalState: "DISPATCH_CANDIDATE",
+    consensus: { level: "AGREEMENT" },
+    scores: { verification: 70, urgency: 80, actionability: 49 }
+  }), ["ACTION_READY_LOW_ACTIONABILITY_SCORE"]);
+  assert.deepEqual(scores, original);
 });
 
 test("full scenario performs one parallel call per role with identical evidence", async () => {
@@ -287,4 +390,33 @@ test("CASE 03 stays urgent even when both verification scores are low", async ()
   assert.equal(result.incidents[2].scores.verification, 7);
   assert.equal(result.incidents[2].scores.urgency, 97);
   assert.equal(result.incidents[2].operationalState, "URGENT_VERIFICATION");
+});
+
+test("full scenario smoke safely displays role scores, gaps, warnings and latency", async () => {
+  const result = await analyzeFullHazeScenario({ payload: payload(), client: new BatchFakeClient() });
+  for (const incident of result.incidents) {
+    incident.gonka.analyst.latencyMs = 1;
+    incident.gonka.reviewer.latencyMs = 1;
+  }
+  let call = 0;
+  const output = [];
+  const success = await runFullScenarioSmoke({
+    fetchImpl: async () => {
+      call += 1;
+      if (call === 1) return { json: async () => ({ capabilities: { fullScenario: true } }) };
+      return { status: 200, ok: true, json: async () => result };
+    },
+    log: line => output.push(String(line))
+  });
+  const summary = output.join("\n");
+  assert.equal(success, true);
+  assert.match(summary, /CASE 01 Analyst Scores: V=/);
+  assert.match(summary, /CASE 01 Reviewer Scores: V=/);
+  assert.match(summary, /CASE 01 Final Scores: V=/);
+  assert.match(summary, /CASE 01 Axis Gaps: V=/);
+  assert.match(summary, /Quality Warnings:/);
+  assert.match(summary, /Analyst Latency: 1ms/);
+  assert.match(summary, /Reviewer Latency: 1ms/);
+  assert.match(summary, /Timing Consistency: PASS/);
+  assert.doesNotMatch(summary, /ANALYST_RAW_MUST_NOT_ESCAPE|LEGACY_REVIEWER_MUST_NOT_ESCAPE|GONKA_API_KEY|authorization|sk-[A-Za-z0-9_-]{12,}/i);
 });

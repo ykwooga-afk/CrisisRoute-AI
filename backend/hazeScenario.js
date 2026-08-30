@@ -28,7 +28,17 @@ function createHazeScenarioCases(messages) {
       riskFlags: ["severe coughing", "asthma", "smoke exposure"],
       facts: ["Two supplied reports reference Block C.", "Respiratory symptoms and asthma were reported."],
       unknowns: ["Current asthma severity", "Final affected-person count"],
-      targetState: "DISPATCH_CANDIDATE"
+      medicalRedFlag: true,
+      locationKnown: true,
+      contactAvailable: true,
+      relevantResourceAvailable: true,
+      duplicateOrForwardRisk: false,
+      materialConflict: false,
+      structuredResourceRequest: false,
+      locationStatus: "known: Block C lobby",
+      contactStatus: "available: reliable hostel callback",
+      resourceStatus: "available: N95 masks and clinic transport",
+      scenarioNotes: ["Severe respiratory harm if true.", "Not dispatched; human approval required."]
     },
     {
       label: "02",
@@ -42,7 +52,17 @@ function createHazeScenarioCases(messages) {
       riskFlags: ["forwarded report", "possible duplicate"],
       facts: ["The supplied item is explicitly marked as a forward."],
       unknowns: ["Original source", "Reliable callback contact"],
-      targetState: "MERGE_OR_VERIFY"
+      medicalRedFlag: false,
+      locationKnown: false,
+      contactAvailable: false,
+      relevantResourceAvailable: false,
+      duplicateOrForwardRisk: true,
+      materialConflict: false,
+      structuredResourceRequest: false,
+      locationStatus: "incomplete: Hostel B only",
+      contactStatus: "missing: original source and callback",
+      resourceStatus: "unconfirmed",
+      scenarioNotes: ["Explicit FORWARD; repeats are not independent corroboration."]
     },
     {
       label: "03",
@@ -56,7 +76,17 @@ function createHazeScenarioCases(messages) {
       riskFlags: ["breathing difficulty", "elderly person", "haze exposure"],
       facts: ["An elderly person's breathing difficulty was reported."],
       unknowns: ["Exact location", "Callback number"],
-      targetState: "URGENT_VERIFICATION"
+      medicalRedFlag: true,
+      locationKnown: false,
+      contactAvailable: false,
+      relevantResourceAvailable: false,
+      duplicateOrForwardRisk: false,
+      materialConflict: false,
+      structuredResourceRequest: false,
+      locationStatus: "missing: exact location",
+      contactStatus: "missing: callback or reliable contact",
+      resourceStatus: "unconfirmed",
+      scenarioNotes: ["Elderly breathing harm is severe/time-sensitive if true.", "Uncertainty lowers V/A, not U."]
     },
     {
       label: "04",
@@ -70,7 +100,17 @@ function createHazeScenarioCases(messages) {
       riskFlags: ["conflicting notices"],
       facts: ["One notice says proceed while another claims cancellation."],
       unknowns: ["Authoritative organizer decision"],
-      targetState: "NEEDS_HUMAN_REVIEW"
+      medicalRedFlag: false,
+      locationKnown: true,
+      contactAvailable: false,
+      relevantResourceAvailable: false,
+      duplicateOrForwardRisk: false,
+      materialConflict: true,
+      structuredResourceRequest: false,
+      locationStatus: "known: campus grounds",
+      contactStatus: "missing: organizer confirmation",
+      resourceStatus: "not applicable before confirmation",
+      scenarioNotes: ["Proceed/cancel notices conflict and affect public action."]
     },
     {
       label: "05",
@@ -84,7 +124,17 @@ function createHazeScenarioCases(messages) {
       riskFlags: [],
       facts: ["A fixed hackathon fixture requests supplies and an indoor safe room."],
       unknowns: ["Air purifier availability", "Delivery timing"],
-      targetState: "QUEUED_ACTION",
+      medicalRedFlag: false,
+      locationKnown: true,
+      contactAvailable: true,
+      relevantResourceAvailable: true,
+      duplicateOrForwardRisk: false,
+      materialConflict: false,
+      structuredResourceRequest: true,
+      locationStatus: "known: Hostel B",
+      contactStatus: "available: committee-form coordinator",
+      resourceStatus: "partial: water, masks, safe space available; purifier unavailable",
+      scenarioNotes: ["Hackathon Scenario Fixture; about 20 people; no immediate medical red flag; not delivered."],
       fixture: true
     }
   ];

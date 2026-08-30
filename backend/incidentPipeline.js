@@ -1,5 +1,5 @@
 const crypto = require("node:crypto");
-const { GonkaClientError, DEFAULT_MODELS } = require("./gonkaClient");
+const { DEFAULT_MODELS } = require("./gonkaClient");
 const {
   SCENARIO_ID,
   CASE_LABELS,
@@ -46,14 +46,39 @@ LOW VERIFICATION DOES NOT MEAN LOW URGENCY. Do not invent corroboration, contact
 Return one compact JSON object only. It must contain exactly five unique cases labelled 01 through 05, with all three numeric scores from 0 to 100.
 Arrays contain at most two short items. Do not use Markdown, hidden reasoning, or extra fields.`.trim();
 
+const SCORING_RUBRIC = `Score each axis independently; do not average uncertainty across axes.
+Verification—how strongly the report is supported: 0-29 single/unverified/anonymous/forwarded/seriously incomplete; 30-59 plausible or partially supported but not independently confirmed; 60-79 corroborated by useful independent evidence; 80-100 strongly corroborated by multiple reliable sources.
+Urgency—severity and time-sensitivity of harm IF TRUE: 0-29 routine/little immediate harm; 30-59 time-sensitive but not immediately severe; 60-79 serious harm needing prompt attention; 80-100 immediate threat to life, breathing, health, or public safety. Score harm if true; low verification must not reduce urgency.
+Actionability—readiness for a human-approved response: 0-29 essential location/contact/resource/next-step information missing; 30-59 partially actionable with important gaps; 60-79 actionable with minor gaps; 80-100 location, contact path, resources, and next step ready for human approval.`;
+
 const ANALYST_BATCH_SYSTEM_PROMPT = `${BATCH_COMMON_RULES}
+${SCORING_RUBRIC}
 You are an independent batch Analyst. Assess the original evidence only.
 Return exactly: {"cases":[{"label":"01","scores":{"verification":0,"urgency":0,"actionability":0},"riskFlags":[],"unknowns":[]}]}`;
 
-const REVIEWER_BATCH_SYSTEM_PROMPT = `Independent blind reviewer. Score five cases from evidence only. Do not assume missing facts. Low verification does not mean low urgency. Return JSON only with numeric 0-100 scores, no explanation, Markdown, or extra fields:{"cases":[{"label":"01","scores":{"verification":0,"urgency":0,"actionability":0}},{"label":"02","scores":{"verification":0,"urgency":0,"actionability":0}},{"label":"03","scores":{"verification":0,"urgency":0,"actionability":0}},{"label":"04","scores":{"verification":0,"urgency":0,"actionability":0}},{"label":"05","scores":{"verification":0,"urgency":0,"actionability":0}}]}`;
+const REVIEWER_BATCH_SYSTEM_PROMPT = `Independent blind reviewer. Use only supplied facts; do not assume missing facts.
+${SCORING_RUBRIC}
+Return JSON only, no explanation, Markdown, or extra fields:{"cases":[{"label":"01","scores":{"verification":0,"urgency":0,"actionability":0}},{"label":"02","scores":{"verification":0,"urgency":0,"actionability":0}},{"label":"03","scores":{"verification":0,"urgency":0,"actionability":0}},{"label":"04","scores":{"verification":0,"urgency":0,"actionability":0}},{"label":"05","scores":{"verification":0,"urgency":0,"actionability":0}}]}`;
+
+const SAFE_ROLE_ERROR_CODES = new Set([
+  "NETWORK_ERROR",
+  "TIMEOUT",
+  "HTTP_ERROR",
+  "INVALID_MODEL_DATA",
+  "RESPONSE_TOO_LARGE"
+]);
+
+function sanitizeRoleErrors(roleErrors) {
+  if (!roleErrors || typeof roleErrors !== "object" || Array.isArray(roleErrors)) return undefined;
+  const safe = {};
+  for (const role of ["analyst", "reviewer"]) {
+    if (SAFE_ROLE_ERROR_CODES.has(roleErrors[role])) safe[role] = roleErrors[role];
+  }
+  return Object.keys(safe).length ? safe : undefined;
+}
 
 class IncidentPipelineError extends Error {
-  constructor(code, message, { retryable = false, role, issues = [] } = {}) {
+  constructor(code, message, { retryable = false, role, issues = [], roleErrors } = {}) {
     super(message);
     this.name = "IncidentPipelineError";
     this.code = code;
@@ -61,6 +86,8 @@ class IncidentPipelineError extends Error {
     if (["analyst", "reviewer", "both"].includes(role)) this.role = role;
     const safeIssues = sanitizeIssues(issues);
     if (safeIssues.length) this.issues = safeIssues;
+    const safeRoleErrors = sanitizeRoleErrors(roleErrors);
+    if (safeRoleErrors) this.roleErrors = safeRoleErrors;
   }
 
   toPublicError() {
@@ -69,8 +96,12 @@ class IncidentPipelineError extends Error {
       message: this.message,
       retryable: this.retryable
     };
-    if (this.role) result.role = this.role;
+    if (this.role) {
+      result.role = this.role;
+      result.failedRole = this.role;
+    }
     if (this.issues) result.issues = [...this.issues];
+    if (this.roleErrors) result.roleErrors = { ...this.roleErrors };
     return result;
   }
 }
@@ -740,11 +771,15 @@ function validateFullScenarioRequest(payload) {
 
 function buildBatchEvidencePrompt(cases) {
   const blocks = cases.map(item => [
-    `CASE ${item.label}`,
-    `Source type: ${item.source}`,
-    ...item.messages.map((message, index) => `Evidence ${index + 1}: ${message}`)
+    `CASE${item.label}`,
+    `Src: ${item.source}`,
+    `Reports: ${item.messages.map((message, index) => `${index + 1}) ${message}`).join(" ")}`,
+    `Loc: ${item.locationStatus}`,
+    `Con: ${item.contactStatus}`,
+    `Res: ${item.resourceStatus}`,
+    `Notes: ${item.scenarioNotes.join(" ")}`
   ].join("\n"));
-  return ["Five independent crisis-case evidence blocks follow.", ...blocks].join("\n\n");
+  return ["Five cases.", ...blocks].join("\n\n");
 }
 
 function uniqueStrings(values, maxItems = 5) {
@@ -758,71 +793,78 @@ function uniqueStrings(values, maxItems = 5) {
   return result;
 }
 
-function fullScenarioGateFacts(caseDefinition) {
-  const factsByLabel = {
-    "01": { medical: true, location: true, contact: true, resource: true, conflict: false, dispatch: true },
-    "02": { medical: false, location: false, contact: false, resource: false, conflict: false, dispatch: false },
-    "03": { medical: true, location: false, contact: false, resource: false, conflict: false, dispatch: false },
-    "04": { medical: false, location: true, contact: false, resource: false, conflict: true, dispatch: false },
-    "05": { medical: false, location: true, contact: true, resource: false, conflict: false, dispatch: false }
-  };
-  return factsByLabel[caseDefinition.label];
+function determineFullScenarioState(facts) {
+  if (facts.materialConflict === true) return "NEEDS_HUMAN_REVIEW";
+  if (facts.duplicateOrForwardRisk === true) return "MERGE_OR_VERIFY";
+  if (facts.medicalRedFlag === true && (!facts.locationKnown || !facts.contactAvailable)) {
+    return "URGENT_VERIFICATION";
+  }
+  if (facts.medicalRedFlag === true && facts.locationKnown === true &&
+      facts.contactAvailable === true && facts.relevantResourceAvailable === true) {
+    return "DISPATCH_CANDIDATE";
+  }
+  if (facts.structuredResourceRequest === true && facts.medicalRedFlag !== true) {
+    return "QUEUED_ACTION";
+  }
+  return "NEEDS_HUMAN_REVIEW";
 }
 
-function buildFullScenarioGates(caseDefinition, consensus) {
-  const facts = fullScenarioGateFacts(caseDefinition);
-  const conflictStatus = facts.conflict ? "review" : "passed";
+function buildFullScenarioGates(caseDefinition, consensus, operationalState) {
+  const conflictReview = caseDefinition.materialConflict === true || consensus.level !== "AGREEMENT";
+  const dispatchEligible = operationalState === "DISPATCH_CANDIDATE";
+  const dispatchPassed = dispatchEligible && consensus.level === "AGREEMENT";
+  const dispatchStatus = dispatchPassed ? "passed" : dispatchEligible ? "review" : "locked";
   return [
     {
       id: "G_MEDICAL",
       label: "Medical Red Flag",
-      status: facts.medical ? "triggered" : "passed",
+      status: caseDefinition.medicalRedFlag ? "triggered" : "passed",
       passed: true,
-      detail: facts.medical
+      detail: caseDefinition.medicalRedFlag
         ? "Input evidence contains a respiratory medical red flag requiring human attention."
         : "No immediate medical red flag is present in the supplied scenario evidence."
     },
     {
       id: "G_LOCATION",
       label: "Actionable Location",
-      status: facts.location ? "passed" : "blocked",
-      passed: facts.location,
-      detail: facts.location ? `${caseDefinition.location} is sufficiently bounded for this workflow.` : "An exact actionable location is not confirmed."
+      status: caseDefinition.locationKnown ? "passed" : "blocked",
+      passed: caseDefinition.locationKnown,
+      detail: caseDefinition.locationStatus
     },
     {
       id: "G_CONTACT",
       label: "Contact Path",
-      status: facts.contact ? "passed" : "blocked",
-      passed: facts.contact,
-      detail: facts.contact ? "A scenario-defined coordinator contact path is available." : "No reliable callback or coordinator contact is confirmed."
+      status: caseDefinition.contactAvailable ? "passed" : "blocked",
+      passed: caseDefinition.contactAvailable,
+      detail: caseDefinition.contactStatus
     },
     {
       id: "G_RESOURCE",
       label: "Resource Availability",
-      status: facts.resource ? "passed" : caseDefinition.label === "05" ? "review" : "blocked",
-      passed: facts.resource,
-      detail: facts.resource
-        ? "Requested bounded resources are present in the demo inventory."
-        : caseDefinition.label === "05"
-          ? "Water, masks and a safe room can be queued; air-purifier availability remains unresolved."
-          : "No complete resource match is established for direct dispatch."
+      status: caseDefinition.relevantResourceAvailable ? "passed" : "blocked",
+      passed: caseDefinition.relevantResourceAvailable,
+      detail: caseDefinition.resourceStatus
     },
     {
       id: "G_CONFLICT",
-      label: "Critical Model Conflict",
-      status: conflictStatus,
-      passed: !facts.conflict,
-      detail: facts.conflict
-        ? "The supplied proceed and cancellation notices materially conflict; an authoritative human source must resolve them."
-        : `No deterministic evidence conflict blocks this case; model score consensus is ${consensus.level}.`
+      label: "Evidence / Model Conflict",
+      status: conflictReview ? "review" : "passed",
+      passed: !conflictReview,
+      detail: caseDefinition.materialConflict
+        ? `Material scenario conflict requires human review; model score consensus is ${consensus.level}.`
+        : consensus.level === "AGREEMENT"
+          ? "No material scenario conflict; independent model scores agree."
+          : `No material scenario conflict, but model score consensus is ${consensus.level}; human review is required.`
     },
     {
       id: "G_DISPATCH",
       label: "Volunteer Dispatch",
-      status: facts.dispatch ? "passed" : "locked",
-      passed: facts.dispatch,
-      detail: facts.dispatch
-        ? "PROPOSED ONLY — dispatch still requires explicit human approval."
+      status: dispatchStatus,
+      passed: dispatchPassed,
+      detail: dispatchEligible
+        ? consensus.level === "AGREEMENT"
+          ? "PROPOSED ONLY — eligible for explicit human approval; nothing has been dispatched."
+          : `PROPOSED ONLY — ${consensus.level} requires human review before any approval or dispatch.`
         : "Dispatch is locked; the AI has not contacted, dispatched, delivered, or rescued anyone."
     }
   ];
@@ -861,8 +903,8 @@ function fullScenarioSafeActions(label) {
   return actions[label];
 }
 
-function buildFullScenarioActionPlan(caseDefinition) {
-  if (caseDefinition.label !== "01") return null;
+function buildFullScenarioActionPlan(caseDefinition, operationalState) {
+  if (operationalState !== "DISPATCH_CANDIDATE") return null;
   const instructions = "PROPOSED — REQUIRES HUMAN APPROVAL. Verify current conditions at Hostel Block C lobby, then provide only approved masks and clinic-transport standby.";
   return {
     status: "PROPOSED — REQUIRES HUMAN APPROVAL",
@@ -877,9 +919,23 @@ function buildFullScenarioActionPlan(caseDefinition) {
   };
 }
 
+function buildQualityWarnings({ operationalState, consensus, scores }) {
+  const warnings = [];
+  if (consensus.level === "CRITICAL_CONFLICT") warnings.push("CRITICAL_MODEL_CONFLICT");
+  if (operationalState === "URGENT_VERIFICATION" && scores.urgency < 60) {
+    warnings.push("URGENT_STATE_LOW_URGENCY_SCORE");
+  }
+  if (["DISPATCH_CANDIDATE", "QUEUED_ACTION"].includes(operationalState) && scores.actionability < 50) {
+    warnings.push("ACTION_READY_LOW_ACTIONABILITY_SCORE");
+  }
+  return warnings;
+}
+
 function buildFullScenarioIncident({ caseDefinition, analyst, reviewer, analystTrace, reviewerTrace, now }) {
   const consensus = computeConsensus(analyst.scores, reviewer.scores);
-  const gates = buildFullScenarioGates(caseDefinition, consensus);
+  const operationalState = determineFullScenarioState(caseDefinition);
+  const gates = buildFullScenarioGates(caseDefinition, consensus, operationalState);
+  const qualityWarnings = buildQualityWarnings({ operationalState, consensus, scores: consensus.scores });
   const receivedAt = now.toISOString();
   const evidence = caseDefinition.messages.map((message, index) => ({
     id: `E-CASE${caseDefinition.label}-${index + 1}`,
@@ -926,7 +982,7 @@ function buildFullScenarioIncident({ caseDefinition, analyst, reviewer, analystT
     claims,
     evidence,
     scores: consensus.scores,
-    operationalState: caseDefinition.targetState,
+    operationalState,
     missingFields: unknownFacts,
     modelDebate: {
       agreement: agreementAxes.map(axis => `${axis} scores are within the agreement threshold.`),
@@ -954,8 +1010,9 @@ function buildFullScenarioIncident({ caseDefinition, analyst, reviewer, analystT
       }
     },
     safetyGates: gates,
+    qualityWarnings,
     recommendedAction: recommendation,
-    actionPlan: buildFullScenarioActionPlan(caseDefinition),
+    actionPlan: buildFullScenarioActionPlan(caseDefinition, operationalState),
     actionBrief: null,
     proofCapsule: null,
     gonka: {
@@ -987,29 +1044,43 @@ function safeRoleFailure(settledResults) {
     .filter(item => item.result.status === "rejected");
   if (!failures.length) return;
 
-  const timedOut = failures.filter(item => item.result.reason?.code === "TIMEOUT");
-  if (timedOut.length) {
-    const message = timedOut.length === 1
-      ? `${timedOut[0].role.display} model timed out.`
-      : "One or more models timed out.";
-    throw new IncidentPipelineError("TIMEOUT", message, {
-      retryable: true,
-      role: timedOut.length === 1 ? timedOut[0].role.value : "both"
+  const normalizeCode = reason => {
+    if (["INVALID_JSON", "INVALID_RESPONSE", "INVALID_MODEL_DATA"].includes(reason?.code)) {
+      return "INVALID_MODEL_DATA";
+    }
+    return SAFE_ROLE_ERROR_CODES.has(reason?.code) ? reason.code : "UPSTREAM_ERROR";
+  };
+  const classified = failures.map(item => ({
+    ...item,
+    code: normalizeCode(item.result.reason)
+  }));
+  const failedRole = classified.length === 1 ? classified[0].role.value : "both";
+  const codes = new Set(classified.map(item => item.code));
+
+  if (codes.size === 1) {
+    const code = classified[0].code;
+    if (code === "INVALID_MODEL_DATA") throw invalidModelData(failedRole, ["payload:not_object"]);
+    const message = code === "TIMEOUT"
+      ? classified.length === 1 ? `${classified[0].role.display} model timed out.` : "One or more models timed out."
+      : code === "NETWORK_ERROR" ? "One or more Gonka network requests failed."
+      : code === "HTTP_ERROR" ? "One or more Gonka requests returned an unsuccessful status."
+      : code === "RESPONSE_TOO_LARGE" ? "One or more Gonka responses exceeded the safe size limit."
+      : "One or more model requests failed.";
+    throw new IncidentPipelineError(code, message, {
+      retryable: classified.some(item => item.result.reason?.retryable === true) || ["TIMEOUT", "NETWORK_ERROR"].includes(code),
+      role: failedRole
     });
   }
 
-  const invalid = failures.filter(item =>
-    ["INVALID_JSON", "INVALID_RESPONSE", "INVALID_MODEL_DATA"].includes(item.result.reason?.code));
-  if (invalid.length) {
-    const role = invalid.length === 1 ? invalid[0].role.value : "both";
-    throw invalidModelData(role, ["payload:not_object"]);
-  }
-
-  const firstReason = failures[0].result.reason;
-  if (firstReason instanceof GonkaClientError || firstReason instanceof IncidentPipelineError) {
-    throw firstReason;
-  }
-  throw new IncidentPipelineError("UPSTREAM_ERROR", "One or more model requests failed.", { retryable: true });
+  const allSafelyClassified = classified.every(item => SAFE_ROLE_ERROR_CODES.has(item.code));
+  const roleErrors = allSafelyClassified
+    ? Object.fromEntries(classified.map(item => [item.role.value, item.code]))
+    : undefined;
+  throw new IncidentPipelineError("UPSTREAM_ERROR", "One or more model requests failed.", {
+    retryable: classified.some(item => item.result.reason?.retryable === true || ["TIMEOUT", "NETWORK_ERROR"].includes(item.code)),
+    role: failedRole,
+    roleErrors
+  });
 }
 
 function validateRoleData(role, validator, data) {
@@ -1141,7 +1212,14 @@ async function analyzeFullHazeScenario({ payload, client, now = new Date() }) {
       receivedMessageCount: request.messages.length,
       processedCaseCount: incidents.length,
       modelRequestCount: 2,
-      scenarioFixtureCases: ["05"]
+      scenarioFixtureCases: ["05"],
+      qualityWarnings: incidents
+        .filter(incident => incident.qualityWarnings.length > 0)
+        .map(incident => ({
+          caseId: incident.caseId,
+          label: incident.label,
+          warnings: [...incident.qualityWarnings]
+        }))
     }
   };
 }
@@ -1163,6 +1241,8 @@ module.exports = {
   ANALYST_BATCH_MAX_TOKENS,
   REVIEWER_BATCH_MAX_TOKENS,
   BATCH_REVIEWER_TIMEOUT_MS,
+  SCORING_RUBRIC,
+  ANALYST_BATCH_SYSTEM_PROMPT,
   REVIEWER_BATCH_SYSTEM_PROMPT,
   IncidentPipelineError,
   validateAnalyzeRequest,
@@ -1181,6 +1261,10 @@ module.exports = {
   extractRiskFlags,
   buildSafetyGates,
   determineOperationalState,
+  buildBatchEvidencePrompt,
+  determineFullScenarioState,
+  buildFullScenarioGates,
+  buildQualityWarnings,
   analyzeCase01,
   analyzeFullHazeScenario,
   analyzeIncidents

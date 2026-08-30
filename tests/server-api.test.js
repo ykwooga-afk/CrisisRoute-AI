@@ -8,6 +8,7 @@ const {
   GonkaClientError,
   DEFAULT_MODELS
 } = require("../backend/gonkaClient");
+const { IncidentPipelineError } = require("../backend/incidentPipeline");
 const {
   run: runCase01Smoke,
   LOCAL_SMOKE_TIMEOUT_MS
@@ -127,6 +128,22 @@ function batchRoleData(role) {
   };
 }
 
+function unsafeUpstreamError(code = "NETWORK_ERROR") {
+  const error = new GonkaClientError(code, { retryable: true });
+  error.stack = "STACK sk-TEST-SECRET-MUST-NOT-LEAK";
+  error.cause = new Error("CAUSE Authorization: Bearer private-token");
+  error.rawContent = { choices: [{ message: { content: "RAW_MODEL_CONTENT_MUST_NOT_LEAK" } }] };
+  error.prompt = "PROMPT_MUST_NOT_LEAK";
+  return error;
+}
+
+function assertSafeErrorBody(body) {
+  assert.doesNotMatch(
+    JSON.stringify(body),
+    /stack|cause|sk-TEST|authorization|private-token|rawContent|RAW_MODEL_CONTENT|message\.content|PROMPT_MUST_NOT_LEAK|SUCCESS_MODEL_RAW/i
+  );
+}
+
 test("POST analyze returns a UI-compatible CASE 01 response through local Mock Gonka", async t => {
   const mock = await startMockGonka(t);
   const client = new GonkaClient({
@@ -183,7 +200,8 @@ test("POST analyze returns all five scenario incidents using exactly two model c
     receivedMessageCount: 5,
     processedCaseCount: 5,
     modelRequestCount: 2,
-    scenarioFixtureCases: ["05"]
+    scenarioFixtureCases: ["05"],
+    qualityWarnings: []
   });
   assert.doesNotMatch(JSON.stringify(result), /BATCH_RAW_MUST_NOT_LEAK|authorization|sk-[A-Za-z0-9_-]{12,}/i);
 });
@@ -299,13 +317,122 @@ for (const timeoutCase of [
         code: "TIMEOUT",
         message: timeoutCase.expectedMessage,
         retryable: true,
-        role: timeoutCase.expectedRole
+        role: timeoutCase.expectedRole,
+        failedRole: timeoutCase.expectedRole
       }
     });
     assert.equal(requestCount, 2);
     assert.doesNotMatch(serialized, /SUCCESS_MODEL_RAW|analyst-test-id|reviewer-test-id|authorization|sk-[A-Za-z0-9_-]{12,}/i);
   });
 }
+
+for (const networkCase of [
+  { failed: "analyst", expectedRole: "analyst" },
+  { failed: "reviewer", expectedRole: "reviewer" },
+  { failed: "both", expectedRole: "both" }
+]) {
+  test(`${networkCase.failed} NETWORK_ERROR maps to safe HTTP 502 with failedRole`, async t => {
+    const client = configuredFakeClient(async request => {
+      const role = request.model === DEFAULT_MODELS.analyst ? "analyst" : "reviewer";
+      if (networkCase.failed === "both" || networkCase.failed === role) {
+        throw unsafeUpstreamError("NETWORK_ERROR");
+      }
+      return roleResult(
+        request,
+        role === "analyst" ? analystData() : reviewerData(),
+        "SUCCESS_MODEL_RAW_MUST_NOT_LEAK"
+      );
+    });
+    const baseUrl = await startServer(t, createServer({ gonkaClientFactory: () => client }));
+    const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(scenarioPayload())
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 502);
+    assert.equal(body.error.code, "NETWORK_ERROR");
+    assert.equal(body.error.role, networkCase.expectedRole);
+    assert.equal(body.error.failedRole, networkCase.expectedRole);
+    assert.equal(body.error.retryable, true);
+    assertSafeErrorBody(body);
+  });
+}
+
+test("mixed Analyst NETWORK_ERROR and Reviewer TIMEOUT expose only safe role classifications", async t => {
+  const client = configuredFakeClient(async request => {
+    if (request.model === DEFAULT_MODELS.analyst) throw unsafeUpstreamError("NETWORK_ERROR");
+    throw unsafeUpstreamError("TIMEOUT");
+  });
+  const baseUrl = await startServer(t, createServer({ gonkaClientFactory: () => client }));
+  const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(scenarioPayload())
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 502);
+  assert.equal(body.error.code, "UPSTREAM_ERROR");
+  assert.equal(body.error.role, "both");
+  assert.equal(body.error.failedRole, "both");
+  assert.deepEqual(body.error.roleErrors, {
+    analyst: "NETWORK_ERROR",
+    reviewer: "TIMEOUT"
+  });
+  assertSafeErrorBody(body);
+});
+
+test("invalid internal role metadata is not exposed verbatim by the HTTP error contract", async t => {
+  const client = configuredFakeClient(async request => {
+    if (request.model === DEFAULT_MODELS.analyst) {
+      const error = new IncidentPipelineError("NETWORK_ERROR", "PRIVATE_INTERNAL_MESSAGE", {
+        retryable: true,
+        role: "unsafe-internal-role",
+        roleErrors: { analyst: "PRIVATE_INTERNAL_CODE" }
+      });
+      error.role = "unsafe-internal-role";
+      error.roleErrors = { analyst: "PRIVATE_INTERNAL_CODE" };
+      throw error;
+    }
+    return roleResult(request, reviewerData(), "SUCCESS_MODEL_RAW_MUST_NOT_LEAK");
+  });
+  const baseUrl = await startServer(t, createServer({ gonkaClientFactory: () => client }));
+  const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(scenarioPayload())
+  });
+  const body = await response.json();
+  const serialized = JSON.stringify(body);
+
+  assert.equal(response.status, 502);
+  assert.equal(body.error.failedRole, "analyst");
+  assert.doesNotMatch(serialized, /unsafe-internal-role|PRIVATE_INTERNAL_CODE|PRIVATE_INTERNAL_MESSAGE/);
+  assertSafeErrorBody(body);
+});
+
+test("additional classified upstream failures retain safe roles and HTTP 502", async t => {
+  for (const code of ["HTTP_ERROR", "RESPONSE_TOO_LARGE", "INVALID_MODEL_DATA"]) {
+    const client = configuredFakeClient(async request => {
+      if (request.model === DEFAULT_MODELS.reviewer) throw unsafeUpstreamError(code);
+      return roleResult(request, analystData(), "SUCCESS_MODEL_RAW_MUST_NOT_LEAK");
+    });
+    const baseUrl = await startServer(t, createServer({ gonkaClientFactory: () => client }));
+    const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(scenarioPayload())
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 502);
+    assert.equal(body.error.code, code);
+    assert.equal(body.error.failedRole, "reviewer");
+    assertSafeErrorBody(body);
+  }
+});
 
 test("smoke dynamically reports safe timeout role without raw content", async t => {
   const client = configuredFakeClient(async request => {

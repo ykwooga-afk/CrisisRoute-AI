@@ -47,6 +47,45 @@ const mimeTypes = {
   ".ico": "image/x-icon"
 };
 
+const safeFailedRoles = new Set(["analyst", "reviewer", "both"]);
+const safeRoleErrorCodes = new Set([
+  "NETWORK_ERROR",
+  "TIMEOUT",
+  "HTTP_ERROR",
+  "INVALID_MODEL_DATA",
+  "RESPONSE_TOO_LARGE"
+]);
+
+function safeFailureMetadata(error) {
+  const metadata = {};
+  if (safeFailedRoles.has(error?.role)) {
+    metadata.role = error.role;
+    metadata.failedRole = error.role;
+  }
+  if (error?.roleErrors && typeof error.roleErrors === "object" && !Array.isArray(error.roleErrors)) {
+    const roleErrors = {};
+    for (const role of ["analyst", "reviewer"]) {
+      if (safeRoleErrorCodes.has(error.roleErrors[role])) roleErrors[role] = error.roleErrors[role];
+    }
+    if (Object.keys(roleErrors).length) metadata.roleErrors = roleErrors;
+  }
+  return metadata;
+}
+
+function safePipelineErrorMessage(code, role) {
+  const displayRole = role === "analyst" ? "Analyst" : role === "reviewer" ? "Reviewer" : null;
+  if (code === "INVALID_MODEL_DATA") {
+    return displayRole ? `${displayRole} model data was invalid.` : "One or more model responses contained invalid data.";
+  }
+  if (code === "TIMEOUT") {
+    return displayRole ? `${displayRole} model timed out.` : "One or more models timed out.";
+  }
+  if (code === "NETWORK_ERROR") return "One or more Gonka network requests failed.";
+  if (code === "HTTP_ERROR") return "One or more Gonka requests returned an unsuccessful status.";
+  if (code === "RESPONSE_TOO_LARGE") return "One or more Gonka responses exceeded the safe size limit.";
+  return "One or more model requests failed.";
+}
+
 function sendJson(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body, null, 2));
@@ -78,6 +117,7 @@ function getLiveConfiguration(gonkaClientFactory) {
 
 function mapApiError(error) {
   if (error instanceof IncidentPipelineError) {
+    const failureMetadata = safeFailureMetadata(error);
     if (error.code === "INVALID_REQUEST") {
       return { status: 400, code: error.code, message: "Request body or messages are invalid.", retryable: false };
     }
@@ -85,11 +125,10 @@ function mapApiError(error) {
       return {
         status: 502,
         code: error.code,
-        message: error.message,
+        message: safePipelineErrorMessage(error.code, failureMetadata.role),
         retryable: false,
-        role: error.role,
+        ...failureMetadata,
         issues: error.issues,
-        failedRole: error.role,
         issuePaths: error.issues
       };
     }
@@ -100,13 +139,19 @@ function mapApiError(error) {
       return {
         status: 504,
         code: error.code,
-        message: error.message,
+        message: safePipelineErrorMessage(error.code, failureMetadata.role),
         retryable: true,
-        role: error.role
+        ...failureMetadata
       };
     }
-    if (error.code === "UPSTREAM_ERROR") {
-      return { status: 502, code: error.code, message: error.message, retryable: true };
+    if (["NETWORK_ERROR", "HTTP_ERROR", "RESPONSE_TOO_LARGE", "UPSTREAM_ERROR"].includes(error.code)) {
+      return {
+        status: 502,
+        code: error.code,
+        message: safePipelineErrorMessage(error.code, failureMetadata.role),
+        retryable: error.retryable === true,
+        ...failureMetadata
+      };
     }
   }
 
@@ -148,6 +193,13 @@ function sendApiError(res, error) {
   }
   if (Array.isArray(mapped.issuePaths)) {
     publicError.issuePaths = mapped.issuePaths.slice(0, 5);
+  }
+  if (mapped.roleErrors && typeof mapped.roleErrors === "object" && !Array.isArray(mapped.roleErrors)) {
+    const roleErrors = {};
+    for (const role of ["analyst", "reviewer"]) {
+      if (safeRoleErrorCodes.has(mapped.roleErrors[role])) roleErrors[role] = mapped.roleErrors[role];
+    }
+    if (Object.keys(roleErrors).length) publicError.roleErrors = roleErrors;
   }
   return sendJson(res, mapped.status, {
     ok: false,

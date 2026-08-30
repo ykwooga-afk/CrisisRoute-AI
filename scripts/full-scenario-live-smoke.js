@@ -23,7 +23,7 @@ const requiredIncidentFields = [
   "peopleCount", "needs", "riskFlags", "knownFacts", "unknownFacts", "claims",
   "evidence", "scores", "operationalState", "missingFields", "modelDebate",
   "modelReviews", "safetyGates", "recommendedAction", "actionPlan", "actionBrief",
-  "proofCapsule", "gonka", "humanDecision"
+  "proofCapsule", "gonka", "humanDecision", "qualityWarnings"
 ];
 
 function containsSensitiveOrRawContent(value) {
@@ -123,16 +123,33 @@ async function run({
   log(`Labels: ${labels.join(", ") || "None"}`);
   log(`Unique Case IDs: ${uniqueCaseIds}`);
   for (const incident of incidents) {
-    log(`CASE ${incident.label}: State=${incident.operationalState} Scores=V${incident.scores?.verification}/U${incident.scores?.urgency}/A${incident.scores?.actionability} Consensus=${incident.modelDebate?.consensus || "Not Available"}`);
+    const analystScores = incident.modelReviews?.analyst?.scores;
+    const reviewerScores = incident.modelReviews?.reviewer?.scores;
+    const finalScores = incident.scores;
+    const gaps = incident.modelDebate?.scoreGaps;
+    log(`CASE ${incident.label}: State=${incident.operationalState}`);
+    log(`CASE ${incident.label} Analyst Scores: V=${analystScores?.verification} U=${analystScores?.urgency} A=${analystScores?.actionability}`);
+    log(`CASE ${incident.label} Reviewer Scores: V=${reviewerScores?.verification} U=${reviewerScores?.urgency} A=${reviewerScores?.actionability}`);
+    log(`CASE ${incident.label} Final Scores: V=${finalScores?.verification} U=${finalScores?.urgency} A=${finalScores?.actionability}`);
+    log(`CASE ${incident.label} Axis Gaps: V=${gaps?.verification} U=${gaps?.urgency} A=${gaps?.actionability}`);
+    log(`CASE ${incident.label} Consensus: ${incident.modelDebate?.consensus || "Not Available"}`);
+    log(`CASE ${incident.label} Quality Warnings: ${incident.qualityWarnings?.length ? incident.qualityWarnings.join(",") : "None"}`);
     log(`CASE ${incident.label} Gates: ${(incident.safetyGates || []).map(gate => `${gate.id}=${gate.status}`).join(" ")}`);
   }
   const first = incidents[0];
+  const analystLatency = first?.gonka?.analyst?.latencyMs;
+  const reviewerLatency = first?.gonka?.reviewer?.latencyMs;
+  const latencyPresent = Number.isFinite(analystLatency) && Number.isFinite(reviewerLatency);
+  const timingConsistent = latencyPresent && durationMs + 100 >= Math.max(analystLatency, reviewerLatency);
   log(`Analyst Model: ${first?.gonka?.analyst?.model || "Not Available"}`);
   log(`Analyst Response ID: ${first?.gonka?.analyst?.responseId || "Not Available"}`);
+  log(`Analyst Latency: ${analystLatency ?? "Not Available"}ms`);
   log(`Analyst Shared Trace: ${analystIds.size === 1 ? "Yes" : "No"}`);
   log(`Reviewer Model: ${first?.gonka?.reviewer?.model || "Not Available"}`);
   log(`Reviewer Response ID: ${first?.gonka?.reviewer?.responseId || "Not Available"}`);
+  log(`Reviewer Latency: ${reviewerLatency ?? "Not Available"}ms`);
   log(`Reviewer Shared Trace: ${reviewerIds.size === 1 ? "Yes" : "No"}`);
+  log(`Timing Consistency: ${timingConsistent ? "PASS" : "LATENCY_INSTRUMENTATION_INCONSISTENT"}`);
   log(`Schema Contract: ${schemaPassed ? "PASS" : "FAIL"}`);
   log(`UI Root Contract: ${uiPassed ? "PASS" : "FAIL"}`);
   log(`Meta: slice=${result?.meta?.slice} partial=${result?.meta?.partial} received=${result?.meta?.receivedMessageCount} processedCases=${result?.meta?.processedCaseCount} fixtureCases=${(result?.meta?.scenarioFixtureCases || []).join(",")}`);
@@ -148,6 +165,7 @@ async function run({
     uiPassed &&
     analystIds.size === 1 &&
     reviewerIds.size === 1 &&
+    timingConsistent &&
     result?.meta?.modelRequestCount === 2 &&
     !sensitiveFound
   );

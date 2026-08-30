@@ -9,7 +9,7 @@ const {
 } = require("./backend/gonkaClient");
 const {
   IncidentPipelineError,
-  analyzeCase01
+  analyzeIncidents
 } = require("./backend/incidentPipeline");
 
 const root = __dirname;
@@ -88,7 +88,9 @@ function mapApiError(error) {
         message: error.message,
         retryable: false,
         role: error.role,
-        issues: error.issues
+        issues: error.issues,
+        failedRole: error.role,
+        issuePaths: error.issues
       };
     }
     if (error.code === "CONFIGURATION_ERROR") {
@@ -141,6 +143,12 @@ function sendApiError(res, error) {
   if (Array.isArray(mapped.issues)) {
     publicError.issues = mapped.issues.slice(0, 5);
   }
+  if (["analyst", "reviewer", "both"].includes(mapped.failedRole)) {
+    publicError.failedRole = mapped.failedRole;
+  }
+  if (Array.isArray(mapped.issuePaths)) {
+    publicError.issuePaths = mapped.issuePaths.slice(0, 5);
+  }
   return sendJson(res, mapped.status, {
     ok: false,
     error: publicError
@@ -169,7 +177,7 @@ async function handleApi(req, res, { gonkaClientFactory }) {
       liveRoutesReady: configuration.ready,
       capabilities: {
         analyzeCase01: configuration.ready,
-        fullScenario: false,
+        fullScenario: configuration.ready,
         decision: false,
         brief: false
       },
@@ -186,7 +194,7 @@ async function handleApi(req, res, { gonkaClientFactory }) {
     try {
       const payload = await parseJsonBody(req);
       const client = gonkaClientFactory();
-      const result = await analyzeCase01({
+      const result = await analyzeIncidents({
         payload,
         client
       });

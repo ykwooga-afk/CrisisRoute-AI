@@ -1,12 +1,23 @@
 const crypto = require("node:crypto");
 const { GonkaClientError, DEFAULT_MODELS } = require("./gonkaClient");
+const {
+  SCENARIO_ID,
+  CASE_LABELS,
+  createHazeScenarioCases,
+  cloneResources
+} = require("./hazeScenario");
 
 const ANALYST_PROMPT_VERSION = "analyst-v1.1-minimal";
 const REVIEWER_PROMPT_VERSION = "reviewer-v1.1-minimal";
 const ANALYST_TIMEOUT_MS = 45_000;
 const REVIEWER_TIMEOUT_MS = 45_000;
-const CASE_01_SCENARIO = "malaysia_haze_fire_smoke";
+const CASE_01_SCENARIO = SCENARIO_ID;
 const MAX_MESSAGE_LENGTH = 4_000;
+const ANALYST_BATCH_PROMPT_VERSION = "analyst-batch-v1.0";
+const REVIEWER_BATCH_PROMPT_VERSION = "reviewer-batch-v1.1-minimal-scores";
+const ANALYST_BATCH_MAX_TOKENS = 1_100;
+const REVIEWER_BATCH_MAX_TOKENS = 500;
+const BATCH_REVIEWER_TIMEOUT_MS = 60_000;
 
 const SCORE_AXES = ["verification", "urgency", "actionability"];
 
@@ -28,6 +39,18 @@ You are a blind, independent Reviewer. Assess only original reports; never infer
 Limits: counterEvidence<=3, unknowns<=3; each item<=180 characters; conclusion<=240 characters. Use empty arrays when needed. duplicateRisk must be exactly Low, Medium, or High.
 Return exactly:
 {"scores":{"verification":0,"urgency":0,"actionability":0},"counterEvidence":[],"unknowns":[],"duplicateRisk":"Low","conclusion":"string"}`;
+
+const BATCH_COMMON_RULES = `
+AI advises; humans decide. Use only the five supplied case evidence blocks.
+LOW VERIFICATION DOES NOT MEAN LOW URGENCY. Do not invent corroboration, contact, approval, dispatch, treatment, delivery, or rescue.
+Return one compact JSON object only. It must contain exactly five unique cases labelled 01 through 05, with all three numeric scores from 0 to 100.
+Arrays contain at most two short items. Do not use Markdown, hidden reasoning, or extra fields.`.trim();
+
+const ANALYST_BATCH_SYSTEM_PROMPT = `${BATCH_COMMON_RULES}
+You are an independent batch Analyst. Assess the original evidence only.
+Return exactly: {"cases":[{"label":"01","scores":{"verification":0,"urgency":0,"actionability":0},"riskFlags":[],"unknowns":[]}]}`;
+
+const REVIEWER_BATCH_SYSTEM_PROMPT = `Independent blind reviewer. Score five cases from evidence only. Do not assume missing facts. Low verification does not mean low urgency. Return JSON only with numeric 0-100 scores, no explanation, Markdown, or extra fields:{"cases":[{"label":"01","scores":{"verification":0,"urgency":0,"actionability":0}},{"label":"02","scores":{"verification":0,"urgency":0,"actionability":0}},{"label":"03","scores":{"verification":0,"urgency":0,"actionability":0}},{"label":"04","scores":{"verification":0,"urgency":0,"actionability":0}},{"label":"05","scores":{"verification":0,"urgency":0,"actionability":0}}]}`;
 
 class IncidentPipelineError extends Error {
   constructor(code, message, { retryable = false, role, issues = [] } = {}) {
@@ -64,8 +87,18 @@ const ISSUE_REASONS = new Set([
   "not_numeric",
   "out_of_range",
   "not_object",
+  "not_array",
+  "invalid_label",
+  "duplicate_label",
+  "unknown_label",
+  "invalid_boolean",
   "unsafe_execution_claim"
 ]);
+
+function isSafeIssuePath(path) {
+  if (ISSUE_PATHS.has(path)) return true;
+  return /^(?:cases|cases\.(?:01|02|03|04|05)(?:\.(?:label|scores\.(?:verification|urgency|actionability)|materialConflict))?)$/.test(path);
+}
 
 function sanitizeIssues(issues) {
   if (!Array.isArray(issues)) return [];
@@ -76,7 +109,7 @@ function sanitizeIssues(issues) {
     if (separator < 1) continue;
     const path = issue.slice(0, separator);
     const reason = issue.slice(separator + 1);
-    if (!ISSUE_PATHS.has(path) || !ISSUE_REASONS.has(reason)) continue;
+    if (!isSafeIssuePath(path) || !ISSUE_REASONS.has(reason)) continue;
     if (!safe.includes(`${path}:${reason}`)) safe.push(`${path}:${reason}`);
     if (safe.length === 5) break;
   }
@@ -254,6 +287,86 @@ function normalizeReviewerData(value) {
   };
   if (issues.length) throw invalidModelData("reviewer", issues);
   return normalized;
+}
+
+function normalizeCaseLabel(value) {
+  if (typeof value === "number") {
+    return Number.isInteger(value) && value >= 1 && value <= 5
+      ? String(value).padStart(2, "0")
+      : null;
+  }
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!/^0?[1-5]$/.test(trimmed)) return null;
+  return String(Number(trimmed)).padStart(2, "0");
+}
+
+function normalizeBatchScores(value, issues, label) {
+  const localIssues = [];
+  const scores = normalizeScores(value, localIssues);
+  for (const issue of localIssues) {
+    issues.push(`cases.${label}.${issue}`);
+  }
+  return scores;
+}
+
+function normalizeBatchData(value, role) {
+  if (!isObject(value)) throw invalidModelData(role, ["payload:not_object"]);
+  if (!Array.isArray(value.cases)) throw invalidModelData(role, ["cases:not_array"]);
+
+  const issues = [];
+  const byLabel = new Map();
+  for (const item of value.cases) {
+    if (!isObject(item)) {
+      issues.push("cases:not_object");
+      continue;
+    }
+    const label = normalizeCaseLabel(
+      Object.hasOwn(item, "label")
+        ? item.label
+        : Object.hasOwn(item, "caseLabel")
+          ? item.caseLabel
+          : item.case_label
+    );
+    if (!label) {
+      issues.push("cases:unknown_label");
+      continue;
+    }
+    if (byLabel.has(label)) {
+      issues.push(`cases.${label}:duplicate_label`);
+      continue;
+    }
+
+    const normalized = {
+      label,
+      scores: normalizeBatchScores(item.scores, issues, label)
+    };
+    if (role === "analyst") {
+      normalized.riskFlags = normalizeStringArray(
+        pickField(item, "riskFlags", "risk_flags"),
+        { maxItems: 2, maxLength: 120 }
+      );
+      normalized.unknowns = normalizeStringArray(item.unknowns, { maxItems: 2, maxLength: 120 });
+    }
+    byLabel.set(label, normalized);
+  }
+
+  for (const label of CASE_LABELS) {
+    if (!byLabel.has(label)) issues.push(`cases.${label}:missing`);
+  }
+  if (value.cases.length !== CASE_LABELS.length && !issues.length) {
+    issues.push("cases:missing");
+  }
+  if (issues.length) throw invalidModelData(role, issues);
+  return { cases: CASE_LABELS.map(label => byLabel.get(label)) };
+}
+
+function normalizeBatchAnalystData(value) {
+  return normalizeBatchData(value, "analyst");
+}
+
+function normalizeBatchReviewerData(value) {
+  return normalizeBatchData(value, "reviewer");
 }
 
 const validateAnalystData = normalizeAnalystData;
@@ -615,6 +728,255 @@ function buildIncident({ request, analyst, reviewer, analystTrace, reviewerTrace
   };
 }
 
+function validateFullScenarioRequest(payload) {
+  if (!isObject(payload) || payload.scenario !== SCENARIO_ID) throw invalidRequest();
+  const messages = validateMessageArray(payload.messages, { min: 5, max: 5 });
+  return {
+    scenario: SCENARIO_ID,
+    messages,
+    cases: createHazeScenarioCases(messages)
+  };
+}
+
+function buildBatchEvidencePrompt(cases) {
+  const blocks = cases.map(item => [
+    `CASE ${item.label}`,
+    `Source type: ${item.source}`,
+    ...item.messages.map((message, index) => `Evidence ${index + 1}: ${message}`)
+  ].join("\n"));
+  return ["Five independent crisis-case evidence blocks follow.", ...blocks].join("\n\n");
+}
+
+function uniqueStrings(values, maxItems = 5) {
+  const result = [];
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const normalized = value.trim().slice(0, 180);
+    if (normalized && !result.includes(normalized)) result.push(normalized);
+    if (result.length === maxItems) break;
+  }
+  return result;
+}
+
+function fullScenarioGateFacts(caseDefinition) {
+  const factsByLabel = {
+    "01": { medical: true, location: true, contact: true, resource: true, conflict: false, dispatch: true },
+    "02": { medical: false, location: false, contact: false, resource: false, conflict: false, dispatch: false },
+    "03": { medical: true, location: false, contact: false, resource: false, conflict: false, dispatch: false },
+    "04": { medical: false, location: true, contact: false, resource: false, conflict: true, dispatch: false },
+    "05": { medical: false, location: true, contact: true, resource: false, conflict: false, dispatch: false }
+  };
+  return factsByLabel[caseDefinition.label];
+}
+
+function buildFullScenarioGates(caseDefinition, consensus) {
+  const facts = fullScenarioGateFacts(caseDefinition);
+  const conflictStatus = facts.conflict ? "review" : "passed";
+  return [
+    {
+      id: "G_MEDICAL",
+      label: "Medical Red Flag",
+      status: facts.medical ? "triggered" : "passed",
+      passed: true,
+      detail: facts.medical
+        ? "Input evidence contains a respiratory medical red flag requiring human attention."
+        : "No immediate medical red flag is present in the supplied scenario evidence."
+    },
+    {
+      id: "G_LOCATION",
+      label: "Actionable Location",
+      status: facts.location ? "passed" : "blocked",
+      passed: facts.location,
+      detail: facts.location ? `${caseDefinition.location} is sufficiently bounded for this workflow.` : "An exact actionable location is not confirmed."
+    },
+    {
+      id: "G_CONTACT",
+      label: "Contact Path",
+      status: facts.contact ? "passed" : "blocked",
+      passed: facts.contact,
+      detail: facts.contact ? "A scenario-defined coordinator contact path is available." : "No reliable callback or coordinator contact is confirmed."
+    },
+    {
+      id: "G_RESOURCE",
+      label: "Resource Availability",
+      status: facts.resource ? "passed" : caseDefinition.label === "05" ? "review" : "blocked",
+      passed: facts.resource,
+      detail: facts.resource
+        ? "Requested bounded resources are present in the demo inventory."
+        : caseDefinition.label === "05"
+          ? "Water, masks and a safe room can be queued; air-purifier availability remains unresolved."
+          : "No complete resource match is established for direct dispatch."
+    },
+    {
+      id: "G_CONFLICT",
+      label: "Critical Model Conflict",
+      status: conflictStatus,
+      passed: !facts.conflict,
+      detail: facts.conflict
+        ? "The supplied proceed and cancellation notices materially conflict; an authoritative human source must resolve them."
+        : `No deterministic evidence conflict blocks this case; model score consensus is ${consensus.level}.`
+    },
+    {
+      id: "G_DISPATCH",
+      label: "Volunteer Dispatch",
+      status: facts.dispatch ? "passed" : "locked",
+      passed: facts.dispatch,
+      detail: facts.dispatch
+        ? "PROPOSED ONLY — dispatch still requires explicit human approval."
+        : "Dispatch is locked; the AI has not contacted, dispatched, delivered, or rescued anyone."
+    }
+  ];
+}
+
+function fullScenarioRecommendation(label) {
+  const recommendations = {
+    "01": "Propose masks and clinic-transport standby for Block C; verify current conditions and require human approval before dispatch.",
+    "02": "Merge the forwarded item with related reports or verify its original source, exact location and callback contact before action.",
+    "03": "Urgently verify by callback, determine the exact location, and follow official emergency medical guidance for worsening breathing difficulty.",
+    "04": "Request authoritative organizer confirmation before publishing any proceed-or-cancel instruction.",
+    "05": "Queue water, masks and an indoor safe room; record the air purifier as unmet and do not claim delivery."
+  };
+  return recommendations[label];
+}
+
+function deterministicReviewFacts(label) {
+  const facts = {
+    "01": { counterEvidence: ["No clinical assessment is supplied."], duplicateRisk: "Low", materialConflict: false },
+    "02": { counterEvidence: ["Forwarding does not establish independent corroboration."], duplicateRisk: "High", materialConflict: false },
+    "03": { counterEvidence: ["Exact location and callback contact are missing."], duplicateRisk: "Low", materialConflict: false },
+    "04": { counterEvidence: ["Proceed and cancellation notices materially conflict."], duplicateRisk: "Low", materialConflict: true },
+    "05": { counterEvidence: ["Air-purifier availability is not established."], duplicateRisk: "Low", materialConflict: false }
+  };
+  return facts[label];
+}
+
+function fullScenarioSafeActions(label) {
+  const actions = {
+    "01": ["Confirm the affected people and current respiratory condition.", "Seek human approval before any bounded resource dispatch."],
+    "02": ["Find the original source and merge duplicate forwards.", "Obtain an exact location and reliable callback contact."],
+    "03": ["Call back urgently and determine the exact location.", "Use official emergency medical guidance if symptoms worsen."],
+    "04": ["Escalate the conflicting notices to an authorized organizer.", "Hold definitive public instructions until the conflict is resolved."],
+    "05": ["Queue available water, masks and indoor safe-room support.", "Confirm air-purifier availability before promising it."]
+  };
+  return actions[label];
+}
+
+function buildFullScenarioActionPlan(caseDefinition) {
+  if (caseDefinition.label !== "01") return null;
+  const instructions = "PROPOSED — REQUIRES HUMAN APPROVAL. Verify current conditions at Hostel Block C lobby, then provide only approved masks and clinic-transport standby.";
+  return {
+    status: "PROPOSED — REQUIRES HUMAN APPROVAL",
+    destination: caseDefinition.location,
+    priority: "HIGH",
+    resources: [
+      { label: "N95 masks", status: "Proposed" },
+      { label: "Clinic transport", status: "Standby proposed" }
+    ],
+    instructions,
+    languages: { en: instructions }
+  };
+}
+
+function buildFullScenarioIncident({ caseDefinition, analyst, reviewer, analystTrace, reviewerTrace, now }) {
+  const consensus = computeConsensus(analyst.scores, reviewer.scores);
+  const gates = buildFullScenarioGates(caseDefinition, consensus);
+  const receivedAt = now.toISOString();
+  const evidence = caseDefinition.messages.map((message, index) => ({
+    id: `E-CASE${caseDefinition.label}-${index + 1}`,
+    type: caseDefinition.fixture ? "Hackathon scenario fixture" : `${caseDefinition.source} report`,
+    summary: message,
+    retrievedAt: receivedAt,
+    reliability: caseDefinition.fixture
+      ? "Fixed demonstration fixture; not asserted as a live field report."
+      : "Supplied report; source identity was not independently verified by AI.",
+    contradictions: caseDefinition.label === "04" ? "Proceed and cancellation notices conflict." : "None deterministically established.",
+    uncertainties: uniqueStrings([...caseDefinition.unknowns, ...analyst.unknowns], 4)
+  }));
+  const claims = caseDefinition.messages.map((message, index) => ({
+    id: `C-CASE${caseDefinition.label}-${index + 1}`,
+    text: message.slice(0, 720),
+    status: caseDefinition.label === "04" ? "contradicted" : caseDefinition.fixture ? "reported_unverified" : "reported",
+    evidenceIds: [evidence[index].id]
+  }));
+  const agreementAxes = SCORE_AXES.filter(axis => consensus.gaps[axis] <= 15);
+  const disagreementAxes = SCORE_AXES.filter(axis => consensus.gaps[axis] > 15);
+  const riskFlags = uniqueStrings([...caseDefinition.riskFlags, ...analyst.riskFlags], 5);
+  const unknownFacts = uniqueStrings([...caseDefinition.unknowns, ...analyst.unknowns], 5);
+  const recommendation = fullScenarioRecommendation(caseDefinition.label);
+  const deterministicReview = deterministicReviewFacts(caseDefinition.label);
+
+  return {
+    caseId: `CR-LIVE-CASE-${caseDefinition.label}`,
+    label: caseDefinition.label,
+    title: caseDefinition.title,
+    rawMessage: caseDefinition.messages.join("\n"),
+    source: caseDefinition.source,
+    receivedAt,
+    location: caseDefinition.location,
+    peopleCount: caseDefinition.peopleCount,
+    needs: [...caseDefinition.needs],
+    riskFlags,
+    knownFacts: [...caseDefinition.facts],
+    unknownFacts,
+    priorityRationale: `${recommendation} Operational state and gates are assigned by deterministic scenario rules.`,
+    insight: caseDefinition.label === "03"
+      ? "Low verification does not reduce the urgency of a reported breathing emergency."
+      : "Model scores inform review; deterministic evidence and safety rules control operations.",
+    safeNextActions: fullScenarioSafeActions(caseDefinition.label),
+    claims,
+    evidence,
+    scores: consensus.scores,
+    operationalState: caseDefinition.targetState,
+    missingFields: unknownFacts,
+    modelDebate: {
+      agreement: agreementAxes.map(axis => `${axis} scores are within the agreement threshold.`),
+      disagreement: disagreementAxes.map(axis => `${axis} score gap is ${consensus.gaps[axis]}.`),
+      counterEvidence: deterministicReview.counterEvidence,
+      consensus: consensus.level,
+      maxScoreGap: consensus.maxScoreGap,
+      scoreGaps: consensus.gaps
+    },
+    modelReviews: {
+      analyst: {
+        conclusion: "Independent batch scores and bounded risk/unknown fields supplied for deterministic assembly.",
+        evidenceCited: evidence.map(item => item.id),
+        scores: analyst.scores,
+        rationale: analyst.riskFlags.join("; ") || "No additional analyst risk flag supplied."
+      },
+      reviewer: {
+        conclusion: "Blind batch review supplied independent scores and bounded challenge fields.",
+        counterEvidence: deterministicReview.counterEvidence,
+        unknowns: [...caseDefinition.unknowns],
+        duplicateRisk: deterministicReview.duplicateRisk,
+        scores: reviewer.scores,
+        rationale: "Reviewer received the same original evidence package, never Analyst output.",
+        safetyConcerns: deterministicReview.materialConflict ? ["material evidence conflict"] : []
+      }
+    },
+    safetyGates: gates,
+    recommendedAction: recommendation,
+    actionPlan: buildFullScenarioActionPlan(caseDefinition),
+    actionBrief: null,
+    proofCapsule: null,
+    gonka: {
+      mode: "live",
+      analyst: {
+        model: analystTrace.model,
+        responseId: analystTrace.responseId,
+        promptVersion: ANALYST_BATCH_PROMPT_VERSION,
+        latencyMs: analystTrace.latencyMs
+      },
+      reviewer: {
+        model: reviewerTrace.model,
+        responseId: reviewerTrace.responseId,
+        promptVersion: REVIEWER_BATCH_PROMPT_VERSION,
+        latencyMs: reviewerTrace.latencyMs
+      }
+    },
+    humanDecision: null
+  };
+}
+
 function safeRoleFailure(settledResults) {
   const roles = [
     { display: "Analyst", value: "analyst" },
@@ -721,15 +1083,94 @@ async function analyzeCase01({ payload, client, now = new Date() }) {
   };
 }
 
+async function analyzeFullHazeScenario({ payload, client, now = new Date() }) {
+  const request = validateFullScenarioRequest(payload);
+  if (!client || typeof client.completeJson !== "function") {
+    throw new IncidentPipelineError("CONFIGURATION_ERROR", "Live analysis is not configured.");
+  }
+
+  const evidencePrompt = buildBatchEvidencePrompt(request.cases);
+  const analystRequest = {
+    model: DEFAULT_MODELS.analyst,
+    messages: [
+      { role: "system", content: ANALYST_BATCH_SYSTEM_PROMPT },
+      { role: "user", content: evidencePrompt }
+    ],
+    temperature: 0,
+    maxTokens: ANALYST_BATCH_MAX_TOKENS,
+    timeoutMs: ANALYST_TIMEOUT_MS
+  };
+  const reviewerRequest = {
+    model: DEFAULT_MODELS.reviewer,
+    messages: [
+      { role: "system", content: REVIEWER_BATCH_SYSTEM_PROMPT },
+      { role: "user", content: evidencePrompt }
+    ],
+    temperature: 0,
+    maxTokens: REVIEWER_BATCH_MAX_TOKENS,
+    timeoutMs: BATCH_REVIEWER_TIMEOUT_MS
+  };
+
+  const settledResults = await Promise.allSettled([
+    client.completeJson(analystRequest),
+    client.completeJson(reviewerRequest)
+  ]);
+  safeRoleFailure(settledResults);
+  const analystResult = settledResults[0].value;
+  const reviewerResult = settledResults[1].value;
+  const analystBatch = validateRoleData("analyst", normalizeBatchAnalystData, analystResult.data);
+  const reviewerBatch = validateRoleData("reviewer", normalizeBatchReviewerData, reviewerResult.data);
+  const normalizedNow = now instanceof Date ? now : new Date(now);
+  const incidents = request.cases.map((caseDefinition, index) => buildFullScenarioIncident({
+    caseDefinition,
+    analyst: analystBatch.cases[index],
+    reviewer: reviewerBatch.cases[index],
+    analystTrace: analystResult.trace,
+    reviewerTrace: reviewerResult.trace,
+    now: normalizedNow
+  }));
+
+  return {
+    resources: cloneResources(),
+    rawReports: [...request.messages],
+    incidents,
+    meta: {
+      mode: "live",
+      slice: "FULL_HAZE_SCENARIO",
+      partial: false,
+      receivedMessageCount: request.messages.length,
+      processedCaseCount: incidents.length,
+      modelRequestCount: 2,
+      scenarioFixtureCases: ["05"]
+    }
+  };
+}
+
+async function analyzeIncidents(options) {
+  if (options?.payload?.scenario === SCENARIO_ID) {
+    return analyzeFullHazeScenario(options);
+  }
+  return analyzeCase01(options);
+}
+
 module.exports = {
   ANALYST_PROMPT_VERSION,
   REVIEWER_PROMPT_VERSION,
   ANALYST_TIMEOUT_MS,
   REVIEWER_TIMEOUT_MS,
+  ANALYST_BATCH_PROMPT_VERSION,
+  REVIEWER_BATCH_PROMPT_VERSION,
+  ANALYST_BATCH_MAX_TOKENS,
+  REVIEWER_BATCH_MAX_TOKENS,
+  BATCH_REVIEWER_TIMEOUT_MS,
+  REVIEWER_BATCH_SYSTEM_PROMPT,
   IncidentPipelineError,
   validateAnalyzeRequest,
   normalizeAnalystData,
   normalizeReviewerData,
+  normalizeCaseLabel,
+  normalizeBatchAnalystData,
+  normalizeBatchReviewerData,
   validateAnalystData,
   validateReviewerData,
   computeConsensus,
@@ -740,5 +1181,7 @@ module.exports = {
   extractRiskFlags,
   buildSafetyGates,
   determineOperationalState,
-  analyzeCase01
+  analyzeCase01,
+  analyzeFullHazeScenario,
+  analyzeIncidents
 };

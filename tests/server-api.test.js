@@ -85,6 +85,10 @@ function scenarioPayload() {
   return { scenario: "malaysia_haze_fire_smoke", messages: SCENARIO_MESSAGES };
 }
 
+function case01Payload() {
+  return { messages: SCENARIO_MESSAGES.slice(0, 2) };
+}
+
 function configuredFakeClient(completeJson) {
   return {
     baseUrl: "http://127.0.0.1:9999/v1",
@@ -106,6 +110,23 @@ function roleResult(request, data, rawSentinel = "") {
   };
 }
 
+function batchRoleData(role) {
+  return {
+    cases: ["01", "02", "03", "04", "05"].map((label, index) => role === "analyst" ? {
+      label,
+      scores: { verification: 80 - index * 5, urgency: index === 2 ? 98 : 90 - index * 4, actionability: 85 - index * 6 },
+      riskFlags: [],
+      unknowns: []
+    } : {
+      label,
+      scores: { verification: 76 - index * 5, urgency: index === 2 ? 96 : 86 - index * 4, actionability: 81 - index * 6 },
+      counterEvidence: [],
+      duplicateRisk: index === 1 ? "High" : "Low",
+      materialConflict: index === 3
+    })
+  };
+}
+
 test("POST analyze returns a UI-compatible CASE 01 response through local Mock Gonka", async t => {
   const mock = await startMockGonka(t);
   const client = new GonkaClient({
@@ -118,7 +139,7 @@ test("POST analyze returns a UI-compatible CASE 01 response through local Mock G
   const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(scenarioPayload())
+    body: JSON.stringify(case01Payload())
   });
   const result = await response.json();
 
@@ -127,11 +148,44 @@ test("POST analyze returns a UI-compatible CASE 01 response through local Mock G
   assert.ok(Array.isArray(result.resources));
   assert.ok(Array.isArray(result.incidents));
   assert.equal(result.incidents.length, 1);
-  assert.equal(result.incidents[0].caseId, "CR-LIVE-CASE-01");
+  assert.match(result.incidents[0].caseId, /^CR-LIVE-[A-F0-9]{10}$/);
   assert.equal(result.meta.slice, "CASE_01");
   assert.equal(result.meta.partial, true);
-  assert.equal(result.meta.receivedMessageCount, 5);
+  assert.equal(result.meta.receivedMessageCount, 2);
   assert.equal(result.meta.processedMessageCount, 2);
+});
+
+test("POST analyze returns all five scenario incidents using exactly two model calls", async t => {
+  const calls = [];
+  const client = configuredFakeClient(async request => {
+    calls.push(structuredClone(request));
+    const role = request.model === DEFAULT_MODELS.analyst ? "analyst" : "reviewer";
+    return roleResult(request, batchRoleData(role), "BATCH_RAW_MUST_NOT_LEAK");
+  });
+  const baseUrl = await startServer(t, createServer({ gonkaClientFactory: () => client }));
+  const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(scenarioPayload())
+  });
+  const result = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 2);
+  assert.equal(result.incidents.length, 5);
+  assert.deepEqual(result.incidents.map(item => item.operationalState), [
+    "DISPATCH_CANDIDATE", "MERGE_OR_VERIFY", "URGENT_VERIFICATION", "NEEDS_HUMAN_REVIEW", "QUEUED_ACTION"
+  ]);
+  assert.deepEqual(result.meta, {
+    mode: "live",
+    slice: "FULL_HAZE_SCENARIO",
+    partial: false,
+    receivedMessageCount: 5,
+    processedCaseCount: 5,
+    modelRequestCount: 2,
+    scenarioFixtureCases: ["05"]
+  });
+  assert.doesNotMatch(JSON.stringify(result), /BATCH_RAW_MUST_NOT_LEAK|authorization|sk-[A-Za-z0-9_-]{12,}/i);
 });
 
 test("invalid JSON returns 400 without calling a model", async t => {
@@ -189,7 +243,7 @@ test("invalid model data maps safe role and issue paths without field values", a
   const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(scenarioPayload())
+    body: JSON.stringify(case01Payload())
   });
   const body = await response.json();
   const serialized = JSON.stringify(body);
@@ -202,7 +256,9 @@ test("invalid model data maps safe role and issue paths without field values", a
       message: "Reviewer model data was invalid.",
       retryable: false,
       role: "reviewer",
-      issues: ["scores.urgency:not_numeric"]
+      issues: ["scores.urgency:not_numeric"],
+      failedRole: "reviewer",
+      issuePaths: ["scores.urgency:not_numeric"]
     }
   });
   assert.doesNotMatch(serialized, /sk-SERVER|safe-analyst-id|safe-reviewer-id|stack|authorization/i);
@@ -231,7 +287,7 @@ for (const timeoutCase of [
     const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(scenarioPayload())
+      body: JSON.stringify(case01Payload())
     });
     const body = await response.json();
     const serialized = JSON.stringify(body);
@@ -339,7 +395,7 @@ test("health reports CASE 01 readiness without making a Gonka request", async t 
   assert.equal(health.liveRoutesReady, true);
   assert.deepEqual(health.capabilities, {
     analyzeCase01: true,
-    fullScenario: false,
+    fullScenario: true,
     decision: false,
     brief: false
   });

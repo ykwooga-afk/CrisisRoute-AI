@@ -29,6 +29,157 @@ async function importClient() {
   return import(dataModule(source));
 }
 
+function rehearsalIncident(label) {
+  const score = Number(label) * 5 + 50;
+  const gates = ["G_LOCATION", "G_CONTACT", "G_RESOURCE", "G_CONFLICT"].map(id => ({
+    id,
+    passed: true,
+    status: "passed"
+  }));
+  return {
+    label,
+    caseId: `CR-OFFLINE-${label}`,
+    scores: { verification: score, urgency: 80, actionability: 82 },
+    modelReviews: {
+      analyst: { scores: { verification: score - 2, urgency: 82, actionability: 80 } },
+      reviewer: { scores: { verification: score + 2, urgency: 78, actionability: 84 } }
+    },
+    modelDebate: { consensus: "AGREEMENT" },
+    operationalState: label === "01" ? "DISPATCH_CANDIDATE" : "QUEUED_ACTION",
+    safetyGates: gates,
+    gonka: {
+      analyst: { model: "offline-analyst", responseId: `offline-analyst-${label}`, latencyMs: 1 },
+      reviewer: { model: "offline-reviewer", responseId: `offline-reviewer-${label}`, latencyMs: 1 }
+    }
+  };
+}
+
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" }
+  });
+}
+
+function createRehearsalHarness({
+  failurePhase,
+  failureStatus = 502,
+  failureBody,
+  networkFailure = false,
+  nonJsonFailure = false,
+  qualityFailure = false,
+  cleanupFailure = false,
+  rendererFailure = false,
+  serverStartFailure = false
+} = {}) {
+  const rehearsal = require("../scripts/live-judge-rehearsal");
+  const incidents = ["01", "02", "03", "04", "05"].map(rehearsalIncident);
+  const logs = [];
+  let serverOptions;
+  let proofCalls = 0;
+  const fakeServer = {
+    listening: false,
+    once() {},
+    listen(_port, _host, callback) {
+      this.listening = true;
+      callback();
+    },
+    address() { return { port: 43111 }; },
+    close(callback) {
+      this.listening = false;
+      callback();
+    }
+  };
+
+  const routePhase = pathname => {
+    if (pathname === "/api/health/gonka") return "HEALTH";
+    if (pathname === "/api/incidents/analyze") return "ANALYZE";
+    if (pathname.endsWith("/decision")) return "DECISION";
+    if (pathname.endsWith("/brief")) return "BRIEF";
+    if (pathname.endsWith("/audit")) return "AUDIT";
+    if (pathname === "/api/proof/verify") return "PROOF";
+    return "UNKNOWN";
+  };
+
+  const fetchImpl = async (target, options = {}) => {
+    const pathname = target.pathname;
+    const phase = routePhase(pathname);
+    if (phase === "ANALYZE" && !networkFailure) {
+      const gonkaClient = serverOptions.gonkaClientFactory();
+      await Promise.all([
+        gonkaClient.completeJson({ model: "offline-analyst" }),
+        gonkaClient.completeJson({ model: "offline-reviewer" })
+      ]);
+    }
+    if (phase === failurePhase) {
+      if (networkFailure) throw new Error("PRIVATE_NETWORK_STACK_MUST_NOT_LEAK");
+      if (nonJsonFailure) return new Response("PRIVATE_NON_JSON_BODY_MUST_NOT_LEAK", { status: failureStatus });
+      return jsonResponse(failureBody || {
+        ok: false,
+        error: {
+          code: "HTTP_ERROR",
+          message: "The local request was not accepted.",
+          retryable: false,
+          failedRole: phase === "ANALYZE" ? "reviewer" : undefined,
+          rawBody: "PRIVATE_RAW_BODY_MUST_NOT_LEAK",
+          stack: "PRIVATE_STACK_MUST_NOT_LEAK"
+        }
+      }, failureStatus);
+    }
+    if (phase === "HEALTH") {
+      return jsonResponse({
+        ok: true,
+        liveRoutesReady: true,
+        capabilities: { fullScenario: true, decision: true, brief: true }
+      });
+    }
+    if (phase === "ANALYZE") return jsonResponse({ ok: true, incidents });
+    if (phase === "DECISION") {
+      return jsonResponse({ decision: { recordStatus: "RECORDED", executionStatus: "NOT_EXECUTED" } });
+    }
+    if (phase === "BRIEF") {
+      return jsonResponse({
+        brief: { briefId: "BR-OFFLINE", status: "READY", executionStatus: "NOT_EXECUTED", summary: "Offline brief" },
+        proofCapsule: { capsuleId: "PC-OFFLINE" }
+      });
+    }
+    if (phase === "AUDIT") return jsonResponse({ chainValid: true, audit: [{ sequence: 1 }] });
+    if (phase === "PROOF") {
+      proofCalls += 1;
+      return jsonResponse({ valid: proofCalls === 1 });
+    }
+    return jsonResponse({ ok: false }, 404);
+  };
+
+  const dependencies = {
+    log: line => logs.push(String(line)),
+    createServerImpl: options => {
+      serverOptions = options;
+      return serverStartFailure ? null : fakeServer;
+    },
+    createGonkaClientImpl: () => ({
+      completeJson: async () => ({ data: {}, trace: {} })
+    }),
+    evaluateImpl: () => ({
+      fullPassed: !qualityFailure,
+      incidentCount: 5,
+      labels: ["01", "02", "03", "04", "05"]
+    }),
+    fetchImpl,
+    closeServerImpl: async server => {
+      if (server?.listening) server.listening = false;
+      if (cleanupFailure) throw new Error("PRIVATE_CLEANUP_STACK_MUST_NOT_LEAK");
+    },
+    isPortListeningImpl: async () => false,
+    renderImpl: rendererFailure ? () => { throw new Error("PRIVATE_RENDER_STACK_MUST_NOT_LEAK"); } : rehearsal.renderRunSummary,
+    now: (() => {
+      let value = 1_000;
+      return () => ++value;
+    })()
+  };
+  return { rehearsal, dependencies, logs, incidents, fakeServer };
+}
+
 let reliability;
 let replay;
 
@@ -209,6 +360,9 @@ test("live rehearsal import is side-effect free and exports safe diagnostics", (
   const before = process._getActiveHandles().filter(handle => handle?.constructor?.name === "Server").length;
   const rehearsal = require(rehearsalPath);
   const after = process._getActiveHandles().filter(handle => handle?.constructor?.name === "Server").length;
+  assert.equal(typeof rehearsal.createInitialRunState, "function");
+  assert.equal(typeof rehearsal.updatePhaseStatus, "function");
+  assert.equal(typeof rehearsal.runLiveRehearsal, "function");
   assert.equal(typeof rehearsal.sanitizeSafeFailure, "function");
   assert.equal(typeof rehearsal.formatSafeFailureSummary, "function");
   assert.equal(after, before);
@@ -231,10 +385,11 @@ test("live rehearsal prints only allowlisted role diagnostics", () => {
       stack: "STACK_MUST_NOT_LEAK",
       rawBody: "RAW_BODY_MUST_NOT_LEAK"
     }
-  }, { status: 502 });
+  }, { phase: "ANALYZE", httpStatus: 502 });
   const output = formatSafeFailureSummary(safe).join("\n");
 
-  assert.equal(safe.status, 502);
+  assert.equal(safe.httpStatus, 502);
+  assert.equal(safe.phase, "ANALYZE");
   assert.equal(safe.failedRole, "both");
   assert.deepEqual(safe.roleErrors, { analyst: "NETWORK_ERROR", reviewer: "TIMEOUT" });
   assert.deepEqual(safe.validationIssuePaths, ["cases.01.scores.urgency:not_numeric"]);
@@ -255,7 +410,7 @@ test("live rehearsal rejects unsafe message, role, code and raw fields", () => {
     stack: "PRIVATE_STACK",
     cause: "PRIVATE_CAUSE",
     rawBody: "PRIVATE_RAW"
-  }, { status: 502 });
+  }, { phase: "ANALYZE", httpStatus: 502 });
   const serialized = JSON.stringify(safe);
   const output = formatSafeFailureSummary(safe).join("\n");
 
@@ -264,6 +419,204 @@ test("live rehearsal rejects unsafe message, role, code and raw fields", () => {
   assert.deepEqual(safe.roleErrors, {});
   assert.deepEqual(safe.validationIssuePaths, []);
   assert.doesNotMatch(`${serialized}\n${output}`, /CREDENTIAL_PRIVATE_SECRET|PRIVATE_STACK|PRIVATE_CAUSE|PRIVATE_RAW|private-role|PRIVATE_ERROR/);
+});
+
+test("rehearsal initial state and incomplete renderer are deterministic", () => {
+  const rehearsal = require("../scripts/live-judge-rehearsal");
+  const state = rehearsal.createInitialRunState({ startedAt: 123 });
+  assert.equal(state.phase, "PREFLIGHT");
+  assert.equal(state.port, null);
+  assert.equal(state.serverHandle, null);
+  assert.deepEqual(state.statuses, {
+    health: "not_attempted",
+    analyze: "not_attempted",
+    decision: "not_attempted",
+    brief: "not_attempted",
+    audit: "not_attempted",
+    proof: "not_attempted"
+  });
+  assert.doesNotThrow(() => rehearsal.renderRunSummary({}));
+  assert.match(rehearsal.renderRunSummary({}).join("\n"), /Health Status: not_attempted/);
+});
+
+test("full offline rehearsal success reaches COMPLETE and cleans up", async () => {
+  const harness = createRehearsalHarness();
+  const result = await harness.rehearsal.runLiveRehearsal(harness.dependencies);
+
+  assert.equal(result.success, true);
+  assert.equal(result.state.phase, "COMPLETE");
+  assert.deepEqual(result.state.phaseLedger, [
+    "PREFLIGHT", "SERVER_START", "HEALTH", "ANALYZE", "QUALITY", "DECISION",
+    "BRIEF", "AUDIT", "PROOF_VALID", "PROOF_TAMPER", "CLEANUP", "COMPLETE"
+  ]);
+  assert.deepEqual(result.state.statuses, {
+    health: 200,
+    analyze: 200,
+    decision: 200,
+    brief: 200,
+    audit: 200,
+    proof: 200
+  });
+  assert.equal(result.state.qualityPassed, true);
+  assert.equal(result.state.summary.incidents.length, 5);
+  assert.equal(result.state.summary.decisionStatus, "RECORDED");
+  assert.equal(result.state.summary.executionStatus, "NOT_EXECUTED");
+  assert.equal(result.state.summary.auditValid, true);
+  assert.equal(result.state.summary.proofValid, true);
+  assert.equal(result.state.summary.tamperInvalid, true);
+  assert.equal(result.state.requestCounts.analyzeSubmissions, 1);
+  assert.equal(result.state.requestCounts.inferenceAttempts, 2);
+  assert.equal(result.state.requestCounts.loopbackExternalRequests, 0);
+  assert.equal(result.state.cleanup.closeSucceeded, true);
+  assert.equal(result.state.cleanup.randomPortListenerRemaining, false);
+  assert.equal(result.state.cleanup.fixedPortListenerRemaining, false);
+});
+
+test("offline Analyze HTTP 502 preserves reviewer role without a secondary exception", async () => {
+  const harness = createRehearsalHarness({
+    failurePhase: "ANALYZE",
+    failureStatus: 502,
+    failureBody: {
+      ok: false,
+      error: {
+        code: "HTTP_ERROR",
+        message: "One or more Gonka requests returned an unsuccessful status.",
+        retryable: false,
+        failedRole: "reviewer",
+        rawBody: "PRIVATE_RAW_BODY_MUST_NOT_LEAK",
+        stack: "PRIVATE_STACK_MUST_NOT_LEAK"
+      }
+    }
+  });
+  const result = await harness.rehearsal.runLiveRehearsal(harness.dependencies);
+  const output = result.lines.join("\n");
+
+  assert.equal(result.success, false);
+  assert.equal(result.state.failedPhase, "ANALYZE");
+  assert.equal(result.state.statuses.analyze, 502);
+  assert.equal(result.state.safeFailure.code, "HTTP_ERROR");
+  assert.equal(result.state.safeFailure.failedRole, "reviewer");
+  for (const operation of ["decision", "brief", "audit", "proof"]) {
+    assert.equal(result.state.statuses[operation], "not_attempted");
+  }
+  assert.equal(result.state.cleanup.closeSucceeded, true);
+  assert.doesNotMatch(output, /ReferenceError|PRIVATE_RAW_BODY|PRIVATE_STACK/);
+});
+
+test("offline mixed role failure displays only allowlisted roleErrors", async () => {
+  const harness = createRehearsalHarness({
+    failurePhase: "ANALYZE",
+    failureStatus: 502,
+    failureBody: {
+      ok: false,
+      error: {
+        code: "UPSTREAM_ERROR",
+        message: "One or more model requests failed.",
+        retryable: true,
+        failedRole: "both",
+        roleErrors: {
+          analyst: "NETWORK_ERROR",
+          reviewer: "TIMEOUT",
+          intruder: "PRIVATE_ERROR"
+        }
+      }
+    }
+  });
+  const result = await harness.rehearsal.runLiveRehearsal(harness.dependencies);
+  const output = result.lines.join("\n");
+
+  assert.equal(result.state.failedPhase, "ANALYZE");
+  assert.deepEqual(result.state.safeFailure.roleErrors, {
+    analyst: "NETWORK_ERROR",
+    reviewer: "TIMEOUT"
+  });
+  assert.match(output, /Role Errors: analyst=NETWORK_ERROR, reviewer=TIMEOUT/);
+  assert.doesNotMatch(output, /intruder|PRIVATE_ERROR/);
+});
+
+for (const failureCase of [
+  { name: "Health non-200", options: { failurePhase: "HEALTH", failureStatus: 503 }, phase: "HEALTH", statusKey: "health", status: 503, code: "HTTP_ERROR" },
+  { name: "Analyze network error", options: { failurePhase: "ANALYZE", networkFailure: true }, phase: "ANALYZE", statusKey: "analyze", status: "network_error", code: "NETWORK_ERROR" },
+  { name: "Analyze non-JSON body", options: { failurePhase: "ANALYZE", failureStatus: 502, nonJsonFailure: true }, phase: "ANALYZE", statusKey: "analyze", status: 502, code: "INVALID_RESPONSE" },
+  { name: "Quality contract", options: { qualityFailure: true }, phase: "QUALITY", statusKey: "analyze", status: 200, code: "LIVE_QUALITY_FAILURE" },
+  { name: "Decision 409", options: { failurePhase: "DECISION", failureStatus: 409 }, phase: "DECISION", statusKey: "decision", status: 409, code: "HTTP_ERROR" },
+  { name: "Brief 500", options: { failurePhase: "BRIEF", failureStatus: 500 }, phase: "BRIEF", statusKey: "brief", status: 500, code: "HTTP_ERROR" },
+  { name: "Audit failure", options: { failurePhase: "AUDIT", failureStatus: 500 }, phase: "AUDIT", statusKey: "audit", status: 500, code: "HTTP_ERROR" },
+  { name: "Proof verify failure", options: { failurePhase: "PROOF", failureStatus: 500 }, phase: "PROOF_VALID", statusKey: "proof", status: 500, code: "HTTP_ERROR" }
+]) {
+  test(`full offline control flow safely captures ${failureCase.name}`, async () => {
+    const harness = createRehearsalHarness(failureCase.options);
+    const result = await harness.rehearsal.runLiveRehearsal(harness.dependencies);
+    const output = result.lines.join("\n");
+
+    assert.equal(result.success, false);
+    assert.equal(result.state.failedPhase, failureCase.phase);
+    assert.equal(result.state.statuses[failureCase.statusKey], failureCase.status);
+    assert.equal(result.state.safeFailure.code, failureCase.code);
+    assert.equal(result.state.cleanup.closeSucceeded, true);
+    assert.equal(result.state.cleanup.randomPortListenerRemaining, false);
+    assert.equal(result.state.cleanup.fixedPortListenerRemaining, false);
+    assert.equal(result.state.requestCounts.loopbackExternalRequests, 0);
+    assert.doesNotMatch(output, /PRIVATE_.*(?:STACK|BODY)|ReferenceError|Authorization|Bearer/);
+  });
+}
+
+test("cleanup failure becomes local error without masking completed work", async () => {
+  const harness = createRehearsalHarness({ cleanupFailure: true });
+  const result = await harness.rehearsal.runLiveRehearsal(harness.dependencies);
+  const output = result.lines.join("\n");
+
+  assert.equal(result.success, false);
+  assert.equal(result.state.failedPhase, "CLEANUP");
+  assert.equal(result.state.safeFailure.code, "LOCAL_REHEARSAL_ERROR");
+  assert.equal(result.state.cleanup.closeSucceeded, false);
+  assert.equal(result.state.workCompleted, true);
+  assert.doesNotMatch(output, /PRIVATE_CLEANUP|ReferenceError/);
+});
+
+test("cleanup failure never replaces an earlier safe HTTP failure", async () => {
+  const harness = createRehearsalHarness({
+    failurePhase: "ANALYZE",
+    failureStatus: 502,
+    cleanupFailure: true
+  });
+  const result = await harness.rehearsal.runLiveRehearsal(harness.dependencies);
+  const output = result.lines.join("\n");
+
+  assert.equal(result.success, false);
+  assert.equal(result.state.failedPhase, "ANALYZE");
+  assert.equal(result.state.safeFailure.code, "HTTP_ERROR");
+  assert.equal(result.state.safeFailure.failedRole, "reviewer");
+  assert.equal(result.state.cleanup.closeSucceeded, false);
+  assert.match(output, /Failed Phase: ANALYZE/);
+  assert.doesNotMatch(output, /PRIVATE_CLEANUP|ReferenceError/);
+});
+
+test("summary renderer failure returns deterministic local error after cleanup", async () => {
+  const harness = createRehearsalHarness({ rendererFailure: true });
+  const result = await harness.rehearsal.runLiveRehearsal(harness.dependencies);
+  const output = result.lines.join("\n");
+
+  assert.equal(result.success, false);
+  assert.equal(result.state.failedPhase, "COMPLETE");
+  assert.equal(result.state.safeFailure.code, "LOCAL_REHEARSAL_ERROR");
+  assert.equal(result.state.cleanup.closeSucceeded, true);
+  assert.doesNotMatch(output, /PRIVATE_RENDER|ReferenceError/);
+});
+
+test("unset server, port and statuses return deterministic local error", async () => {
+  const harness = createRehearsalHarness({ serverStartFailure: true });
+  const result = await harness.rehearsal.runLiveRehearsal(harness.dependencies);
+  const output = result.lines.join("\n");
+
+  assert.equal(result.success, false);
+  assert.equal(result.state.failedPhase, "SERVER_START");
+  assert.equal(result.state.port, null);
+  assert.equal(result.state.serverHandle, null);
+  assert.equal(result.state.statuses.health, "not_attempted");
+  assert.equal(result.state.safeFailure.code, "LOCAL_REHEARSAL_ERROR");
+  assert.match(output, /Health Status: not_attempted/);
+  assert.doesNotMatch(output, /ReferenceError|TypeError/);
 });
 
 test("client Abort stops browser wait without claiming server cancellation", async () => {

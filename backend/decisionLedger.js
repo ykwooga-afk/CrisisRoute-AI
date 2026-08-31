@@ -157,6 +157,17 @@ function safeNumber(value) {
   return Number.isFinite(value) ? value : null;
 }
 
+function safeStringArray(value, { maxItems = 12, maxLength = 240 } = {}) {
+  if (!Array.isArray(value)) return [];
+  const result = [];
+  for (const item of value) {
+    const normalized = safeString(item, maxLength);
+    if (normalized && !result.includes(normalized)) result.push(normalized);
+    if (result.length === maxItems) break;
+  }
+  return result;
+}
+
 function buildAnalysisSnapshot(incident) {
   if (!isPlainObject(incident)) return null;
   let caseId;
@@ -182,7 +193,16 @@ function buildAnalysisSnapshot(incident) {
   return {
     caseId,
     label: safeString(incident.label, 16),
+    title: safeString(incident.title, 160),
     operationalState: safeString(incident.operationalState, 48),
+    location: safeString(incident.location, 240),
+    peopleCount: safeNumber(incident.peopleCount),
+    needs: safeStringArray(incident.needs, { maxItems: 12, maxLength: 120 }),
+    riskFlags: safeStringArray(incident.riskFlags),
+    knownFacts: safeStringArray(incident.knownFacts),
+    unknownFacts: safeStringArray(incident.unknownFacts),
+    safeNextActions: safeStringArray(incident.safeNextActions, { maxItems: 10 }),
+    recommendedAction: safeString(incident.recommendedAction, 500),
     scores: {
       verification: safeNumber(incident.scores?.verification),
       urgency: safeNumber(incident.scores?.urgency),
@@ -322,6 +342,9 @@ function createDecisionLedger({
       recordStatus: "RECORDED",
       executionStatus: "NOT_EXECUTED",
       requiresExternalExecution: EXTERNAL_EXECUTION_ACTIONS.has(request.action),
+      humanDecisionAcknowledged: request.acknowledgeHumanDecision,
+      noAutomaticExecutionAcknowledged: request.acknowledgeNoAutomaticExecution,
+      reviewAcknowledged: request.acknowledgeReview,
       analysisSnapshotHash: context.analysisSnapshotHash,
       previousHash: chain.length ? chain[chain.length - 1].entryHash : GENESIS_HASH
     };
@@ -379,6 +402,7 @@ module.exports = {
   RECOMMENDED_ACTION,
   DecisionLedgerError,
   canonicalJson,
+  sha256,
   hashEntry,
   verifyAuditChain,
   validateCaseId,

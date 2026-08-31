@@ -15,6 +15,10 @@ const {
   DecisionLedgerError,
   createDecisionLedger
 } = require("./backend/decisionLedger");
+const {
+  BriefServiceError,
+  createBriefService
+} = require("./backend/briefService");
 
 const root = __dirname;
 const srcRoot = path.resolve(root, "src");
@@ -120,6 +124,20 @@ function getLiveConfiguration(gonkaClientFactory) {
 }
 
 function mapApiError(error) {
+  if (error instanceof BriefServiceError) {
+    const statusByCode = {
+      INVALID_PROOF_REQUEST: 400,
+      DECISION_REQUIRED: 409,
+      AUDIT_INTEGRITY_FAILURE: 409
+    };
+    return {
+      status: statusByCode[error.code] || 500,
+      code: statusByCode[error.code] ? error.code : "INTERNAL_ERROR",
+      message: statusByCode[error.code] ? error.message : "Internal server error.",
+      retryable: false
+    };
+  }
+
   if (error instanceof DecisionLedgerError) {
     const statusByCode = {
       INVALID_DECISION_REQUEST: 400,
@@ -251,7 +269,7 @@ async function parseJsonBody(req) {
   }
 }
 
-function parseDecisionRoute(requestTarget) {
+function parseCaseRoute(requestTarget) {
   if (typeof requestTarget !== "string") return null;
   const separatorIndex = requestTarget.search(/[?#]/);
   const rawPathname = separatorIndex === -1
@@ -259,9 +277,9 @@ function parseDecisionRoute(requestTarget) {
     : requestTarget.slice(0, separatorIndex);
   if (!rawPathname.startsWith("/api/incidents/")) return null;
 
-  const suffixMatch = rawPathname.match(/\/(decision|audit)(?:\/|$)/);
+  const suffixMatch = rawPathname.match(/\/(decision|audit|brief)(?:\/|$)/);
   if (!suffixMatch) return null;
-  const exactMatch = rawPathname.match(/^\/api\/incidents\/([^/]+)\/(decision|audit)$/);
+  const exactMatch = rawPathname.match(/^\/api\/incidents\/([^/]+)\/(decision|audit|brief)$/);
   if (!exactMatch || exactMatch[1].length > 96) {
     throw new DecisionLedgerError("INVALID_CASE_ID");
   }
@@ -278,7 +296,7 @@ function parseDecisionRoute(requestTarget) {
   return { caseId, kind: exactMatch[2] };
 }
 
-async function handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, decisionLedger }) {
+async function handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, decisionLedger, briefService }) {
   if (req.method === "GET" && req.url === "/api/health/gonka") {
     const configuration = getLiveConfiguration(gonkaClientFactory);
     return sendJson(res, 200, {
@@ -288,11 +306,14 @@ async function handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, dec
         analyzeCase01: configuration.ready,
         fullScenario: configuration.ready,
         decision: true,
-        brief: false
+        brief: true
       },
       decisionStorage: "ephemeral",
       decisionExternalAnchoring: "none",
       decisionAuthentication: "demo_local_only",
+      briefGeneration: "deterministic",
+      proofIntegrityScope: "local_payload_integrity",
+      proofExternalAnchoring: "none",
       baseUrl: configuration.client?.baseUrl || process.env.GONKA_BASE_URL || DEFAULT_GONKA_BASE_URL,
       analystModel: configuration.client?.models.analyst || process.env.GONKA_ANALYST_MODEL || DEFAULT_MODELS.analyst,
       reviewerModel: configuration.client?.models.reviewer || process.env.GONKA_REVIEWER_MODEL || DEFAULT_MODELS.reviewer,
@@ -314,14 +335,39 @@ async function handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, dec
     }
   }
 
-  let decisionRoute;
+  if (req.url === "/api/proof/verify") {
+    if (req.method !== "POST") {
+      res.setHeader("Allow", "POST");
+      return sendJson(res, 405, {
+        ok: false,
+        error: {
+          code: "METHOD_NOT_ALLOWED",
+          message: "Method not allowed for this API route.",
+          retryable: false
+        }
+      });
+    }
+    try {
+      let payload;
+      try {
+        payload = await parseJsonBody(req);
+      } catch {
+        throw new BriefServiceError("INVALID_PROOF_REQUEST");
+      }
+      return sendJson(res, 200, briefService.verifyProof(payload));
+    } catch (error) {
+      return sendApiError(res, error);
+    }
+  }
+
+  let caseRoute;
   try {
-    decisionRoute = parseDecisionRoute(req.url);
+    caseRoute = parseCaseRoute(req.url);
   } catch (error) {
     return sendApiError(res, error);
   }
-  if (decisionRoute) {
-    const expectedMethod = decisionRoute.kind === "decision" ? "POST" : "GET";
+  if (caseRoute) {
+    const expectedMethod = caseRoute.kind === "audit" ? "GET" : "POST";
     if (req.method !== expectedMethod) {
       res.setHeader("Allow", expectedMethod);
       return sendJson(res, 405, {
@@ -334,8 +380,11 @@ async function handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, dec
       });
     }
     try {
-      if (decisionRoute.kind === "audit") {
-        return sendJson(res, 200, decisionLedger.getAudit(decisionRoute.caseId));
+      if (caseRoute.kind === "audit") {
+        return sendJson(res, 200, decisionLedger.getAudit(caseRoute.caseId));
+      }
+      if (caseRoute.kind === "brief") {
+        return sendJson(res, 200, briefService.generateBrief(caseRoute.caseId));
       }
       let payload;
       try {
@@ -344,7 +393,7 @@ async function handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, dec
         throw new DecisionLedgerError("INVALID_DECISION_REQUEST");
       }
       const result = decisionLedger.recordDecision({
-        caseId: decisionRoute.caseId,
+        caseId: caseRoute.caseId,
         payload,
         idempotencyKey: req.headers["idempotency-key"]
       });
@@ -483,12 +532,13 @@ async function serveStatic(req, res) {
 function createServer({
   gonkaClientFactory = createGonkaClientFromEnv,
   analyzeIncidentsFn = analyzeIncidents,
-  decisionLedger = createDecisionLedger()
+  decisionLedger = createDecisionLedger(),
+  briefService = createBriefService({ decisionLedger })
 } = {}) {
   return http.createServer(async (req, res) => {
     try {
       if (req.url?.startsWith("/api/")) {
-        await handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, decisionLedger });
+        await handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, decisionLedger, briefService });
         return;
       }
       await serveStatic(req, res);

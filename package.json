@@ -10,7 +10,8 @@
     "smoke:gonka": "node --env-file-if-exists=.env.local scripts/gonka-smoke.js",
     "smoke:case01": "node scripts/case01-live-smoke.js",
     "smoke:scenario": "node scripts/full-scenario-live-smoke.js",
-    "smoke:decision": "node scripts/decision-flow-smoke.js"
+    "smoke:decision": "node scripts/decision-flow-smoke.js",
+    "smoke:brief": "node scripts/brief-proof-smoke.js"
   },
   "keywords": [
     "gonka",

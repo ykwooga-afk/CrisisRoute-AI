@@ -87,8 +87,22 @@ export async function submitHumanDecision(incident, decision, mode = DATA_MODES.
     }
 
     const result = await response.json();
+    let briefResult = null;
+    if (result.decision.action === "APPROVE_ACTION") {
+      const briefResponse = await fetch(`/api/incidents/${incident.caseId}/brief`, { method: "POST" });
+      if (!briefResponse.ok) {
+        const error = await safeJson(briefResponse);
+        throw new Error(error?.error?.message || error?.message || "Brief generation failed.");
+      }
+      briefResult = await briefResponse.json();
+    }
     return {
       ...incident,
+      actionBrief: briefResult
+        ? { en: [briefResult.brief.summary, ...briefResult.brief.nextSteps].join(" ") }
+        : incident.actionBrief,
+      operationalBrief: briefResult?.brief || incident.operationalBrief,
+      proofCapsule: briefResult?.proofCapsule || incident.proofCapsule,
       humanDecision: {
         decision,
         canonicalAction: result.decision.action,

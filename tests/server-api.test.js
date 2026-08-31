@@ -9,6 +9,7 @@ const {
   DEFAULT_MODELS
 } = require("../backend/gonkaClient");
 const { IncidentPipelineError } = require("../backend/incidentPipeline");
+const { BriefServiceError } = require("../backend/briefService");
 const { CANONICAL_HAZE_MESSAGES } = require("../backend/hazeScenario");
 const {
   run: runCase01Smoke,
@@ -568,11 +569,14 @@ test("health reports CASE 01 readiness without making a Gonka request", async t 
     analyzeCase01: true,
     fullScenario: true,
     decision: true,
-    brief: false
+    brief: true
   });
   assert.equal(health.decisionStorage, "ephemeral");
   assert.equal(health.decisionExternalAnchoring, "none");
   assert.equal(health.decisionAuthentication, "demo_local_only");
+  assert.equal(health.briefGeneration, "deterministic");
+  assert.equal(health.proofIntegrityScope, "local_payload_integrity");
+  assert.equal(health.proofExternalAnchoring, "none");
   assert.equal(modelCalls, 0);
   assert.doesNotMatch(JSON.stringify(health), /GONKA_API_KEY|authorization|server-api-fake-token/i);
 });
@@ -853,4 +857,131 @@ test("audit API returns only the append-only safe chain and honest storage marke
   assert.equal(body.chainScope, "per_case");
   assert.match(body.entries[0].analysisSnapshotHash, /^[a-f0-9]{64}$/);
   assert.doesNotMatch(serialized, /RAW_MODEL|PROMPT|Authorization|sk-SERVER|SERVER_PRIVATE|on-chain|blockchain/i);
+});
+
+test("Brief API requires analysis and then a valid human decision", async t => {
+  const app = await createDecisionApi(t);
+  const beforeAnalysis = await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/brief`, { method: "POST" });
+  assert.equal(beforeAnalysis.status, 404);
+  assert.equal((await beforeAnalysis.json()).error.code, "ANALYSIS_CONTEXT_NOT_FOUND");
+
+  await registerDecisionContexts(app.baseUrl);
+  const beforeDecision = await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/brief`, { method: "POST" });
+  assert.equal(beforeDecision.status, 409);
+  assert.equal((await beforeDecision.json()).error.code, "DECISION_REQUIRED");
+  assert.equal(app.gonkaFactoryCalls, 0);
+});
+
+test("Brief API maps audit-integrity failure to a safe 409", async t => {
+  const briefService = {
+    generateBrief() { throw new BriefServiceError("AUDIT_INTEGRITY_FAILURE"); },
+    verifyProof() { throw new Error("not used"); }
+  };
+  const server = createServer({
+    briefService,
+    gonkaClientFactory: () => configuredFakeClient(async () => {})
+  });
+  const baseUrl = await startServer(t, server);
+  const response = await fetch(`${baseUrl}/api/incidents/CR-LIVE-CASE-01/brief`, { method: "POST" });
+  const body = await response.json();
+  assert.equal(response.status, 409);
+  assert.equal(body.error.code, "AUDIT_INTEGRITY_FAILURE");
+  assertSafeErrorBody(body);
+});
+
+test("Brief and Proof APIs complete a deterministic local integrity round trip", async t => {
+  const app = await createDecisionApi(t);
+  await registerDecisionContexts(app.baseUrl);
+  const decisionResponse = await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(decisionRequestBody())
+  });
+  assert.equal(decisionResponse.status, 200);
+
+  const briefResponse = await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/brief`, { method: "POST" });
+  const briefResult = await briefResponse.json();
+  const serialized = JSON.stringify(briefResult);
+  assert.equal(briefResponse.status, 200);
+  assert.equal(briefResult.brief.executionStatus, "NOT_EXECUTED");
+  assert.equal(briefResult.proofCapsule.integrityScope, "local_payload_integrity");
+  assert.doesNotMatch(serialized, /RAW_MODEL|PROMPT|Authorization|sk-SERVER|SERVER_PRIVATE/i);
+
+  const replay = await (await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/brief`, { method: "POST" })).json();
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.brief.briefId, briefResult.brief.briefId);
+  assert.equal(replay.proofCapsule.capsuleHash, briefResult.proofCapsule.capsuleHash);
+
+  const verifyResponse = await fetch(`${app.baseUrl}/api/proof/verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ brief: briefResult.brief, proofCapsule: briefResult.proofCapsule })
+  });
+  assert.equal(verifyResponse.status, 200);
+  assert.deepEqual(await verifyResponse.json(), {
+    ok: true,
+    valid: true,
+    checks: { briefHash: true, capsuleHash: true, capsuleId: true, references: true }
+  });
+  assert.equal(app.gonkaFactoryCalls, 0);
+});
+
+test("Proof API reports tampering without echoing the supplied payload", async t => {
+  const app = await createDecisionApi(t);
+  await registerDecisionContexts(app.baseUrl);
+  await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(decisionRequestBody())
+  });
+  const result = await (await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/brief`, { method: "POST" })).json();
+  result.brief.summary = "UNTRUSTED_TAMPERED_SUMMARY_MUST_NOT_ECHO";
+  const response = await fetch(`${app.baseUrl}/api/proof/verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ brief: result.brief, proofCapsule: result.proofCapsule })
+  });
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.valid, false);
+  assert.equal(body.checks.briefHash, false);
+  assert.doesNotMatch(JSON.stringify(body), /UNTRUSTED_TAMPERED_SUMMARY|summary|caseId|decisionId/);
+});
+
+test("Proof API rejects malformed, prototype-polluting and deeply nested requests", async t => {
+  const app = await createDecisionApi(t);
+  const payloads = [
+    { brief: null, proofCapsule: null },
+    JSON.parse('{"brief":{},"proofCapsule":{"__proto__":{"polluted":true}}}'),
+    (() => {
+      let deep = "leaf";
+      for (let index = 0; index < 12; index += 1) deep = { nested: deep };
+      return { brief: deep, proofCapsule: {} };
+    })()
+  ];
+  for (const payload of payloads) {
+    const response = await fetch(`${app.baseUrl}/api/proof/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const body = await response.json();
+    assert.equal(response.status, 400);
+    assert.equal(body.error.code, "INVALID_PROOF_REQUEST");
+    assertSafeErrorBody(body);
+  }
+  assert.equal({}.polluted, undefined);
+});
+
+test("Brief and Proof routes enforce exact methods and safe case paths", async t => {
+  const app = await createDecisionApi(t);
+  const briefMethod = await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/brief`);
+  assert.equal(briefMethod.status, 405);
+  assert.equal(briefMethod.headers.get("allow"), "POST");
+  const proofMethod = await fetch(`${app.baseUrl}/api/proof/verify`);
+  assert.equal(proofMethod.status, 405);
+  assert.equal(proofMethod.headers.get("allow"), "POST");
+  const unsafe = await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01%2Fextra/brief`, { method: "POST" });
+  assert.equal(unsafe.status, 400);
+  assert.equal((await unsafe.json()).error.code, "INVALID_CASE_ID");
 });

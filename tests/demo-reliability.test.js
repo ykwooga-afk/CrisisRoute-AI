@@ -203,6 +203,69 @@ test("shared scenario evaluator import is side-effect free", () => {
   assert.equal(after, before);
 });
 
+test("live rehearsal import is side-effect free and exports safe diagnostics", () => {
+  const rehearsalPath = path.join(projectRoot, "scripts/live-judge-rehearsal.js");
+  delete require.cache[require.resolve(rehearsalPath)];
+  const before = process._getActiveHandles().filter(handle => handle?.constructor?.name === "Server").length;
+  const rehearsal = require(rehearsalPath);
+  const after = process._getActiveHandles().filter(handle => handle?.constructor?.name === "Server").length;
+  assert.equal(typeof rehearsal.sanitizeSafeFailure, "function");
+  assert.equal(typeof rehearsal.formatSafeFailureSummary, "function");
+  assert.equal(after, before);
+});
+
+test("live rehearsal prints only allowlisted role diagnostics", () => {
+  const { sanitizeSafeFailure, formatSafeFailureSummary } = require("../scripts/live-judge-rehearsal");
+  const safe = sanitizeSafeFailure({
+    error: {
+      code: "UPSTREAM_ERROR",
+      message: "One or more model requests failed.",
+      retryable: true,
+      failedRole: "both",
+      roleErrors: {
+        analyst: "NETWORK_ERROR",
+        reviewer: "TIMEOUT",
+        intruder: "PRIVATE_INTERNAL_CODE"
+      },
+      issuePaths: ["cases.01.scores.urgency:not_numeric", "unsafe path with value"],
+      stack: "STACK_MUST_NOT_LEAK",
+      rawBody: "RAW_BODY_MUST_NOT_LEAK"
+    }
+  }, { status: 502 });
+  const output = formatSafeFailureSummary(safe).join("\n");
+
+  assert.equal(safe.status, 502);
+  assert.equal(safe.failedRole, "both");
+  assert.deepEqual(safe.roleErrors, { analyst: "NETWORK_ERROR", reviewer: "TIMEOUT" });
+  assert.deepEqual(safe.validationIssuePaths, ["cases.01.scores.urgency:not_numeric"]);
+  assert.match(output, /Safe Error Code: UPSTREAM_ERROR/);
+  assert.match(output, /Failed Role: both/);
+  assert.match(output, /analyst=NETWORK_ERROR, reviewer=TIMEOUT/);
+  assert.doesNotMatch(output, /intruder|PRIVATE_INTERNAL|STACK|RAW_BODY/);
+});
+
+test("live rehearsal rejects unsafe message, role, code and raw fields", () => {
+  const { sanitizeSafeFailure, formatSafeFailureSummary } = require("../scripts/live-judge-rehearsal");
+  const safe = sanitizeSafeFailure({
+    code: "PRIVATE_CODE",
+    message: "CREDENTIAL_PRIVATE_SECRET",
+    failedRole: "private-role",
+    roleErrors: { analyst: "PRIVATE_ERROR" },
+    validationIssuePaths: ["private/value"],
+    stack: "PRIVATE_STACK",
+    cause: "PRIVATE_CAUSE",
+    rawBody: "PRIVATE_RAW"
+  }, { status: 502 });
+  const serialized = JSON.stringify(safe);
+  const output = formatSafeFailureSummary(safe).join("\n");
+
+  assert.equal(safe.code, "UNKNOWN_SAFE_ERROR");
+  assert.equal(safe.failedRole, "not_applicable");
+  assert.deepEqual(safe.roleErrors, {});
+  assert.deepEqual(safe.validationIssuePaths, []);
+  assert.doesNotMatch(`${serialized}\n${output}`, /CREDENTIAL_PRIVATE_SECRET|PRIVATE_STACK|PRIVATE_CAUSE|PRIVATE_RAW|private-role|PRIVATE_ERROR/);
+});
+
 test("client Abort stops browser wait without claiming server cancellation", async () => {
   const clientModule = await importClient();
   const controller = new AbortController();

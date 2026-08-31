@@ -9,9 +9,75 @@ const { evaluateFullScenarioAcceptance } = require("./full-scenario-live-smoke")
 
 const HOST = "127.0.0.1";
 const projectRoot = path.resolve(__dirname, "..");
+const SAFE_FAILED_ROLES = new Set(["analyst", "reviewer", "both"]);
+const SAFE_ROLE_ERROR_CODES = new Set([
+  "NETWORK_ERROR",
+  "TIMEOUT",
+  "HTTP_ERROR",
+  "INVALID_MODEL_DATA",
+  "RESPONSE_TOO_LARGE"
+]);
+const SAFE_ERROR_CODES = new Set([
+  ...SAFE_ROLE_ERROR_CODES,
+  "UPSTREAM_ERROR",
+  "INVALID_SCENARIO_INPUT",
+  "CONFIGURATION_ERROR",
+  "INVALID_RESPONSE",
+  "LIVE_QUALITY_FAILURE",
+  "LIVE_CONTRACT_FAILURE",
+  "UNKNOWN_SAFE_ERROR"
+]);
+const UNSAFE_MESSAGE_PATTERN = /sk-|authorization|bearer|credential|stack|cause|raw|prompt|private|https?:\/\//i;
 
 function dataModule(source) {
   return `data:text/javascript;base64,${Buffer.from(source).toString("base64")}#${Date.now()}-${Math.random()}`;
+}
+
+function sanitizeSafeFailure(source, { status } = {}) {
+  const candidate = source?.error && typeof source.error === "object" && !Array.isArray(source.error)
+    ? source.error
+    : source && typeof source === "object" && !Array.isArray(source) ? source : {};
+  const code = SAFE_ERROR_CODES.has(candidate.code) ? candidate.code : "UNKNOWN_SAFE_ERROR";
+  const failedRole = SAFE_FAILED_ROLES.has(candidate.failedRole) ? candidate.failedRole : "not_applicable";
+  const roleErrors = {};
+  if (candidate.roleErrors && typeof candidate.roleErrors === "object" && !Array.isArray(candidate.roleErrors)) {
+    for (const role of ["analyst", "reviewer"]) {
+      if (SAFE_ROLE_ERROR_CODES.has(candidate.roleErrors[role])) roleErrors[role] = candidate.roleErrors[role];
+    }
+  }
+  const issueSource = [candidate.validationIssuePaths, candidate.issuePaths, candidate.issues]
+    .find(value => Array.isArray(value)) || [];
+  const validationIssuePaths = issueSource
+    .filter(value => typeof value === "string" && value.length <= 120 && /^[A-Za-z0-9_.]+:[a-z_]+$/.test(value))
+    .slice(0, 5);
+  const message = typeof candidate.message === "string" && candidate.message.length <= 300 && !UNSAFE_MESSAGE_PATTERN.test(candidate.message)
+    ? candidate.message
+    : "The live rehearsal failed safely.";
+  return {
+    status: Number.isInteger(status) && status >= 100 && status <= 599
+      ? status
+      : Number.isInteger(candidate.status) && candidate.status >= 100 && candidate.status <= 599 ? candidate.status : "Not available",
+    code,
+    message,
+    retryable: candidate.retryable === true,
+    failedRole,
+    roleErrors,
+    validationIssuePaths
+  };
+}
+
+function formatSafeFailureSummary(failure) {
+  const safe = sanitizeSafeFailure(failure, { status: failure?.status });
+  const roleErrors = Object.entries(safe.roleErrors).map(([role, code]) => `${role}=${code}`).join(", ") || "None";
+  const validationIssuePaths = safe.validationIssuePaths.join(", ") || "None";
+  return [
+    `Safe Error Code: ${safe.code}`,
+    `Safe Error Message: ${safe.message}`,
+    `Retryable: ${safe.retryable ? "Yes" : "No"}`,
+    `Failed Role: ${safe.failedRole}`,
+    `Role Errors: ${roleErrors}`,
+    `Validation Issue Paths: ${validationIssuePaths}`
+  ];
 }
 
 async function importClient() {
@@ -53,7 +119,7 @@ function chooseDecision(incident) {
   const action = approveAllowed(incident) ? "APPROVE_ACTION" : "HOLD_FOR_REVIEW";
   return {
     action,
-    reason: "B11 scripted local acceptance rehearsal; no real-world action is authorized or executed.",
+    reason: "B11-R1 scripted local acceptance rehearsal; no real-world action is authorized or executed.",
     acknowledgeHumanDecision: action === "APPROVE_ACTION",
     acknowledgeNoAutomaticExecution: action === "APPROVE_ACTION",
     acknowledgeReview: reviewRequired
@@ -70,8 +136,9 @@ async function run({ log = console.log } = {}) {
   let clientFactoryCalls = 0;
   let port;
   let summary = {};
-  let outcome = "B11 IMPLEMENTATION PASS — LIVE REHEARSAL BLOCKED";
+  let outcome = "B11-R1 BLOCKED — LIVE REHEARSAL FAILED";
   let analyzeContractReached = false;
+  let capturedSafeFailure;
 
   const countedClientFactory = () => {
     clientFactoryCalls += 1;
@@ -108,14 +175,25 @@ async function run({ log = console.log } = {}) {
       const startedAt = Date.now();
       const response = await fetch(target, options);
       statuses[target.pathname] = { status: response.status, durationMs: Date.now() - startedAt };
+      if (!response.ok && target.pathname === "/api/incidents/analyze") {
+        try {
+          const safeText = await response.clone().text();
+          if (safeText.length <= 200_000) {
+            capturedSafeFailure = sanitizeSafeFailure(JSON.parse(safeText), { status: response.status });
+          }
+        } catch {
+          capturedSafeFailure = sanitizeSafeFailure({}, { status: response.status });
+        }
+      }
       return response;
     };
     const client = createCrisisRouteClient({ fetchImpl: localFetch, baseUrl });
 
     const health = await client.getHealth();
     if (!(health?.ok === true && health?.liveRoutesReady === true && health?.capabilities?.fullScenario === true && health?.capabilities?.decision === true && health?.capabilities?.brief === true)) {
-      throw Object.assign(new Error("Live health capabilities are incomplete."), { code: "HTTP_ERROR", status: 503, failedRole: "not_available" });
+      throw Object.assign(new Error("Live health capabilities are incomplete."), { code: "HTTP_ERROR", status: 503 });
     }
+    summary.health = "PASS";
 
     const analyzeStartedAt = Date.now();
     const analyzed = await client.loadScenario([...CANONICAL_HAZE_MESSAGES]);
@@ -123,14 +201,14 @@ async function run({ log = console.log } = {}) {
     const analyzeDurationMs = Date.now() - analyzeStartedAt;
     const quality = evaluateFullScenarioAcceptance(analyzed, { durationMs: analyzeDurationMs });
     if (!quality.fullPassed) {
-      outcome = "B11 BLOCKED — LIVE CONTRACT FAILURE";
-      throw Object.assign(new Error("The live five-case result failed the shared quality evaluator."), { code: "LIVE_QUALITY_FAILURE", status: 200, failedRole: "not_available" });
+      outcome = "B11-R1 BLOCKED — LIVE REHEARSAL FAILED";
+      throw Object.assign(new Error("The live five-case result failed the shared quality evaluator."), { code: "LIVE_QUALITY_FAILURE", status: 200 });
     }
 
     const case01 = analyzed.incidents.find(incident => incident.label === "01");
     if (!case01) {
-      outcome = "B11 BLOCKED — LIVE CONTRACT FAILURE";
-      throw Object.assign(new Error("CASE 01 is missing."), { code: "LIVE_CONTRACT_FAILURE", status: 200, failedRole: "not_available" });
+      outcome = "B11-R1 BLOCKED — LIVE REHEARSAL FAILED";
+      throw Object.assign(new Error("CASE 01 is missing."), { code: "LIVE_CONTRACT_FAILURE", status: 200 });
     }
     const submission = chooseDecision(case01);
     const decision = await client.recordHumanDecision({
@@ -165,8 +243,8 @@ async function run({ log = console.log } = {}) {
       brief.brief?.executionStatus === "NOT_EXECUTED" && audit.chainValid === true &&
       proofValid.valid === true && proofInvalid.valid === false && sensitiveMatches.length === 0;
     if (!contractPassed) {
-      outcome = "B11 BLOCKED — LIVE CONTRACT FAILURE";
-      throw Object.assign(new Error("Post-analysis Decision, Brief, Audit, Proof or security contract failed."), { code: "LIVE_CONTRACT_FAILURE", status: 200, failedRole: "not_available" });
+      outcome = "B11-R1 BLOCKED — LIVE REHEARSAL FAILED";
+      throw Object.assign(new Error("Post-analysis Decision, Brief, Audit, Proof or security contract failed."), { code: "LIVE_CONTRACT_FAILURE", status: 200 });
     }
 
     summary = {
@@ -198,14 +276,19 @@ async function run({ log = console.log } = {}) {
       tamperInvalid: proofInvalid.valid === false,
       sensitiveMatches: sensitiveMatches.length
     };
-    outcome = "B11 PASS — Demo reliability and final live rehearsal completed";
+    outcome = "B11-R1 PASS — Full live workflow completed";
   } catch (error) {
-    if (analyzeContractReached || summary.httpStatus === 200) outcome = "B11 BLOCKED — LIVE CONTRACT FAILURE";
+    const safeFailure = capturedSafeFailure || sanitizeSafeFailure(error, { status: error?.status });
+    if (analyzeContractReached || summary.httpStatus === 200) outcome = "B11-R1 BLOCKED — LIVE REHEARSAL FAILED";
     summary = {
       ...summary,
-      safeError: error?.code || "UNKNOWN_SAFE_ERROR",
-      httpStatus: error?.status || summary.httpStatus || "Not available",
-      failedRole: ["analyst", "reviewer", "both", "not_available"].includes(error?.failedRole) ? error.failedRole : "not_available"
+      safeFailure,
+      safeError: safeFailure.code,
+      httpStatus: safeFailure.status,
+      analyzeDurationMs: statuses["/api/incidents/analyze"]?.durationMs ?? summary.analyzeDurationMs,
+      failedRole: safeFailure.failedRole,
+      roleErrors: safeFailure.roleErrors,
+      validationIssuePaths: safeFailure.validationIssuePaths
     };
   } finally {
     await closeServer(server);
@@ -213,8 +296,8 @@ async function run({ log = console.log } = {}) {
 
   const randomPortResidue = await isPortListening(port);
   const fixedPortResidue = await isPortListening(4173);
-  if (randomPortResidue || fixedPortResidue) outcome = "B11 BLOCKED — LIVE CONTRACT FAILURE";
-  log("B11-B Single Live Judge Rehearsal");
+  if (randomPortResidue || fixedPortResidue) outcome = "B11-R1 BLOCKED — LIVE REHEARSAL FAILED";
+  log("B11-R1 Single Live Judge Rehearsal");
   log(`Health: ${summary.health || "BLOCKED"}`);
   log(`Analyze HTTP Status: ${summary.httpStatus ?? "Not available"}`);
   log(`Analyze Duration: ${summary.analyzeDurationMs ?? "Not available"}ms`);
@@ -229,6 +312,9 @@ async function run({ log = console.log } = {}) {
   log(`Human Action: ${summary.action || "Not recorded"}`);
   log(`Decision / Execution: ${summary.decisionStatus || "Not available"} / ${summary.executionStatus || "Not available"}`);
   log(`Brief / Audit / Proof: ${summary.briefStatus || "Not available"} / ${summary.auditValid === true ? "VALID" : "Not available"} / ${summary.proofValid === true && summary.tamperInvalid === true ? "VALID + TAMPER DETECTED" : "Not available"}`);
+  if (summary.safeFailure) {
+    for (const line of formatSafeFailureSummary(summary.safeFailure)) log(line);
+  }
   log(`Analyze Requests: ${analyzeRequestCount}`);
   log(`Inference Requests: ${inferenceRequestCount}`);
   log(`Automatic Retries: ${automaticRetryCount}`);
@@ -240,7 +326,7 @@ async function run({ log = console.log } = {}) {
   log(`Random Port Residue: ${randomPortResidue ? "FAIL" : "PASS"}`);
   log(`Port 4173 Residue: ${fixedPortResidue ? "FAIL" : "PASS"}`);
   log(`Outcome: ${outcome}`);
-  return { success: outcome.startsWith("B11 PASS"), outcome };
+  return { success: outcome.startsWith("B11-R1 PASS"), outcome };
 }
 
 if (require.main === module) {
@@ -249,4 +335,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { run, approveAllowed, chooseDecision };
+module.exports = { run, approveAllowed, chooseDecision, sanitizeSafeFailure, formatSafeFailureSummary };

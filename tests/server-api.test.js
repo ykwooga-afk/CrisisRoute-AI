@@ -405,6 +405,54 @@ for (const networkCase of [
   });
 }
 
+for (const failedRole of ["analyst", "reviewer"]) {
+  test(`${failedRole} HTTP_ERROR maps to safe HTTP 502 with failedRole`, async t => {
+    const client = configuredFakeClient(async request => {
+      const role = request.model === DEFAULT_MODELS.analyst ? "analyst" : "reviewer";
+      if (role === failedRole) throw unsafeUpstreamError("HTTP_ERROR");
+      return roleResult(request, batchRoleData(role), "SUCCESS_MODEL_RAW_MUST_NOT_LEAK");
+    });
+    const baseUrl = await startServer(t, createServer({ gonkaClientFactory: () => client }));
+    const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(scenarioPayload())
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 502);
+    assert.equal(body.error.code, "HTTP_ERROR");
+    assert.equal(body.error.failedRole, failedRole);
+    assertSafeErrorBody(body);
+  });
+}
+
+for (const invalidRole of ["analyst", "reviewer", "both"]) {
+  test(`${invalidRole} fulfilled-invalid response maps to safe role diagnostics`, async t => {
+    const client = configuredFakeClient(async request => {
+      const role = request.model === DEFAULT_MODELS.analyst ? "analyst" : "reviewer";
+      const data = batchRoleData(role);
+      if (invalidRole === "both" || invalidRole === role) {
+        data.cases[0].scores.urgency = "RAW_MODEL_CONTENT_MUST_NOT_LEAK";
+      }
+      return roleResult(request, data, "SUCCESS_MODEL_RAW_MUST_NOT_LEAK");
+    });
+    const baseUrl = await startServer(t, createServer({ gonkaClientFactory: () => client }));
+    const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(scenarioPayload())
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 502);
+    assert.equal(body.error.code, "INVALID_MODEL_DATA");
+    assert.equal(body.error.failedRole, invalidRole);
+    assert.ok(body.error.issuePaths.length > 0);
+    assertSafeErrorBody(body);
+  });
+}
+
 test("mixed Analyst NETWORK_ERROR and Reviewer TIMEOUT expose only safe role classifications", async t => {
   const client = configuredFakeClient(async request => {
     if (request.model === DEFAULT_MODELS.analyst) throw unsafeUpstreamError("NETWORK_ERROR");

@@ -11,7 +11,8 @@
     "smoke:case01": "node scripts/case01-live-smoke.js",
     "smoke:scenario": "node scripts/full-scenario-live-smoke.js",
     "smoke:decision": "node scripts/decision-flow-smoke.js",
-    "smoke:brief": "node scripts/brief-proof-smoke.js"
+    "smoke:brief": "node scripts/brief-proof-smoke.js",
+    "smoke:frontend": "node scripts/frontend-workflow-smoke.js"
   },
   "keywords": [
     "gonka",

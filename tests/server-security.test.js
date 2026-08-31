@@ -101,6 +101,7 @@ test("static server exposes only the public allowlist", { timeout: 20_000 }, asy
     "/CrisisRoute-AI-Latest-App.html",
     "/src/main.js",
     "/src/styles.css",
+    "/src/ui/decisionWorkflow.js",
     "/src/assets/favicon.svg"
   ];
 
@@ -136,6 +137,8 @@ test("static server exposes only the public allowlist", { timeout: 20_000 }, asy
     "/scripts/full-scenario-live-smoke.js",
     "/scripts/decision-flow-smoke.js",
     "/scripts/brief-proof-smoke.js",
+    "/scripts/frontend-workflow-smoke.js",
+    "/tests/frontend-workflow.test.js",
     "/src/../.env.local",
     "/src/%2e%2e/.env.local",
     "/src/%2e%2e%2f.env.local",

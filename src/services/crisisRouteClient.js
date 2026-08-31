@@ -7,50 +7,120 @@ export const DATA_MODES = {
   replay: "replay"
 };
 
+export class CrisisRouteClientError extends Error {
+  constructor({ status = 0, code = "CLIENT_ERROR", message = "The request could not be completed.", retryable = false, failedRole, roleErrors } = {}) {
+    super(message);
+    this.name = "CrisisRouteClientError";
+    this.status = status;
+    this.code = code;
+    this.retryable = retryable === true;
+    if (["analyst", "reviewer", "both", "not_available"].includes(failedRole)) this.failedRole = failedRole;
+    if (roleErrors && typeof roleErrors === "object" && !Array.isArray(roleErrors)) {
+      const safeRoleErrors = {};
+      for (const role of ["analyst", "reviewer"]) {
+        if (typeof roleErrors[role] === "string" && roleErrors[role].length <= 80) safeRoleErrors[role] = roleErrors[role];
+      }
+      if (Object.keys(safeRoleErrors).length) this.roleErrors = safeRoleErrors;
+    }
+  }
+}
+
+function joinUrl(baseUrl, path) {
+  return baseUrl ? `${String(baseUrl).replace(/\/$/, "")}${path}` : path;
+}
+
+function safeClientError(status, body, fallbackMessage) {
+  const source = body?.error && typeof body.error === "object" ? body.error : {};
+  return new CrisisRouteClientError({
+    status,
+    code: typeof source.code === "string" ? source.code.slice(0, 80) : "HTTP_ERROR",
+    message: typeof source.message === "string" ? source.message.slice(0, 300) : fallbackMessage,
+    retryable: source.retryable === true,
+    failedRole: source.failedRole,
+    roleErrors: source.roleErrors
+  });
+}
+
+export function createCrisisRouteClient({
+  fetchImpl = (...args) => globalThis.fetch(...args),
+  baseUrl = ""
+} = {}) {
+  async function requestJson(path, { method = "GET", body, headers = {} } = {}) {
+    let response;
+    try {
+      response = await fetchImpl(joinUrl(baseUrl, path), {
+        method,
+        headers: {
+          Accept: "application/json",
+          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          ...headers
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) })
+      });
+    } catch {
+      throw new CrisisRouteClientError({ code: "NETWORK_ERROR", message: "The local CrisisRoute service is unavailable.", retryable: true });
+    }
+    let payload;
+    try {
+      const text = await response.text();
+      if (text.length > 200_000) throw new Error("oversized");
+      payload = JSON.parse(text);
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("invalid shape");
+    } catch {
+      throw new CrisisRouteClientError({
+        status: response.status,
+        code: "INVALID_RESPONSE",
+        message: "The local service returned an invalid response."
+      });
+    }
+    if (!response.ok) throw safeClientError(response.status, payload, "The local request was not accepted.");
+    return payload;
+  }
+
+  return Object.freeze({
+    loadScenario: messages => requestJson("/api/incidents/analyze", {
+      method: "POST",
+      body: { scenario: "malaysia_haze_fire_smoke", messages }
+    }),
+    analyzeIncidents: messages => requestJson("/api/incidents/analyze", {
+      method: "POST",
+      body: { messages }
+    }),
+    recordHumanDecision: ({ caseId, submission, idempotencyKey }) => requestJson(
+      `/api/incidents/${encodeURIComponent(caseId)}/decision`,
+      {
+        method: "POST",
+        headers: idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {},
+        body: {
+          action: submission.action,
+          reason: submission.reason,
+          acknowledgeHumanDecision: submission.acknowledgeHumanDecision === true,
+          acknowledgeNoAutomaticExecution: submission.acknowledgeNoAutomaticExecution === true,
+          acknowledgeReview: submission.acknowledgeReview === true
+        }
+      }
+    ),
+    getCaseAudit: caseId => requestJson(`/api/incidents/${encodeURIComponent(caseId)}/audit`),
+    generateDeterministicBrief: caseId => requestJson(`/api/incidents/${encodeURIComponent(caseId)}/brief`, { method: "POST" }),
+    verifyProofCapsule: ({ brief, proofCapsule }) => requestJson("/api/proof/verify", {
+      method: "POST",
+      body: { brief, proofCapsule }
+    }),
+    getHealth: () => requestJson("/api/health/gonka")
+  });
+}
+
+const browserClient = createCrisisRouteClient();
+
 export async function loadHazeScenario(mode = DATA_MODES.mock) {
   await wait(320);
-
-  if (mode === DATA_MODES.replay) {
-    return getReplayScenario();
-  }
-
-  if (mode === DATA_MODES.live) {
-    const response = await fetch("/api/incidents/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        scenario: "malaysia_haze_fire_smoke",
-        messages: rawReports
-      })
-    });
-
-    if (!response.ok) {
-      const error = await safeJson(response);
-      throw new Error(error?.message || "Live Gonka backend is not ready yet.");
-    }
-
-    return response.json();
-  }
-
+  if (mode === DATA_MODES.replay) return getReplayScenario();
+  if (mode === DATA_MODES.live) return browserClient.loadScenario(rawReports);
   return cloneScenario();
 }
 
 export async function analyzeIncidents(messages, mode = DATA_MODES.mock) {
-  if (mode === DATA_MODES.live) {
-    const response = await fetch("/api/incidents/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages })
-    });
-
-    if (!response.ok) {
-      const error = await safeJson(response);
-      throw new Error(error?.message || "Live Gonka analysis failed.");
-    }
-
-    return response.json();
-  }
-
+  if (mode === DATA_MODES.live) return browserClient.analyzeIncidents(messages);
   const scenario = mode === DATA_MODES.replay ? getReplayScenario() : cloneScenario();
   return {
     ...scenario,
@@ -60,127 +130,85 @@ export async function analyzeIncidents(messages, mode = DATA_MODES.mock) {
   };
 }
 
-export async function submitHumanDecision(incident, decision, mode = DATA_MODES.mock) {
-  const decidedAt = new Date().toISOString();
-
+export async function submitHumanDecision(incident, submission, mode = DATA_MODES.mock, idempotencyKey) {
   if (mode === DATA_MODES.live) {
-    const action = normalizeLiveDecision(decision, incident.operationalState);
-    const reason = liveDecisionReason(decision);
-    const acknowledgeReview = incident.safetyGates?.some(
-      gate => gate.id === "G_CONFLICT" && gate.status === "review"
-    ) === true;
-    const response = await fetch(`/api/incidents/${incident.caseId}/decision`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action,
-        reason,
-        acknowledgeHumanDecision: true,
-        acknowledgeNoAutomaticExecution: true,
-        acknowledgeReview
-      })
-    });
-
-    if (!response.ok) {
-      const error = await safeJson(response);
-      throw new Error(error?.error?.message || error?.message || "Decision API failed.");
-    }
-
-    const result = await response.json();
-    let briefResult = null;
-    if (result.decision.action === "APPROVE_ACTION") {
-      const briefResponse = await fetch(`/api/incidents/${incident.caseId}/brief`, { method: "POST" });
-      if (!briefResponse.ok) {
-        const error = await safeJson(briefResponse);
-        throw new Error(error?.error?.message || error?.message || "Brief generation failed.");
-      }
-      briefResult = await briefResponse.json();
-    }
-    return {
-      ...incident,
-      actionBrief: briefResult
-        ? { en: [briefResult.brief.summary, ...briefResult.brief.nextSteps].join(" ") }
-        : incident.actionBrief,
-      operationalBrief: briefResult?.brief || incident.operationalBrief,
-      proofCapsule: briefResult?.proofCapsule || incident.proofCapsule,
-      humanDecision: {
-        decision,
-        canonicalAction: result.decision.action,
-        decidedAt: result.decision.recordedAt,
-        decidedBy: "Local human operator",
-        recordStatus: result.decision.recordStatus,
-        executionStatus: result.decision.executionStatus,
-        requiresExternalExecution: result.decision.requiresExternalExecution
-      },
-      decisionAudit: result.audit
-    };
+    return browserClient.recordHumanDecision({ caseId: incident.caseId, submission, idempotencyKey });
   }
-
-  const receiptPayload = {
-    caseId: incident.caseId,
-    evidenceHashes: incident.evidence.map(item => `sha256:${simpleHash(item.id + item.summary)}`),
-    gonkaResponseIds: [incident.gonka.analyst.responseId, incident.gonka.reviewer.responseId],
-    promptVersions: [incident.gonka.analyst.promptVersion, incident.gonka.reviewer.promptVersion],
-    decision,
-    approvedByRole: "Coordinator Aisha Rahman",
-    timestamp: decidedAt
-  };
-
+  const recordedAt = new Date().toISOString();
   return {
-    ...incident,
-    humanDecision: {
-      decision,
-      decidedAt,
-      decidedBy: "Coordinator Aisha Rahman"
-    },
-    proofCapsule: {
-      ...receiptPayload,
-      receiptHash: `sha256:${simpleHash(JSON.stringify(receiptPayload))}`
+    ok: true,
+    replayed: false,
+    demoOnly: true,
+    decision: {
+      decisionId: `DEMO-${simpleHash(`${incident.caseId}:${recordedAt}`)}`,
+      caseId: incident.caseId,
+      action: submission.action,
+      reason: submission.reason,
+      actorType: "demo_operator",
+      authentication: "demo_only",
+      recordedAt,
+      aiRecommendation: incident.operationalState,
+      override: false,
+      recordStatus: "RECORDED",
+      executionStatus: "NOT_EXECUTED",
+      requiresExternalExecution: ["APPROVE_ACTION", "REQUEST_VERIFICATION", "MERGE_REPORT", "QUEUE_ACTION"].includes(submission.action)
     }
   };
 }
 
-export async function generateActionBrief(incident, mode = DATA_MODES.mock) {
-  if (mode === DATA_MODES.live) {
-    return incident.actionBrief;
-  }
-
-  await wait(240);
-  return incident.actionBrief || incident.actionPlan?.languages || {
-    en: incident.recommendedAction,
-    zh: "请先补充缺失资料，再安排志愿者行动。",
-    ms: "Sila lengkapkan maklumat yang hilang sebelum tindakan sukarelawan."
+export async function generateActionBrief(incident, decision, mode = DATA_MODES.mock) {
+  if (mode === DATA_MODES.live) return browserClient.generateDeterministicBrief(incident.caseId);
+  await wait(120);
+  const priority = incident.scores.urgency >= 80 ? "CRITICAL" : incident.scores.urgency >= 60 ? "HIGH" : "MEDIUM";
+  return {
+    ok: true,
+    replayed: false,
+    demoOnly: true,
+    brief: {
+      briefVersion: "DEMO_ONLY",
+      briefId: `DEMO-${incident.caseId}`,
+      caseId: incident.caseId,
+      status: "DEMO_ONLY",
+      title: "Demo-only decision handoff",
+      decisionAction: decision.action,
+      priority,
+      summary: "DEMO ONLY — this local snapshot is not a server-issued operational brief.",
+      nextSteps: [...(incident.safeNextActions || [])],
+      safetyConstraints: ["No real-world action is executed by this demo."],
+      recordStatus: "RECORDED",
+      executionStatus: "NOT_EXECUTED"
+    },
+    proofCapsule: null
   };
 }
 
-function normalizeLiveDecision(decision, operationalState) {
-  const aliases = {
-    APPROVED: "APPROVE_ACTION",
-    URGENT_VERIFICATION: "REQUEST_VERIFICATION",
-    NEEDS_MORE_INFO: "REQUEST_VERIFICATION"
+export async function getCaseAudit(caseId, mode = DATA_MODES.mock, decision) {
+  if (mode === DATA_MODES.live) return browserClient.getCaseAudit(caseId);
+  return {
+    ok: true,
+    demoOnly: true,
+    caseId,
+    entryCount: decision ? 1 : 0,
+    entries: decision ? [{
+      sequence: 1,
+      action: decision.action,
+      recordedAt: decision.recordedAt,
+      previousHash: null,
+      entryHash: "DEMO_ONLY_NOT_SERVER_ISSUED"
+    }] : [],
+    chainValid: null,
+    persistence: "demo_only",
+    externalAnchoring: "none"
   };
-  if (decision === "MERGE_OR_REJECT") {
-    return operationalState === "MERGE_OR_VERIFY" ? "MERGE_REPORT" : "REJECT_ACTION";
-  }
-  return aliases[decision] || decision;
 }
 
-function liveDecisionReason(decision) {
-  const reasons = {
-    APPROVED: "Human selected Approve Dispatch in the local demo UI.",
-    URGENT_VERIFICATION: "Human selected Urgent Verify in the local demo UI.",
-    NEEDS_MORE_INFO: "Human requested more information in the local demo UI.",
-    MERGE_OR_REJECT: "Human selected Merge or Reject in the local demo UI."
-  };
-  return reasons[decision] || "Human selected this decision in the local demo UI.";
-}
+export const verifyProofCapsule = payload => browserClient.verifyProofCapsule(payload);
 
 export async function getGonkaHealth() {
   try {
-    const response = await fetch("/api/health/gonka");
-    return await response.json();
-  } catch {
-    return { ok: false, message: "Local health route unavailable." };
+    return await browserClient.getHealth();
+  } catch (error) {
+    return { ok: false, liveRoutesReady: false, message: error.message };
   }
 }
 
@@ -280,14 +308,6 @@ function inferNeeds(message) {
 function extractLocationHint(message) {
   const match = message.match(/(Block\s+[A-Z]|Hostel\s+[A-Z]|Shah Alam|campus field|room\s+\w+)/i);
   return match ? match[0] : "Location mentioned, needs cleanup";
-}
-
-async function safeJson(response) {
-  try {
-    return await response.json();
-  } catch {
-    return null;
-  }
 }
 
 function wait(ms) {

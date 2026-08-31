@@ -3,6 +3,7 @@ const { DEFAULT_MODELS } = require("./gonkaClient");
 const {
   SCENARIO_ID,
   CASE_LABELS,
+  isCanonicalHazeMessages,
   createHazeScenarioCases,
   cloneResources
 } = require("./hazeScenario");
@@ -54,7 +55,7 @@ Actionability—readiness for a human-approved response: 0-29 essential location
 const ANALYST_BATCH_SYSTEM_PROMPT = `${BATCH_COMMON_RULES}
 ${SCORING_RUBRIC}
 You are an independent batch Analyst. Assess the original evidence only.
-Return exactly: {"cases":[{"label":"01","scores":{"verification":0,"urgency":0,"actionability":0},"riskFlags":[],"unknowns":[]}]}`;
+Return exactly: {"cases":[{"label":"01","scores":{"verification":0,"urgency":0,"actionability":0},"riskFlags":[],"unknowns":[]},{"label":"02","scores":{"verification":0,"urgency":0,"actionability":0},"riskFlags":[],"unknowns":[]},{"label":"03","scores":{"verification":0,"urgency":0,"actionability":0},"riskFlags":[],"unknowns":[]},{"label":"04","scores":{"verification":0,"urgency":0,"actionability":0},"riskFlags":[],"unknowns":[]},{"label":"05","scores":{"verification":0,"urgency":0,"actionability":0},"riskFlags":[],"unknowns":[]}]}`;
 
 const REVIEWER_BATCH_SYSTEM_PROMPT = `Independent blind reviewer. Use only supplied facts; do not assume missing facts.
 ${SCORING_RUBRIC}
@@ -151,6 +152,13 @@ function invalidRequest() {
   return new IncidentPipelineError(
     "INVALID_REQUEST",
     "Request messages must contain one or two non-empty strings, or the supported CASE 01 scenario."
+  );
+}
+
+function invalidScenarioInput() {
+  return new IncidentPipelineError(
+    "INVALID_SCENARIO_INPUT",
+    "The fixed haze demonstration scenario input is invalid."
   );
 }
 
@@ -761,7 +769,14 @@ function buildIncident({ request, analyst, reviewer, analystTrace, reviewerTrace
 
 function validateFullScenarioRequest(payload) {
   if (!isObject(payload) || payload.scenario !== SCENARIO_ID) throw invalidRequest();
-  const messages = validateMessageArray(payload.messages, { min: 5, max: 5 });
+  if (!Array.isArray(payload.messages) || payload.messages.length !== 5) throw invalidScenarioInput();
+  const messages = payload.messages.map(message => {
+    if (typeof message !== "string") throw invalidScenarioInput();
+    const trimmed = message.trim();
+    if (!trimmed || trimmed.length > MAX_MESSAGE_LENGTH) throw invalidScenarioInput();
+    return trimmed;
+  });
+  if (!isCanonicalHazeMessages(messages)) throw invalidScenarioInput();
   return {
     scenario: SCENARIO_ID,
     messages,
@@ -1094,6 +1109,32 @@ function validateRoleData(role, validator, data) {
   }
 }
 
+function validateFulfilledRoleData({ analystValidator, analystData, reviewerValidator, reviewerData }) {
+  const outcomes = [
+    { role: "analyst", validator: analystValidator, data: analystData },
+    { role: "reviewer", validator: reviewerValidator, data: reviewerData }
+  ].map(item => {
+    try {
+      return { role: item.role, value: validateRoleData(item.role, item.validator, item.data) };
+    } catch (error) {
+      return { role: item.role, error };
+    }
+  });
+  const failures = outcomes.filter(outcome => outcome.error);
+  if (failures.length) {
+    const role = failures.length === 2 ? "both" : failures[0].role;
+    const issues = failures.flatMap(outcome =>
+      Array.isArray(outcome.error?.issues) && outcome.error.issues.length
+        ? outcome.error.issues
+        : ["payload:not_object"]);
+    throw invalidModelData(role, issues);
+  }
+  return {
+    analyst: outcomes[0].value,
+    reviewer: outcomes[1].value
+  };
+}
+
 async function analyzeCase01({ payload, client, now = new Date() }) {
   const request = validateAnalyzeRequest(payload);
   if (!client || typeof client.completeJson !== "function") {
@@ -1129,8 +1170,12 @@ async function analyzeCase01({ payload, client, now = new Date() }) {
   safeRoleFailure(settledResults);
   const analystResult = settledResults[0].value;
   const reviewerResult = settledResults[1].value;
-  const analyst = validateRoleData("analyst", normalizeAnalystData, analystResult.data);
-  const reviewer = validateRoleData("reviewer", normalizeReviewerData, reviewerResult.data);
+  const { analyst, reviewer } = validateFulfilledRoleData({
+    analystValidator: normalizeAnalystData,
+    analystData: analystResult.data,
+    reviewerValidator: normalizeReviewerData,
+    reviewerData: reviewerResult.data
+  });
   const incident = buildIncident({
     request,
     analyst,
@@ -1189,8 +1234,12 @@ async function analyzeFullHazeScenario({ payload, client, now = new Date() }) {
   safeRoleFailure(settledResults);
   const analystResult = settledResults[0].value;
   const reviewerResult = settledResults[1].value;
-  const analystBatch = validateRoleData("analyst", normalizeBatchAnalystData, analystResult.data);
-  const reviewerBatch = validateRoleData("reviewer", normalizeBatchReviewerData, reviewerResult.data);
+  const { analyst: analystBatch, reviewer: reviewerBatch } = validateFulfilledRoleData({
+    analystValidator: normalizeBatchAnalystData,
+    analystData: analystResult.data,
+    reviewerValidator: normalizeBatchReviewerData,
+    reviewerData: reviewerResult.data
+  });
   const normalizedNow = now instanceof Date ? now : new Date(now);
   const incidents = request.cases.map((caseDefinition, index) => buildFullScenarioIncident({
     caseDefinition,

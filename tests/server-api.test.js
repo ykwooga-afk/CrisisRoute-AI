@@ -9,18 +9,13 @@ const {
   DEFAULT_MODELS
 } = require("../backend/gonkaClient");
 const { IncidentPipelineError } = require("../backend/incidentPipeline");
+const { CANONICAL_HAZE_MESSAGES } = require("../backend/hazeScenario");
 const {
   run: runCase01Smoke,
   LOCAL_SMOKE_TIMEOUT_MS
 } = require("../scripts/case01-live-smoke");
 
-const SCENARIO_MESSAGES = [
-  "Block C hostel: six students are coughing badly, one has asthma. Need N95 masks and clinic transport.",
-  "Another Block C resident reports heavy smoke smell and several students waiting near the lobby.",
-  "CASE 02 ignored",
-  "CASE 03 ignored",
-  "CASE 04 ignored"
-];
+const SCENARIO_MESSAGES = [...CANONICAL_HAZE_MESSAGES];
 
 function analystData() {
   return {
@@ -204,6 +199,55 @@ test("POST analyze returns all five scenario incidents using exactly two model c
     qualityWarnings: []
   });
   assert.doesNotMatch(JSON.stringify(result), /BATCH_RAW_MUST_NOT_LEAK|authorization|sk-[A-Za-z0-9_-]{12,}/i);
+});
+
+test("full scenario accepts canonical messages with whitespace-only differences", async t => {
+  let modelCalls = 0;
+  const client = configuredFakeClient(async request => {
+    modelCalls += 1;
+    const role = request.model === DEFAULT_MODELS.analyst ? "analyst" : "reviewer";
+    return roleResult(request, batchRoleData(role));
+  });
+  const baseUrl = await startServer(t, createServer({ gonkaClientFactory: () => client }));
+  const messages = CANONICAL_HAZE_MESSAGES.map(message => `  ${message.replaceAll(" ", "  \n\t")}  `);
+  const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scenario: "malaysia_haze_fire_smoke", messages })
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.incidents.length, 5);
+  assert.equal(modelCalls, 2);
+});
+
+test("changed fixed-scenario input returns safe 400 before model calls without canonical content", async t => {
+  let modelCalls = 0;
+  const client = configuredFakeClient(async () => { modelCalls += 1; });
+  const baseUrl = await startServer(t, createServer({ gonkaClientFactory: () => client }));
+  const messages = [...CANONICAL_HAZE_MESSAGES];
+  messages[0] = "UNTRUSTED_INPUT_MUST_NOT_BE_BOUND";
+  const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scenario: "malaysia_haze_fire_smoke", messages })
+  });
+  const body = await response.json();
+  const serialized = JSON.stringify(body);
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(body, {
+    ok: false,
+    error: {
+      code: "INVALID_SCENARIO_INPUT",
+      message: "The fixed haze demonstration scenario input is invalid.",
+      retryable: false
+    }
+  });
+  assert.equal(modelCalls, 0);
+  for (const canonical of CANONICAL_HAZE_MESSAGES) assert.equal(serialized.includes(canonical), false);
+  assert.doesNotMatch(serialized, /UNTRUSTED_INPUT|stack|cause|authorization|rawContent/i);
 });
 
 test("invalid JSON returns 400 without calling a model", async t => {

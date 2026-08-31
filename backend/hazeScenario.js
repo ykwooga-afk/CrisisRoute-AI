@@ -1,6 +1,13 @@
 const SCENARIO_ID = "malaysia_haze_fire_smoke";
 const CASE_LABELS = Object.freeze(["01", "02", "03", "04", "05"]);
 const CASE_05_FIXTURE = "Hostel B has no air purifier and around 20 students need water, masks and an indoor safe room.";
+const CANONICAL_HAZE_MESSAGES = Object.freeze([
+  "Block C hostel: six students are coughing badly, one has asthma. Need N95 masks and clinic transport.",
+  "Another Block C resident reports heavy smoke smell and several students waiting near the lobby.",
+  "FORWARD: 20 students trapped in Hostel B!!! Send everything now!!!",
+  "Family near Shah Alam says an elderly parent has breathing difficulty due to haze. Exact location and callback number are unclear.",
+  "Sports day is still scheduled despite haze; one notice says proceed, while another group claims cancellation."
+]);
 
 const RESOURCES = Object.freeze([
   Object.freeze({ id: "res_masks", label: "N95 masks", available: 160, unit: "pcs", status: "ready" }),
@@ -10,9 +17,21 @@ const RESOURCES = Object.freeze([
   Object.freeze({ id: "res_medical", label: "Medical volunteer", available: 1, unit: "person", status: "limited" })
 ]);
 
+function normalizeHazeMessage(value) {
+  if (typeof value !== "string") return null;
+  return value.normalize("NFKC").trim().replace(/\s+/gu, " ").toLowerCase();
+}
+
+function isCanonicalHazeMessages(messages) {
+  return Array.isArray(messages) &&
+    messages.length === CANONICAL_HAZE_MESSAGES.length &&
+    messages.every((message, index) =>
+      normalizeHazeMessage(message) === normalizeHazeMessage(CANONICAL_HAZE_MESSAGES[index]));
+}
+
 function createHazeScenarioCases(messages) {
-  if (!Array.isArray(messages) || messages.length !== 5) {
-    throw new TypeError("The full haze scenario requires exactly five frontend messages.");
+  if (!isCanonicalHazeMessages(messages)) {
+    throw new TypeError("The fixed haze demonstration scenario input is invalid.");
   }
 
   return [
@@ -148,6 +167,9 @@ module.exports = {
   SCENARIO_ID,
   CASE_LABELS,
   CASE_05_FIXTURE,
+  CANONICAL_HAZE_MESSAGES,
+  normalizeHazeMessage,
+  isCanonicalHazeMessages,
   createHazeScenarioCases,
   cloneResources
 };

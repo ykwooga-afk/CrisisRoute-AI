@@ -121,6 +121,14 @@ function mapApiError(error) {
     if (error.code === "INVALID_REQUEST") {
       return { status: 400, code: error.code, message: "Request body or messages are invalid.", retryable: false };
     }
+    if (error.code === "INVALID_SCENARIO_INPUT") {
+      return {
+        status: 400,
+        code: error.code,
+        message: "The fixed haze demonstration scenario input is invalid.",
+        retryable: false
+      };
+    }
     if (error.code === "INVALID_MODEL_DATA") {
       return {
         status: 502,

@@ -1,14 +1,10 @@
 const endpoint = "http://127.0.0.1:4173/api/incidents/analyze";
 const healthEndpoint = "http://127.0.0.1:4173/api/health/gonka";
 const LOCAL_SCENARIO_TIMEOUT_MS = 75_000;
+const { CANONICAL_HAZE_MESSAGES } = require("../backend/hazeScenario");
+const { DEFAULT_MODELS } = require("../backend/gonkaClient");
 
-const messages = [
-  "Block C hostel: six students are coughing badly, one has asthma. Need N95 masks and clinic transport.",
-  "Another Block C resident reports heavy smoke smell and several students waiting near the lobby.",
-  "FORWARD: 20 students trapped in Hostel B!!! Send everything now!!!",
-  "Family near Shah Alam says an elderly parent has breathing difficulty due to haze. Exact location and callback number are unclear.",
-  "Sports day is still scheduled despite haze; one notice says proceed, while another group claims cancellation."
-];
+const messages = CANONICAL_HAZE_MESSAGES;
 
 const expectedStates = new Map([
   ["01", "DISPATCH_CANDIDATE"],
@@ -31,7 +27,7 @@ function containsSensitiveOrRawContent(value) {
     .test(JSON.stringify(value));
 }
 
-function incidentContractPassed(incident) {
+function incidentShapeContractPassed(incident) {
   return Boolean(
     incident &&
     requiredIncidentFields.every(field => Object.hasOwn(incident, field)) &&
@@ -40,8 +36,81 @@ function incidentContractPassed(incident) {
       Number.isFinite(incident.scores?.[axis]) && incident.scores[axis] >= 0 && incident.scores[axis] <= 100) &&
     Array.isArray(incident.safetyGates) &&
     incident.safetyGates.length === 6 &&
+    Array.isArray(incident.qualityWarnings) &&
     incident.gonka?.mode === "live"
   );
+}
+
+function evaluateScenarioQuality(result) {
+  const incidents = Array.isArray(result?.incidents) ? result.incidents : [];
+  const byLabel = new Map(incidents.map(incident => [incident?.label, incident]));
+  const score = (label, axis) => byLabel.get(label)?.scores?.[axis];
+  const finite = value => Number.isFinite(value);
+  const directionalPassed = incidents.length === 5 && [
+    finite(score("01", "urgency")) && score("01", "urgency") >= 60,
+    finite(score("01", "actionability")) && score("01", "actionability") >= 50,
+    finite(score("02", "verification")) && score("02", "verification") <= 59,
+    finite(score("03", "urgency")) && score("03", "urgency") >= 60,
+    finite(score("03", "actionability")) && score("03", "actionability") <= 59,
+    finite(score("04", "actionability")) && score("04", "actionability") <= 59,
+    finite(score("05", "actionability")) && score("05", "actionability") >= 50
+  ].every(Boolean);
+
+  const validConsensus = new Set(["AGREEMENT", "DISAGREEMENT", "CRITICAL_CONFLICT"]);
+  const consensusValuesValid = incidents.length === 5 &&
+    incidents.every(incident => validConsensus.has(incident?.modelDebate?.consensus));
+  const criticalConflictCount = incidents.filter(
+    incident => incident?.modelDebate?.consensus === "CRITICAL_CONFLICT"
+  ).length;
+  const consensusPassed = consensusValuesValid && criticalConflictCount <= 2;
+
+  const fatalWarnings = new Set([
+    "URGENT_STATE_LOW_URGENCY_SCORE",
+    "ACTION_READY_LOW_ACTIONABILITY_SCORE"
+  ]);
+  const warningsPassed = incidents.length === 5 && incidents.every(incident =>
+    Array.isArray(incident?.qualityWarnings) &&
+    !incident.qualityWarnings.some(warning => fatalWarnings.has(warning)));
+
+  const validTrace = (incident, role, expectedModel) => {
+    const trace = incident?.gonka?.[role];
+    return trace?.model === expectedModel &&
+      typeof trace.responseId === "string" && trace.responseId.trim().length > 0 &&
+      Number.isFinite(trace.latencyMs) && trace.latencyMs >= 0;
+  };
+  const analystIds = incidents.map(incident => incident?.gonka?.analyst?.responseId);
+  const reviewerIds = incidents.map(incident => incident?.gonka?.reviewer?.responseId);
+  const tracePassed = incidents.length === 5 &&
+    incidents.every(incident => validTrace(incident, "analyst", DEFAULT_MODELS.analyst)) &&
+    incidents.every(incident => validTrace(incident, "reviewer", DEFAULT_MODELS.reviewer)) &&
+    new Set(analystIds).size === 1 &&
+    new Set(reviewerIds).size === 1;
+
+  const materialConflictLabels = new Set(["04"]);
+  const gateConsistencyPassed = incidents.length === 5 && incidents.every(incident => {
+    const consensus = incident?.modelDebate?.consensus;
+    if (!validConsensus.has(consensus) || !Array.isArray(incident?.safetyGates)) return false;
+    const conflictGate = incident.safetyGates.find(gate => gate?.id === "G_CONFLICT");
+    const dispatchGate = incident.safetyGates.find(gate => gate?.id === "G_DISPATCH");
+    if (!conflictGate || !dispatchGate) return false;
+    const expectedConflict = consensus === "AGREEMENT" && !materialConflictLabels.has(incident.label)
+      ? "passed"
+      : "review";
+    const expectedDispatch = incident.operationalState === "DISPATCH_CANDIDATE"
+      ? consensus === "AGREEMENT" ? "passed" : "review"
+      : "locked";
+    return conflictGate.status === expectedConflict && dispatchGate.status === expectedDispatch;
+  });
+
+  return {
+    directionalPassed,
+    criticalConflictCount,
+    consensusPassed,
+    warningsPassed,
+    tracePassed,
+    gateConsistencyPassed,
+    passed: directionalPassed && consensusPassed && warningsPassed && tracePassed && gateConsistencyPassed
+  };
 }
 
 function safeErrorSummary(error) {
@@ -113,11 +182,21 @@ async function run({
   const incidents = Array.isArray(result?.incidents) ? result.incidents : [];
   const labels = incidents.map(item => item.label);
   const uniqueCaseIds = new Set(incidents.map(item => item.caseId)).size;
-  const schemaPassed = incidents.length === 5 && incidents.every(incidentContractPassed);
-  const uiPassed = schemaPassed && labels.join(",") === "01,02,03,04,05";
+  const shapePassed = incidents.length === 5 && incidents.every(incidentShapeContractPassed);
+  const uiPassed = shapePassed && labels.join(",") === "01,02,03,04,05";
   const sensitiveFound = containsSensitiveOrRawContent(result);
   const analystIds = new Set(incidents.map(item => item.gonka?.analyst?.responseId));
   const reviewerIds = new Set(incidents.map(item => item.gonka?.reviewer?.responseId));
+  const analystSharedTrace = incidents.length === 5 &&
+    incidents.every(item => typeof item.gonka?.analyst?.responseId === "string" && item.gonka.analyst.responseId.trim()) &&
+    analystIds.size === 1;
+  const reviewerSharedTrace = incidents.length === 5 &&
+    incidents.every(item => typeof item.gonka?.reviewer?.responseId === "string" && item.gonka.reviewer.responseId.trim()) &&
+    reviewerIds.size === 1;
+  const quality = evaluateScenarioQuality(result);
+  const healthPassed = health?.ok === true &&
+    health?.liveRoutesReady === true &&
+    health?.capabilities?.fullScenario === true;
 
   log(`Incident Count: ${incidents.length}`);
   log(`Labels: ${labels.join(", ") || "None"}`);
@@ -141,16 +220,30 @@ async function run({
   const reviewerLatency = first?.gonka?.reviewer?.latencyMs;
   const latencyPresent = Number.isFinite(analystLatency) && Number.isFinite(reviewerLatency);
   const timingConsistent = latencyPresent && durationMs + 100 >= Math.max(analystLatency, reviewerLatency);
+  const overallQualityPassed = healthPassed &&
+    shapePassed &&
+    uiPassed &&
+    quality.passed &&
+    timingConsistent &&
+    result?.meta?.modelRequestCount === 2 &&
+    !sensitiveFound;
   log(`Analyst Model: ${first?.gonka?.analyst?.model || "Not Available"}`);
   log(`Analyst Response ID: ${first?.gonka?.analyst?.responseId || "Not Available"}`);
   log(`Analyst Latency: ${analystLatency ?? "Not Available"}ms`);
-  log(`Analyst Shared Trace: ${analystIds.size === 1 ? "Yes" : "No"}`);
+  log(`Analyst Shared Trace: ${analystSharedTrace ? "Yes" : "No"}`);
   log(`Reviewer Model: ${first?.gonka?.reviewer?.model || "Not Available"}`);
   log(`Reviewer Response ID: ${first?.gonka?.reviewer?.responseId || "Not Available"}`);
   log(`Reviewer Latency: ${reviewerLatency ?? "Not Available"}ms`);
-  log(`Reviewer Shared Trace: ${reviewerIds.size === 1 ? "Yes" : "No"}`);
+  log(`Reviewer Shared Trace: ${reviewerSharedTrace ? "Yes" : "No"}`);
   log(`Timing Consistency: ${timingConsistent ? "PASS" : "LATENCY_INSTRUMENTATION_INCONSISTENT"}`);
-  log(`Schema Contract: ${schemaPassed ? "PASS" : "FAIL"}`);
+  log(`Directional Quality: ${quality.directionalPassed ? "PASS" : "FAIL"}`);
+  log(`Critical Conflict Count: ${quality.criticalConflictCount}`);
+  log(`Consensus Quality: ${quality.consensusPassed ? "PASS" : "FAIL"}`);
+  log(`Trace Contract: ${quality.tracePassed ? "PASS" : "FAIL"}`);
+  log(`Gate Consistency: ${quality.gateConsistencyPassed ? "PASS" : "FAIL"}`);
+  log(`Overall Quality Acceptance: ${overallQualityPassed ? "PASS" : "FAIL"}`);
+  log(`Incident Shape Contract: ${shapePassed ? "PASS" : "FAIL"}`);
+  log("Full generic JSON Schema validation: Not implemented");
   log(`UI Root Contract: ${uiPassed ? "PASS" : "FAIL"}`);
   log(`Meta: slice=${result?.meta?.slice} partial=${result?.meta?.partial} received=${result?.meta?.receivedMessageCount} processedCases=${result?.meta?.processedCaseCount} fixtureCases=${(result?.meta?.scenarioFixtureCases || []).join(",")}`);
   log(`Model Request Count: ${result?.meta?.modelRequestCount ?? "Not Available"}`);
@@ -158,13 +251,12 @@ async function run({
 
   return Boolean(
     response.status === 200 &&
-    health?.capabilities?.fullScenario === true &&
+    healthPassed &&
     incidents.length === 5 &&
     uniqueCaseIds === 5 &&
-    schemaPassed &&
+    shapePassed &&
     uiPassed &&
-    analystIds.size === 1 &&
-    reviewerIds.size === 1 &&
+    quality.passed &&
     timingConsistent &&
     result?.meta?.modelRequestCount === 2 &&
     !sensitiveFound
@@ -182,4 +274,9 @@ if (require.main === module) {
   });
 }
 
-module.exports = { run, LOCAL_SCENARIO_TIMEOUT_MS };
+module.exports = {
+  run,
+  evaluateScenarioQuality,
+  incidentShapeContractPassed,
+  LOCAL_SCENARIO_TIMEOUT_MS
+};

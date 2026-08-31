@@ -1,5 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const {
   ANALYST_TIMEOUT_MS,
@@ -17,20 +19,24 @@ const {
   determineFullScenarioState,
   buildFullScenarioGates,
   buildQualityWarnings,
+  analyzeCase01,
   analyzeFullHazeScenario
 } = require("../backend/incidentPipeline");
 const { DEFAULT_MODELS } = require("../backend/gonkaClient");
 const incidentSchema = require("../src/types/incident.schema.json");
-const { createHazeScenarioCases } = require("../backend/hazeScenario");
-const { run: runFullScenarioSmoke, LOCAL_SCENARIO_TIMEOUT_MS } = require("../scripts/full-scenario-live-smoke");
+const {
+  CANONICAL_HAZE_MESSAGES,
+  CASE_05_FIXTURE,
+  createHazeScenarioCases,
+  isCanonicalHazeMessages
+} = require("../backend/hazeScenario");
+const {
+  run: runFullScenarioSmoke,
+  evaluateScenarioQuality,
+  LOCAL_SCENARIO_TIMEOUT_MS
+} = require("../scripts/full-scenario-live-smoke");
 
-const MESSAGES = [
-  "Block C hostel: six students are coughing badly, one has asthma. Need N95 masks and clinic transport.",
-  "Another Block C resident reports heavy smoke smell and several students waiting near the lobby.",
-  "FORWARD: 20 students trapped in Hostel B!!! Send everything now!!!",
-  "Family near Shah Alam says an elderly parent has breathing difficulty due to haze. Exact location and callback number are unclear.",
-  "Sports day is still scheduled despite haze; one notice says proceed, while another group claims cancellation."
-];
+const MESSAGES = [...CANONICAL_HAZE_MESSAGES];
 
 function payload() {
   return { scenario: "malaysia_haze_fire_smoke", messages: [...MESSAGES] };
@@ -41,11 +47,13 @@ function scenarioCases() {
 }
 
 function scores(index) {
-  return {
-    verification: 80 - index * 7,
-    urgency: index === 2 ? 96 : 88 - index * 5,
-    actionability: 82 - index * 8
-  };
+  return [
+    { verification: 80, urgency: 88, actionability: 82 },
+    { verification: 30, urgency: 70, actionability: 25 },
+    { verification: 20, urgency: 96, actionability: 30 },
+    { verification: 45, urgency: 50, actionability: 35 },
+    { verification: 60, urgency: 50, actionability: 70 }
+  ][index];
 }
 
 function analystBatch(overrides = {}) {
@@ -123,6 +131,95 @@ function assertSchemaShape(incident) {
     assert.ok(incident.scores[axis] >= 0 && incident.scores[axis] <= 100);
   }
 }
+
+async function assertScenarioRejectedBeforeModelCalls(messages) {
+  let modelCalls = 0;
+  const client = { completeJson: async () => { modelCalls += 1; } };
+  await assert.rejects(
+    analyzeFullHazeScenario({
+      payload: { scenario: "malaysia_haze_fire_smoke", messages },
+      client
+    }),
+    error => {
+      assert.equal(error.code, "INVALID_SCENARIO_INPUT");
+      assert.equal(error.retryable, false);
+      assert.doesNotMatch(error.message, /Block C|Shah Alam|Sports day|FORWARD/);
+      return true;
+    }
+  );
+  assert.equal(modelCalls, 0);
+}
+
+async function makePassingSmokeResult() {
+  const result = await analyzeFullHazeScenario({ payload: payload(), client: new BatchFakeClient() });
+  for (const incident of result.incidents) {
+    incident.gonka.analyst.latencyMs = 1;
+    incident.gonka.reviewer.latencyMs = 1;
+  }
+  return result;
+}
+
+async function runSmokeWithResult(result, health = {
+  ok: true,
+  liveRoutesReady: true,
+  capabilities: { fullScenario: true }
+}) {
+  let call = 0;
+  return runFullScenarioSmoke({
+    fetchImpl: async () => {
+      call += 1;
+      if (call === 1) return { json: async () => health };
+      return { status: 200, ok: true, json: async () => result };
+    },
+    log: () => {}
+  });
+}
+
+test("canonical haze messages are frozen, ordered frontend reports without the CASE 05 fixture", () => {
+  assert.equal(CANONICAL_HAZE_MESSAGES.length, 5);
+  assert.equal(Object.isFrozen(CANONICAL_HAZE_MESSAGES), true);
+  assert.deepEqual(CANONICAL_HAZE_MESSAGES, MESSAGES);
+  assert.equal(CANONICAL_HAZE_MESSAGES.includes(CASE_05_FIXTURE), false);
+  assert.equal(isCanonicalHazeMessages(CANONICAL_HAZE_MESSAGES), true);
+});
+
+test("frontend rawReports remain exactly aligned with the backend canonical messages", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../src/data/hazeScenario.mock.js"), "utf8");
+  const match = source.match(/export const rawReports\s*=\s*(\[[\s\S]*?\]);/);
+  assert.ok(match, "frontend rawReports array was not found");
+  assert.deepEqual(JSON.parse(match[1]), CANONICAL_HAZE_MESSAGES);
+});
+
+test("canonical haze input accepts NFKC, case and whitespace-only differences", async () => {
+  const whitespaceVariant = CANONICAL_HAZE_MESSAGES.map(message =>
+    `  ${message.toUpperCase().replaceAll(" ", "  \n\t")}  `);
+  whitespaceVariant[2] = whitespaceVariant[2].replace("20", "２０");
+  assert.equal(isCanonicalHazeMessages(whitespaceVariant), true);
+  const result = await analyzeFullHazeScenario({
+    payload: { scenario: "malaysia_haze_fire_smoke", messages: whitespaceVariant },
+    client: new BatchFakeClient()
+  });
+  assert.equal(result.incidents.length, 5);
+});
+
+for (let index = 0; index < 5; index += 1) {
+  test(`changed canonical message ${index + 1} is rejected before model calls`, async () => {
+    const changed = [...CANONICAL_HAZE_MESSAGES];
+    changed[index] = `${changed[index]} changed`;
+    await assertScenarioRejectedBeforeModelCalls(changed);
+  });
+}
+
+test("reordered canonical messages are rejected before model calls", async () => {
+  const reordered = [...CANONICAL_HAZE_MESSAGES];
+  [reordered[0], reordered[1]] = [reordered[1], reordered[0]];
+  await assertScenarioRejectedBeforeModelCalls(reordered);
+});
+
+test("missing and extra canonical messages are rejected before model calls", async () => {
+  await assertScenarioRejectedBeforeModelCalls(CANONICAL_HAZE_MESSAGES.slice(0, 4));
+  await assertScenarioRejectedBeforeModelCalls([...CANONICAL_HAZE_MESSAGES, "extra"]);
+});
 
 test("case labels normalize only the supported numeric forms", () => {
   assert.equal(normalizeCaseLabel(1), "01");
@@ -226,6 +323,14 @@ test("both batch roles receive the same complete scoring rubric", () => {
   assert.match(SCORING_RUBRIC, /Score each axis independently/i);
   assert.ok(ANALYST_BATCH_SYSTEM_PROMPT.includes(SCORING_RUBRIC));
   assert.ok(REVIEWER_BATCH_SYSTEM_PROMPT.includes(SCORING_RUBRIC));
+});
+
+test("Analyst batch prompt explicitly contains each required label exactly once", () => {
+  const contract = ANALYST_BATCH_SYSTEM_PROMPT.slice(ANALYST_BATCH_SYSTEM_PROMPT.indexOf('{'));
+  const parsed = JSON.parse(contract);
+  assert.deepEqual(parsed.cases.map(item => item.label), ["01", "02", "03", "04", "05"]);
+  assert.equal(new Set(parsed.cases.map(item => item.label)).size, 5);
+  assert.equal(parsed.cases.length, 5);
 });
 
 test("Reviewer prompt remains a low-output-burden scores-only contract", () => {
@@ -335,6 +440,66 @@ test("full scenario performs one parallel call per role with identical evidence"
   assert.equal(result.meta.modelRequestCount, 2);
 });
 
+for (const invalidCase of [
+  { name: "Analyst", analyst: null, reviewer: reviewerBatch(), role: "analyst" },
+  { name: "Reviewer", analyst: analystBatch(), reviewer: null, role: "reviewer" },
+  { name: "both roles", analyst: null, reviewer: null, role: "both" }
+]) {
+  test(`${invalidCase.name} fulfilled-invalid batch payload reports the safe failed role`, async () => {
+    await assert.rejects(
+      analyzeFullHazeScenario({
+        payload: payload(),
+        client: new BatchFakeClient({ analyst: invalidCase.analyst, reviewer: invalidCase.reviewer })
+      }),
+      error => {
+        assert.equal(error.code, "INVALID_MODEL_DATA");
+        assert.equal(error.role, invalidCase.role);
+        assert.deepEqual(error.issues, ["payload:not_object"]);
+        assert.doesNotMatch(JSON.stringify(error.toPublicError()), /rawContent|ANALYST_RAW|LEGACY_REVIEWER/);
+        return true;
+      }
+    );
+  });
+}
+
+test("different fulfilled-invalid issues merge under both without values or duplicates", async () => {
+  const analyst = analystBatch();
+  const reviewer = reviewerBatch();
+  delete analyst.cases[0].scores.verification;
+  reviewer.cases[1].scores.urgency = 101;
+  await assert.rejects(
+    analyzeFullHazeScenario({ payload: payload(), client: new BatchFakeClient({ analyst, reviewer }) }),
+    error => {
+      assert.equal(error.code, "INVALID_MODEL_DATA");
+      assert.equal(error.role, "both");
+      assert.ok(error.issues.includes("cases.01.scores.verification:missing"));
+      assert.ok(error.issues.includes("cases.02.scores.urgency:out_of_range"));
+      assert.equal(new Set(error.issues).size, error.issues.length);
+      assert.ok(error.issues.length <= 5);
+      assert.doesNotMatch(JSON.stringify(error.toPublicError()), /101|rawContent|ANALYST_RAW|LEGACY_REVIEWER/);
+      return true;
+    }
+  );
+});
+
+test("CASE 01 also reports both fulfilled-invalid roles without leaking either payload", async () => {
+  const client = {
+    completeJson: async request => ({
+      data: null,
+      trace: trace(request.model, request.model === DEFAULT_MODELS.analyst ? "analyst" : "reviewer")
+    })
+  };
+  await assert.rejects(
+    analyzeCase01({ payload: { messages: CANONICAL_HAZE_MESSAGES.slice(0, 2) }, client }),
+    error => {
+      assert.equal(error.code, "INVALID_MODEL_DATA");
+      assert.equal(error.role, "both");
+      assert.deepEqual(error.issues, ["payload:not_object"]);
+      return true;
+    }
+  );
+});
+
 test("five incidents use deterministic states, gates, schema and shared traces", async () => {
   const result = await analyzeFullHazeScenario({
     payload: payload(),
@@ -393,17 +558,15 @@ test("CASE 03 stays urgent even when both verification scores are low", async ()
 });
 
 test("full scenario smoke safely displays role scores, gaps, warnings and latency", async () => {
-  const result = await analyzeFullHazeScenario({ payload: payload(), client: new BatchFakeClient() });
-  for (const incident of result.incidents) {
-    incident.gonka.analyst.latencyMs = 1;
-    incident.gonka.reviewer.latencyMs = 1;
-  }
+  const result = await makePassingSmokeResult();
   let call = 0;
   const output = [];
   const success = await runFullScenarioSmoke({
     fetchImpl: async () => {
       call += 1;
-      if (call === 1) return { json: async () => ({ capabilities: { fullScenario: true } }) };
+      if (call === 1) return {
+        json: async () => ({ ok: true, liveRoutesReady: true, capabilities: { fullScenario: true } })
+      };
       return { status: 200, ok: true, json: async () => result };
     },
     log: line => output.push(String(line))
@@ -418,5 +581,131 @@ test("full scenario smoke safely displays role scores, gaps, warnings and latenc
   assert.match(summary, /Analyst Latency: 1ms/);
   assert.match(summary, /Reviewer Latency: 1ms/);
   assert.match(summary, /Timing Consistency: PASS/);
+  assert.match(summary, /Directional Quality: PASS/);
+  assert.match(summary, /Critical Conflict Count: 0/);
+  assert.match(summary, /Consensus Quality: PASS/);
+  assert.match(summary, /Trace Contract: PASS/);
+  assert.match(summary, /Gate Consistency: PASS/);
+  assert.match(summary, /Overall Quality Acceptance: PASS/);
+  assert.match(summary, /Incident Shape Contract: PASS/);
+  assert.match(summary, /Full generic JSON Schema validation: Not implemented/);
   assert.doesNotMatch(summary, /ANALYST_RAW_MUST_NOT_ESCAPE|LEGACY_REVIEWER_MUST_NOT_ESCAPE|GONKA_API_KEY|authorization|sk-[A-Za-z0-9_-]{12,}/i);
+});
+
+test("passing five-case result satisfies every pure Smoke quality gate", async () => {
+  const quality = evaluateScenarioQuality(await makePassingSmokeResult());
+  assert.deepEqual(quality, {
+    directionalPassed: true,
+    criticalConflictCount: 0,
+    consensusPassed: true,
+    warningsPassed: true,
+    tracePassed: true,
+    gateConsistencyPassed: true,
+    passed: true
+  });
+});
+
+for (const scoreFailure of [
+  { name: "CASE 03 low Urgency", label: "03", axis: "urgency", value: 59 },
+  { name: "CASE 01 low Actionability", label: "01", axis: "actionability", value: 49 },
+  { name: "CASE 05 low Actionability", label: "05", axis: "actionability", value: 49 }
+]) {
+  test(`${scoreFailure.name} fails directional Smoke quality`, async () => {
+    const result = await makePassingSmokeResult();
+    result.incidents.find(item => item.label === scoreFailure.label).scores[scoreFailure.axis] = scoreFailure.value;
+    const quality = evaluateScenarioQuality(result);
+    assert.equal(quality.directionalPassed, false);
+    assert.equal(quality.passed, false);
+  });
+}
+
+test("three Critical Conflicts fail consensus quality without changing scores", async () => {
+  const result = await makePassingSmokeResult();
+  for (const incident of result.incidents.slice(0, 3)) {
+    incident.modelDebate.consensus = "CRITICAL_CONFLICT";
+    incident.safetyGates.find(gate => gate.id === "G_CONFLICT").status = "review";
+    if (incident.operationalState === "DISPATCH_CANDIDATE") {
+      incident.safetyGates.find(gate => gate.id === "G_DISPATCH").status = "review";
+    }
+  }
+  const quality = evaluateScenarioQuality(result);
+  assert.equal(quality.criticalConflictCount, 3);
+  assert.equal(quality.consensusPassed, false);
+  assert.equal(quality.passed, false);
+});
+
+for (const warning of ["URGENT_STATE_LOW_URGENCY_SCORE", "ACTION_READY_LOW_ACTIONABILITY_SCORE"]) {
+  test(`${warning} causes Smoke quality failure`, async () => {
+    const result = await makePassingSmokeResult();
+    result.incidents[0].qualityWarnings.push(warning);
+    const quality = evaluateScenarioQuality(result);
+    assert.equal(quality.warningsPassed, false);
+    assert.equal(quality.passed, false);
+  });
+}
+
+for (const traceFailure of [
+  { name: "missing Analyst Response ID", mutate: result => { result.incidents[0].gonka.analyst.responseId = ""; } },
+  { name: "missing Reviewer Response ID", mutate: result => { result.incidents[0].gonka.reviewer.responseId = undefined; } },
+  { name: "wrong Analyst model ID", mutate: result => { result.incidents[0].gonka.analyst.model = "wrong/model"; } },
+  { name: "missing Reviewer latency", mutate: result => { result.incidents[0].gonka.reviewer.latencyMs = undefined; } }
+]) {
+  test(`${traceFailure.name} fails the Smoke trace contract`, async () => {
+    const result = await makePassingSmokeResult();
+    traceFailure.mutate(result);
+    const quality = evaluateScenarioQuality(result);
+    assert.equal(quality.tracePassed, false);
+    assert.equal(quality.passed, false);
+  });
+}
+
+test("Gate and Consensus inconsistency fails Smoke quality", async () => {
+  const result = await makePassingSmokeResult();
+  const case01 = result.incidents.find(item => item.label === "01");
+  case01.safetyGates.find(gate => gate.id === "G_CONFLICT").status = "review";
+  const quality = evaluateScenarioQuality(result);
+  assert.equal(case01.modelDebate.consensus, "AGREEMENT");
+  assert.equal(quality.gateConsistencyPassed, false);
+  assert.equal(quality.passed, false);
+});
+
+test("health ok false makes Smoke fail even when result quality passes", async () => {
+  const result = await makePassingSmokeResult();
+  let call = 0;
+  const output = [];
+  const success = await runFullScenarioSmoke({
+    fetchImpl: async () => {
+      call += 1;
+      if (call === 1) return {
+        json: async () => ({ ok: false, liveRoutesReady: true, capabilities: { fullScenario: true } })
+      };
+      return { status: 200, ok: true, json: async () => result };
+    },
+    log: line => output.push(String(line))
+  });
+  assert.equal(success, false);
+  assert.match(output.join("\n"), /Overall Quality Acceptance: FAIL/);
+});
+
+test("run returns false when any wired quality category fails", async () => {
+  const mutations = [
+    result => { result.incidents.find(item => item.label === "03").scores.urgency = 59; },
+    result => {
+      for (const incident of result.incidents.slice(0, 3)) {
+        incident.modelDebate.consensus = "CRITICAL_CONFLICT";
+        incident.safetyGates.find(gate => gate.id === "G_CONFLICT").status = "review";
+        if (incident.operationalState === "DISPATCH_CANDIDATE") {
+          incident.safetyGates.find(gate => gate.id === "G_DISPATCH").status = "review";
+        }
+      }
+    },
+    result => { result.incidents[0].qualityWarnings.push("ACTION_READY_LOW_ACTIONABILITY_SCORE"); },
+    result => { result.incidents[0].gonka.analyst.responseId = ""; },
+    result => { result.incidents[0].safetyGates.find(gate => gate.id === "G_CONFLICT").status = "review"; }
+  ];
+  for (const mutate of mutations) {
+    const result = await makePassingSmokeResult();
+    mutate(result);
+    assert.equal(await runSmokeWithResult(result), false);
+  }
 });

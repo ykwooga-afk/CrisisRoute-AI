@@ -202,6 +202,44 @@ test("POST analyze returns all five scenario incidents using exactly two model c
   assert.doesNotMatch(JSON.stringify(result), /BATCH_RAW_MUST_NOT_LEAK|authorization|sk-[A-Za-z0-9_-]{12,}/i);
 });
 
+test("POST analyze safely accepts fenced and prose direct batch Arrays through GonkaClient", async t => {
+  let modelCalls = 0;
+  const mockServer = http.createServer(async (req, res) => {
+    modelCalls += 1;
+    const request = JSON.parse(await readBody(req));
+    const role = request.model === DEFAULT_MODELS.analyst ? "analyst" : "reviewer";
+    const direct = batchRoleData(role).cases.map(item => ({ ...item }));
+    const content = role === "analyst"
+      ? `\`\`\`json\n${JSON.stringify(direct)}\n\`\`\``
+      : `Final payload: ${JSON.stringify(direct)}`;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: `${role}-direct-array-id`,
+      model: request.model,
+      choices: [{ message: { role: "assistant", content }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 20, completion_tokens: 30, total_tokens: 50 }
+    }));
+  });
+  const mockOrigin = await startServer(t, mockServer);
+  const client = new GonkaClient({
+    apiKey: "server-api-fake-token",
+    baseUrl: `${mockOrigin}/v1`
+  });
+  const baseUrl = await startServer(t, createServer({ gonkaClientFactory: () => client }));
+  const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(scenarioPayload())
+  });
+  const result = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(modelCalls, 2);
+  assert.equal(result.incidents.length, 5);
+  assert.deepEqual(result.incidents.map(item => item.label), ["01", "02", "03", "04", "05"]);
+  assert.doesNotMatch(JSON.stringify(result), /Final payload|```|rawContent|server-api-fake-token/i);
+});
+
 test("full scenario accepts canonical messages with whitespace-only differences", async t => {
   let modelCalls = 0;
   const client = configuredFakeClient(async request => {

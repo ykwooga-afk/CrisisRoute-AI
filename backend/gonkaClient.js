@@ -8,6 +8,8 @@ const DEFAULT_MODELS = Object.freeze({
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const MAX_JSON_CANDIDATES = 8;
+const MAX_JSON_NESTING_DEPTH = 64;
 const clientSecrets = new WeakMap();
 
 const ERROR_MESSAGES = Object.freeze({
@@ -18,11 +20,31 @@ const ERROR_MESSAGES = Object.freeze({
   NETWORK_ERROR: "Gonka network request failed.",
   HTTP_ERROR: "Gonka returned an unsuccessful HTTP status.",
   INVALID_RESPONSE: "Gonka returned an invalid response structure.",
-  INVALID_JSON: "Gonka model output did not contain a valid JSON object."
+  INVALID_JSON: "Gonka model output did not contain valid structured JSON.",
+  INVALID_MODEL_DATA: "Gonka model output did not match the required data contract."
 });
 
+const SAFE_DIAGNOSTIC_ISSUES = new Set([
+  "payload:no_contract_candidate",
+  "payload:ambiguous_candidates",
+  "payload:direct_array_wrong_length",
+  "payload:string_unwrap_failed",
+  "payload:candidate_limit_exceeded",
+  "payload:nesting_limit_exceeded"
+]);
+const SAFE_CANDIDATE_KINDS = new Set([
+  "object", "array", "string", "number", "boolean", "null"
+]);
+
 class GonkaClientError extends Error {
-  constructor(code, { status, retryable, responseId } = {}) {
+  constructor(code, {
+    status,
+    retryable,
+    responseId,
+    issues,
+    candidateCount,
+    candidateKinds
+  } = {}) {
     super(ERROR_MESSAGES[code] || "Gonka client error.");
     this.name = "GonkaClientError";
     this.code = code;
@@ -32,6 +54,17 @@ class GonkaClientError extends Error {
     if (typeof responseId === "string" && responseId.trim()) {
       this.responseId = responseId;
     }
+    const safeIssues = Array.isArray(issues)
+      ? [...new Set(issues.filter(issue => SAFE_DIAGNOSTIC_ISSUES.has(issue)))].slice(0, 5)
+      : [];
+    if (safeIssues.length) this.issues = safeIssues;
+    if (Number.isInteger(candidateCount) && candidateCount >= 0) {
+      this.candidateCount = Math.min(candidateCount, MAX_JSON_CANDIDATES);
+    }
+    const safeKinds = Array.isArray(candidateKinds)
+      ? candidateKinds.filter(kind => SAFE_CANDIDATE_KINDS.has(kind)).slice(0, MAX_JSON_CANDIDATES)
+      : [];
+    if (safeKinds.length) this.candidateKinds = safeKinds;
   }
 
   toPublicError() {
@@ -42,6 +75,9 @@ class GonkaClientError extends Error {
     };
     if (Number.isInteger(this.status)) publicError.status = this.status;
     if (this.responseId) publicError.responseId = this.responseId;
+    if (this.issues) publicError.issues = [...this.issues];
+    if (Number.isInteger(this.candidateCount)) publicError.candidateCount = this.candidateCount;
+    if (this.candidateKinds) publicError.candidateKinds = [...this.candidateKinds];
     return publicError;
   }
 
@@ -54,33 +90,92 @@ function isJsonObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function extractStructuredJson(content) {
+function jsonValueKind(value) {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value === "object" ? "object" : typeof value;
+}
+
+function createCandidateResult(candidates, issues = []) {
+  return {
+    candidates,
+    candidateCount: candidates.length,
+    candidateKinds: candidates.map(candidate => candidate.kind),
+    issues: [...new Set(issues)]
+  };
+}
+
+function candidateError(issue, candidates = []) {
+  throw new GonkaClientError("INVALID_JSON", {
+    issues: [issue],
+    candidateCount: candidates.length,
+    candidateKinds: candidates.map(candidate => candidate.kind)
+  });
+}
+
+function exceedsNestingLimit(value) {
+  if (value === null || typeof value !== "object") return false;
+  const pending = [{ value, depth: 1 }];
+  while (pending.length) {
+    const current = pending.pop();
+    if (current.depth > MAX_JSON_NESTING_DEPTH) return true;
+    for (const child of Object.values(current.value)) {
+      if (child !== null && typeof child === "object") {
+        pending.push({ value: child, depth: current.depth + 1 });
+      }
+    }
+  }
+  return false;
+}
+
+function addCandidate(candidates, value) {
+  if (exceedsNestingLimit(value)) {
+    candidateError("payload:nesting_limit_exceeded", candidates);
+  }
+  if (candidates.length === MAX_JSON_CANDIDATES) {
+    candidateError("payload:candidate_limit_exceeded", candidates);
+  }
+  candidates.push({ value, kind: jsonValueKind(value) });
+}
+
+function extractStructuredJsonCandidates(content) {
   if (typeof content !== "string") {
-    throw new GonkaClientError("INVALID_JSON");
+    candidateError("payload:no_contract_candidate");
   }
 
   const trimmedContent = content.trim();
   if (!trimmedContent) {
-    throw new GonkaClientError("INVALID_JSON");
+    candidateError("payload:no_contract_candidate");
   }
 
+  const candidates = [];
+  const issues = [];
   try {
     const parsed = JSON.parse(trimmedContent);
-    if (isJsonObject(parsed)) return parsed;
-    throw new GonkaClientError("INVALID_JSON");
+    addCandidate(candidates, parsed);
+    if (typeof parsed === "string") {
+      let unwrapped;
+      try {
+        unwrapped = JSON.parse(parsed.trim());
+      } catch {
+        issues.push("payload:string_unwrap_failed");
+      }
+      if (unwrapped !== undefined) addCandidate(candidates, unwrapped);
+    }
+    return createCandidateResult(candidates, issues);
   } catch (error) {
     if (error instanceof GonkaClientError) throw error;
+    // Continue with a bounded, string-aware scan for embedded composite JSON.
   }
 
-  let lastValidCandidate = null;
-  let lastValidEnd = -1;
-
   for (let start = 0; start < content.length; start += 1) {
-    if (content[start] !== "{") continue;
+    const opening = content[start];
+    if (opening !== "{" && opening !== "[") continue;
 
-    let depth = 0;
+    const stack = [];
     let inString = false;
     let escaped = false;
+    let completedAt = -1;
 
     for (let index = start; index < content.length; index += 1) {
       const character = content[index];
@@ -98,30 +193,53 @@ function extractStructuredJson(content) {
 
       if (character === '"') {
         inString = true;
-      } else if (character === "{") {
-        depth += 1;
-      } else if (character === "}") {
-        depth -= 1;
-        if (depth === 0) {
-          const candidate = content.slice(start, index + 1);
-          try {
-            const parsed = JSON.parse(candidate);
-            if (isJsonObject(parsed) && index > lastValidEnd) {
-              lastValidCandidate = parsed;
-              lastValidEnd = index;
-            }
-          } catch {
-            // Invalid candidates are discarded without logging their content.
-          }
+      } else if (character === "{" || character === "[") {
+        stack.push(character);
+        if (stack.length > MAX_JSON_NESTING_DEPTH) {
+          candidateError("payload:nesting_limit_exceeded", candidates);
+        }
+      } else if (character === "}" || character === "]") {
+        const expected = character === "}" ? "{" : "[";
+        if (stack.at(-1) !== expected) break;
+        stack.pop();
+        if (stack.length === 0) {
+          completedAt = index;
           break;
         }
-        if (depth < 0) break;
       }
     }
+
+    if (completedAt < 0) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(content.slice(start, completedAt + 1));
+    } catch {
+      // Invalid candidates are discarded without logging their content.
+      continue;
+    }
+    addCandidate(candidates, parsed);
+    start = completedAt;
   }
 
-  if (lastValidCandidate) return lastValidCandidate;
-  throw new GonkaClientError("INVALID_JSON");
+  if (!candidates.length) candidateError("payload:no_contract_candidate");
+  return createCandidateResult(candidates, issues);
+}
+
+function extractStructuredJson(content) {
+  const extracted = extractStructuredJsonCandidates(content);
+  return selectLegacyObject(extracted);
+}
+
+function selectLegacyObject(extracted) {
+  const objects = extracted.candidates.filter(candidate => candidate.kind === "object");
+  if (objects.length) return objects.at(-1).value;
+  throw new GonkaClientError("INVALID_JSON", {
+    issues: extracted.issues.length
+      ? extracted.issues
+      : ["payload:no_contract_candidate"],
+    candidateCount: extracted.candidateCount,
+    candidateKinds: extracted.candidateKinds
+  });
 }
 
 function normalizeBaseUrl(value) {
@@ -210,7 +328,8 @@ class GonkaClient {
     messages,
     temperature = 0,
     maxTokens,
-    timeoutMs = this.defaultTimeoutMs
+    timeoutMs = this.defaultTimeoutMs,
+    returnCandidates = false
   } = {}) {
     if (
       typeof model !== "string" ||
@@ -224,7 +343,8 @@ class GonkaClient {
       !Number.isInteger(maxTokens) ||
       maxTokens <= 0 ||
       !Number.isInteger(timeoutMs) ||
-      timeoutMs <= 0
+      timeoutMs <= 0 ||
+      typeof returnCandidates !== "boolean"
     ) {
       throw new GonkaClientError("INVALID_REQUEST");
     }
@@ -308,7 +428,8 @@ class GonkaClient {
         });
       }
 
-      const data = extractStructuredJson(choice.message.content);
+      const extracted = extractStructuredJsonCandidates(choice.message.content);
+      const data = returnCandidates ? undefined : selectLegacyObject(extracted);
       const trace = {
         responseId: payload.id,
         model: typeof payload.model === "string" && payload.model.trim()
@@ -321,7 +442,9 @@ class GonkaClient {
         usage: normalizeUsage(payload.usage)
       };
 
-      return { data, trace };
+      return returnCandidates
+        ? { candidates: extracted, trace }
+        : { data, trace };
     } catch (error) {
       if (controller.signal.aborted) {
         throw new GonkaClientError("TIMEOUT", { retryable: true });
@@ -357,7 +480,10 @@ module.exports = {
   GonkaClientError,
   createGonkaClientFromEnv,
   extractStructuredJson,
+  extractStructuredJsonCandidates,
   DEFAULT_GONKA_BASE_URL,
   DEFAULT_MODELS,
-  MAX_RESPONSE_BYTES
+  MAX_RESPONSE_BYTES,
+  MAX_JSON_CANDIDATES,
+  MAX_JSON_NESTING_DEPTH
 };

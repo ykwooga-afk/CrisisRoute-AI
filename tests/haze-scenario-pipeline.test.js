@@ -15,6 +15,10 @@ const {
   normalizeCaseLabel,
   normalizeBatchAnalystData,
   normalizeBatchReviewerData,
+  selectAnalystCandidate,
+  selectReviewerCandidate,
+  selectBatchAnalystCandidate,
+  selectBatchReviewerCandidate,
   buildBatchEvidencePrompt,
   determineFullScenarioState,
   buildFullScenarioGates,
@@ -22,7 +26,7 @@ const {
   analyzeCase01,
   analyzeFullHazeScenario
 } = require("../backend/incidentPipeline");
-const { DEFAULT_MODELS } = require("../backend/gonkaClient");
+const { DEFAULT_MODELS, extractStructuredJsonCandidates } = require("../backend/gonkaClient");
 const incidentSchema = require("../src/types/incident.schema.json");
 const {
   CANONICAL_HAZE_MESSAGES,
@@ -86,6 +90,18 @@ function reviewerBatch(overrides = {}) {
     })),
     ...overrides
   };
+}
+
+function reviewerDirectArray() {
+  return reviewerBatch().cases.map((item, index) => ({
+    label: String(index + 1).padStart(2, "0"),
+    scores: structuredClone(item.scores),
+    ignoredReviewerField: "DROP_REVIEWER_FIELD"
+  }));
+}
+
+function candidatesFrom(content) {
+  return extractStructuredJsonCandidates(content);
 }
 
 function trace(model, role) {
@@ -241,6 +257,144 @@ test("batch normalizers whitelist Analyst arrays and reduce Reviewer to labels a
   for (const removed of ["counterEvidence", "duplicateRisk", "materialConflict", "operationalState"]) {
     assert.equal(Object.hasOwn(reviewer.cases[0], removed), false);
   }
+});
+
+for (const roleCase of [
+  {
+    role: "Analyst",
+    selector: selectBatchAnalystCandidate,
+    wrapper: () => analystBatch(),
+    direct: () => structuredClone(analystBatch().cases)
+  },
+  {
+    role: "Reviewer",
+    selector: selectBatchReviewerCandidate,
+    wrapper: () => ({ cases: reviewerDirectArray(), ignoredTopLevel: "DROP_ME" }),
+    direct: reviewerDirectArray
+  }
+]) {
+  test(`${roleCase.role} role selector accepts the canonical wrapper and drops unknown fields`, () => {
+    const selected = roleCase.selector(candidatesFrom(JSON.stringify(roleCase.wrapper())));
+    assert.deepEqual(selected.cases.map(item => item.label), ["01", "02", "03", "04", "05"]);
+    assert.doesNotMatch(JSON.stringify(selected), /DROP_ME|DROP_REVIEWER_FIELD|ANALYST_RAW_MUST_NOT_ESCAPE/);
+  });
+
+  for (const variant of [
+    { name: "direct five-item Array", wrap: value => JSON.stringify(value) },
+    { name: "fenced direct Array", wrap: value => `\`\`\`json\n${JSON.stringify(value)}\n\`\`\`` },
+    { name: "prose before direct Array", wrap: value => `Final safe payload: ${JSON.stringify(value)}` }
+  ]) {
+    test(`${roleCase.role} role selector accepts ${variant.name}`, () => {
+      const selected = roleCase.selector(candidatesFrom(variant.wrap(roleCase.direct())));
+      assert.deepEqual(selected.cases.map(item => item.label), ["01", "02", "03", "04", "05"]);
+    });
+  }
+
+  test(`${roleCase.role} role selector accepts reordered direct items by exact labels`, () => {
+    const direct = roleCase.direct().reverse();
+    const selected = roleCase.selector(candidatesFrom(JSON.stringify(direct)));
+    assert.deepEqual(selected.cases.map(item => item.label), ["01", "02", "03", "04", "05"]);
+  });
+
+  test(`${roleCase.role} role selector accepts numeric String scores`, () => {
+    const direct = roleCase.direct();
+    direct[0].scores = { verification: "10", urgency: "20.5", actionability: "30" };
+    const selected = roleCase.selector(candidatesFrom(JSON.stringify(direct)));
+    assert.deepEqual(selected.cases[0].scores, { verification: 10, urgency: 20.5, actionability: 30 });
+  });
+
+  test(`${roleCase.role} role selector accepts multiple identical normalized candidates once`, () => {
+    const direct = roleCase.direct();
+    const wrapper = { cases: structuredClone(direct) };
+    const selected = roleCase.selector(candidatesFrom(`${JSON.stringify(wrapper)} ${JSON.stringify(direct)}`));
+    assert.equal(selected.cases.length, 5);
+  });
+
+  test(`${roleCase.role} role selector ignores an earlier unrelated Object`, () => {
+    const content = `metadata {"score":7} final ${JSON.stringify(roleCase.direct())}`;
+    const selected = roleCase.selector(candidatesFrom(content));
+    assert.equal(selected.cases.length, 5);
+  });
+
+  test(`${roleCase.role} role selector rejects multiple different valid candidates`, () => {
+    const first = roleCase.direct();
+    const second = structuredClone(first);
+    second[0].scores.verification = Number(second[0].scores.verification) + 1;
+    assert.throws(
+      () => roleCase.selector(candidatesFrom(`${JSON.stringify(first)} ${JSON.stringify(second)}`)),
+      error => error.code === "INVALID_MODEL_DATA" &&
+        error.role === roleCase.role.toLowerCase() &&
+        error.issues.includes("payload:ambiguous_candidates")
+    );
+  });
+
+  test(`${roleCase.role} role selector reports a wrong direct Array length safely`, () => {
+    const direct = roleCase.direct().slice(0, 4);
+    assert.throws(() => roleCase.selector(candidatesFrom(JSON.stringify(direct))), error => {
+      assert.equal(error.code, "INVALID_MODEL_DATA");
+      assert.ok(error.issues.includes("payload:no_contract_candidate"));
+      assert.ok(error.issues.includes("payload:direct_array_wrong_length"));
+      assert.doesNotMatch(JSON.stringify(error.toPublicError()), /riskFlags|counterEvidence|DROP_/);
+      return true;
+    });
+  });
+
+  for (const invalid of [
+    { name: "missing Label", mutate(value) { delete value[0].label; } },
+    { name: "duplicate Label", mutate(value) { value[4].label = "04"; } },
+    { name: "extra Label", mutate(value) { value[4].label = "06"; } },
+    { name: "invalid Item type", mutate(value) { value[2] = null; } },
+    { name: "missing Score", mutate(value) { delete value[1].scores.urgency; } },
+    { name: "out-of-range Score", mutate(value) { value[1].scores.urgency = 101; } }
+  ]) {
+    test(`${roleCase.role} role selector rejects ${invalid.name} in a direct Array`, () => {
+      const direct = roleCase.direct();
+      invalid.mutate(direct);
+      assert.throws(
+        () => roleCase.selector(candidatesFrom(JSON.stringify(direct))),
+        error => error.code === "INVALID_MODEL_DATA" &&
+          error.issues.includes("payload:no_contract_candidate")
+      );
+    });
+  }
+
+  test(`${roleCase.role} role selector drops prototype-pollution keys`, () => {
+    const direct = roleCase.direct();
+    Object.defineProperty(direct[0], "__proto__", {
+      value: { polluted: true },
+      enumerable: true
+    });
+    direct[0].constructor = { prototype: { polluted: true } };
+    const selected = roleCase.selector(candidatesFrom(JSON.stringify(direct)));
+    assert.equal(Object.hasOwn(selected.cases[0], "__proto__"), false);
+    assert.equal(Object.hasOwn(selected.cases[0], "constructor"), false);
+    assert.equal({}.polluted, undefined);
+  });
+}
+
+test("CASE 01 role selectors retain Object-only contracts", () => {
+  const analyst = analystBatch().cases[0];
+  const reviewer = {
+    scores: scores(0),
+    counterEvidence: [],
+    unknowns: [],
+    duplicateRisk: "Low",
+    conclusion: "Human review required."
+  };
+  const selectedAnalyst = selectAnalystCandidate(candidatesFrom(JSON.stringify({
+    scores: analyst.scores,
+    knownFacts: [],
+    unknownFacts: [],
+    riskFlags: [],
+    recommendedAction: "Verify before human approval."
+  })));
+  const selectedReviewer = selectReviewerCandidate(candidatesFrom(JSON.stringify(reviewer)));
+  assert.deepEqual(selectedAnalyst.scores, analyst.scores);
+  assert.deepEqual(selectedReviewer.scores, reviewer.scores);
+  assert.throws(
+    () => selectAnalystCandidate(candidatesFrom(JSON.stringify([selectedAnalyst]))),
+    error => error.code === "INVALID_MODEL_DATA" && error.issues.includes("payload:no_contract_candidate")
+  );
 });
 
 for (const invalidCase of [

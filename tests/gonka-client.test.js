@@ -7,9 +7,12 @@ const {
   GonkaClientError,
   createGonkaClientFromEnv,
   extractStructuredJson,
+  extractStructuredJsonCandidates,
   DEFAULT_GONKA_BASE_URL,
   DEFAULT_MODELS,
-  MAX_RESPONSE_BYTES
+  MAX_RESPONSE_BYTES,
+  MAX_JSON_CANDIDATES,
+  MAX_JSON_NESTING_DEPTH
 } = require("../backend/gonkaClient");
 
 const FAKE_TOKEN = "unit-test-token-not-a-real-secret";
@@ -219,6 +222,105 @@ test("selects the last valid JSON object", () => {
   );
 });
 
+function extractedValues(content) {
+  return extractStructuredJsonCandidates(content).candidates.map(candidate => candidate.value);
+}
+
+for (const sample of [
+  { name: "pure Object", content: '{"status":"ready"}', expected: { status: "ready" } },
+  { name: "pure Array", content: '[{"label":"01"}]', expected: [{ label: "01" }] },
+  { name: "fenced Object", content: '```json\n{"status":"ready"}\n```', expected: { status: "ready" } },
+  { name: "fenced Array", content: '```json\n[{"label":"01"}]\n```', expected: [{ label: "01" }] },
+  { name: "prose plus Object", content: 'Result follows: {"status":"ready"} end.', expected: { status: "ready" } },
+  { name: "prose plus Array", content: 'Result follows: [{"label":"01"}] end.', expected: [{ label: "01" }] },
+  { name: "hidden-prefix-style Object", content: 'private thoughts omitted\nFINAL {"status":"ready"}', expected: { status: "ready" } },
+  { name: "hidden-prefix-style Array", content: 'private thoughts omitted\nFINAL [{"label":"01"}]', expected: [{ label: "01" }] }
+]) {
+  test(`candidate extraction supports ${sample.name}`, () => {
+    assert.deepEqual(extractedValues(sample.content).at(-1), sample.expected);
+  });
+}
+
+test("candidate extraction ignores an earlier primitive and retains a later payload", () => {
+  const extracted = extractStructuredJsonCandidates('draft 7 final {"status":"ready"}');
+  assert.deepEqual(extracted.candidateKinds, ["object"]);
+  assert.deepEqual(extracted.candidates[0].value, { status: "ready" });
+});
+
+test("candidate extraction retains multiple independent composite candidates", () => {
+  const extracted = extractStructuredJsonCandidates('meta {"step":1} final [{"label":"01"}]');
+  assert.equal(extracted.candidateCount, 2);
+  assert.deepEqual(extracted.candidateKinds, ["object", "array"]);
+});
+
+test("candidate extraction handles brackets, braces and escaped quotes inside strings", () => {
+  const content = '{"text":"literal [ ] { } and \\\"quoted\\\"","nested":{"items":[1,{"ok":true}]}}';
+  assert.deepEqual(extractedValues(content)[0], {
+    text: 'literal [ ] { } and "quoted"',
+    nested: { items: [1, { ok: true }] }
+  });
+});
+
+test("candidate extraction unwraps a JSON String containing one Object", () => {
+  const extracted = extractStructuredJsonCandidates(JSON.stringify('{"status":"ready"}'));
+  assert.deepEqual(extracted.candidateKinds, ["string", "object"]);
+  assert.deepEqual(extracted.candidates[1].value, { status: "ready" });
+});
+
+test("candidate extraction unwraps a JSON String containing one Array", () => {
+  const extracted = extractStructuredJsonCandidates(JSON.stringify('[{"label":"01"}]'));
+  assert.deepEqual(extracted.candidateKinds, ["string", "array"]);
+  assert.deepEqual(extracted.candidates[1].value, [{ label: "01" }]);
+});
+
+test("candidate extraction reports a failed one-level String unwrap without exposing it", () => {
+  const privateText = "not inner JSON PRIVATE_MODEL_TEXT";
+  const extracted = extractStructuredJsonCandidates(JSON.stringify(privateText));
+  assert.deepEqual(extracted.candidateKinds, ["string"]);
+  assert.deepEqual(extracted.issues, ["payload:string_unwrap_failed"]);
+  assert.doesNotMatch(JSON.stringify({
+    candidateCount: extracted.candidateCount,
+    candidateKinds: extracted.candidateKinds,
+    issues: extracted.issues
+  }), /PRIVATE_MODEL_TEXT/);
+});
+
+test("candidate extraction rejects more than eight candidates with bounded metadata", () => {
+  const privateContent = Array.from(
+    { length: MAX_JSON_CANDIDATES + 1 },
+    (_, index) => JSON.stringify({ index, private: `RAW_${index}` })
+  ).join(" ");
+  assert.throws(() => extractStructuredJsonCandidates(privateContent), error => {
+    assert.equal(error.code, "INVALID_JSON");
+    assert.deepEqual(error.issues, ["payload:candidate_limit_exceeded"]);
+    assert.equal(error.candidateCount, MAX_JSON_CANDIDATES);
+    assert.equal(error.candidateKinds.length, MAX_JSON_CANDIDATES);
+    assert.doesNotMatch(JSON.stringify(error), /RAW_/);
+    return true;
+  });
+});
+
+test("candidate extraction rejects excessive nesting safely", () => {
+  let nested = { ok: true };
+  for (let index = 0; index < MAX_JSON_NESTING_DEPTH; index += 1) nested = { nested };
+  assert.throws(() => extractStructuredJsonCandidates(JSON.stringify(nested)), error => {
+    assert.equal(error.code, "INVALID_JSON");
+    assert.deepEqual(error.issues, ["payload:nesting_limit_exceeded"]);
+    return true;
+  });
+});
+
+for (const malformed of ["", "private {broken", "```json\n[broken]\n```"] ) {
+  test(`candidate extraction rejects empty or malformed content: ${JSON.stringify(malformed)}`, () => {
+    assert.throws(
+      () => extractStructuredJsonCandidates(malformed),
+      error => error.code === "INVALID_JSON" &&
+        error.issues.includes("payload:no_contract_candidate") &&
+        !JSON.stringify(error).includes("broken")
+    );
+  });
+}
+
 test("rejects valid JSON values that are not objects", () => {
   for (const value of ["null", '"ready"', "100", "[1,2]"]) {
     assert.throws(() => extractStructuredJson(value), error => error.code === "INVALID_JSON");
@@ -253,6 +355,18 @@ test("returns parsed data and an auditable trace without raw content", async t =
   });
   assert.equal(typeof result.trace.latencyMs, "number");
   assert.doesNotMatch(JSON.stringify(result), /hidden prefix|raw|authorization/i);
+});
+
+test("opt-in candidate mode returns bounded candidates for role selection", async t => {
+  const mock = await createMockServer(t, async (req, res) => {
+    await readRequestBody(req);
+    sendJson(res, 200, successfulPayload('prefix [{"label":"01"}]'));
+  });
+  const result = await complete(createClient(mock.baseUrl), { returnCandidates: true });
+  assert.equal(Object.hasOwn(result, "data"), false);
+  assert.deepEqual(result.candidates.candidateKinds, ["array"]);
+  assert.deepEqual(result.candidates.candidates[0].value, [{ label: "01" }]);
+  assert.doesNotMatch(JSON.stringify(result.trace), /prefix|label|raw/i);
 });
 
 test("rejects an empty choices array as INVALID_RESPONSE", async t => {

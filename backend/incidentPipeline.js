@@ -120,6 +120,12 @@ const ISSUE_REASONS = new Set([
   "out_of_range",
   "not_object",
   "not_array",
+  "no_contract_candidate",
+  "ambiguous_candidates",
+  "direct_array_wrong_length",
+  "string_unwrap_failed",
+  "candidate_limit_exceeded",
+  "nesting_limit_exceeded",
   "invalid_label",
   "duplicate_label",
   "unknown_label",
@@ -406,6 +412,83 @@ function normalizeBatchAnalystData(value) {
 
 function normalizeBatchReviewerData(value) {
   return normalizeBatchData(value, "reviewer");
+}
+
+function selectContractCandidate(extracted, { role, validator, allowDirectBatchArray = false }) {
+  const candidates = Array.isArray(extracted?.candidates) ? extracted.candidates : [];
+  const diagnostics = Array.isArray(extracted?.issues) ? [...extracted.issues] : [];
+  const distinct = new Map();
+
+  for (const candidate of candidates) {
+    if (!candidate || !["object", "array"].includes(candidate.kind)) continue;
+    let value = candidate.value;
+    if (candidate.kind === "array") {
+      if (!allowDirectBatchArray) continue;
+      if (value.length !== CASE_LABELS.length) {
+        diagnostics.push("payload:direct_array_wrong_length");
+        continue;
+      }
+      const directLabels = value.map(item => isObject(item) ? item.label : null);
+      if (
+        directLabels.some(label => typeof label !== "string" || !CASE_LABELS.includes(label)) ||
+        new Set(directLabels).size !== CASE_LABELS.length ||
+        CASE_LABELS.some(label => !directLabels.includes(label))
+      ) {
+        continue;
+      }
+      value = { cases: value };
+    }
+
+    try {
+      const normalized = validator(value);
+      const identity = JSON.stringify(normalized);
+      if (!distinct.has(identity)) distinct.set(identity, normalized);
+    } catch (error) {
+      if (!(error instanceof IncidentPipelineError) || error.code !== "INVALID_MODEL_DATA") {
+        throw error;
+      }
+    }
+  }
+
+  if (distinct.size === 1) return distinct.values().next().value;
+
+  const issues = distinct.size > 1
+    ? ["payload:ambiguous_candidates"]
+    : [
+        "payload:no_contract_candidate",
+        ...diagnostics.filter(issue => typeof issue === "string" && issue.startsWith("payload:"))
+      ];
+  throw invalidModelData(role, issues);
+}
+
+function selectAnalystCandidate(extracted) {
+  return selectContractCandidate(extracted, {
+    role: "analyst",
+    validator: normalizeAnalystData
+  });
+}
+
+function selectReviewerCandidate(extracted) {
+  return selectContractCandidate(extracted, {
+    role: "reviewer",
+    validator: normalizeReviewerData
+  });
+}
+
+function selectBatchAnalystCandidate(extracted) {
+  return selectContractCandidate(extracted, {
+    role: "analyst",
+    validator: normalizeBatchAnalystData,
+    allowDirectBatchArray: true
+  });
+}
+
+function selectBatchReviewerCandidate(extracted) {
+  return selectContractCandidate(extracted, {
+    role: "reviewer",
+    validator: normalizeBatchReviewerData,
+    allowDirectBatchArray: true
+  });
 }
 
 const validateAnalystData = normalizeAnalystData;
@@ -1074,7 +1157,13 @@ function safeRoleFailure(settledResults) {
 
   if (codes.size === 1) {
     const code = classified[0].code;
-    if (code === "INVALID_MODEL_DATA") throw invalidModelData(failedRole, ["payload:not_object"]);
+    if (code === "INVALID_MODEL_DATA") {
+      const issues = classified.flatMap(item =>
+        Array.isArray(item.result.reason?.issues) && item.result.reason.issues.length
+          ? item.result.reason.issues
+          : ["payload:no_contract_candidate"]);
+      throw invalidModelData(failedRole, issues);
+    }
     const message = code === "TIMEOUT"
       ? classified.length === 1 ? `${classified[0].role.display} model timed out.` : "One or more models timed out."
       : code === "NETWORK_ERROR" ? "One or more Gonka network requests failed."
@@ -1109,13 +1198,37 @@ function validateRoleData(role, validator, data) {
   }
 }
 
-function validateFulfilledRoleData({ analystValidator, analystData, reviewerValidator, reviewerData }) {
+function validateFulfilledRoleData({
+  analystValidator,
+  analystData,
+  analystCandidates,
+  analystSelector,
+  reviewerValidator,
+  reviewerData,
+  reviewerCandidates,
+  reviewerSelector
+}) {
   const outcomes = [
-    { role: "analyst", validator: analystValidator, data: analystData },
-    { role: "reviewer", validator: reviewerValidator, data: reviewerData }
+    {
+      role: "analyst",
+      validator: analystValidator,
+      data: analystData,
+      candidates: analystCandidates,
+      selector: analystSelector
+    },
+    {
+      role: "reviewer",
+      validator: reviewerValidator,
+      data: reviewerData,
+      candidates: reviewerCandidates,
+      selector: reviewerSelector
+    }
   ].map(item => {
     try {
-      return { role: item.role, value: validateRoleData(item.role, item.validator, item.data) };
+      const value = item.candidates && typeof item.selector === "function"
+        ? item.selector(item.candidates)
+        : validateRoleData(item.role, item.validator, item.data);
+      return { role: item.role, value };
     } catch (error) {
       return { role: item.role, error };
     }
@@ -1150,7 +1263,8 @@ async function analyzeCase01({ payload, client, now = new Date() }) {
     ],
     temperature: 0,
     maxTokens: 600,
-    timeoutMs: ANALYST_TIMEOUT_MS
+    timeoutMs: ANALYST_TIMEOUT_MS,
+    returnCandidates: true
   };
   const reviewerRequest = {
     model: DEFAULT_MODELS.reviewer,
@@ -1160,7 +1274,8 @@ async function analyzeCase01({ payload, client, now = new Date() }) {
     ],
     temperature: 0,
     maxTokens: 500,
-    timeoutMs: REVIEWER_TIMEOUT_MS
+    timeoutMs: REVIEWER_TIMEOUT_MS,
+    returnCandidates: true
   };
 
   const settledResults = await Promise.allSettled([
@@ -1173,8 +1288,12 @@ async function analyzeCase01({ payload, client, now = new Date() }) {
   const { analyst, reviewer } = validateFulfilledRoleData({
     analystValidator: normalizeAnalystData,
     analystData: analystResult.data,
+    analystCandidates: analystResult.candidates,
+    analystSelector: selectAnalystCandidate,
     reviewerValidator: normalizeReviewerData,
-    reviewerData: reviewerResult.data
+    reviewerData: reviewerResult.data,
+    reviewerCandidates: reviewerResult.candidates,
+    reviewerSelector: selectReviewerCandidate
   });
   const incident = buildIncident({
     request,
@@ -1214,7 +1333,8 @@ async function analyzeFullHazeScenario({ payload, client, now = new Date() }) {
     ],
     temperature: 0,
     maxTokens: ANALYST_BATCH_MAX_TOKENS,
-    timeoutMs: ANALYST_TIMEOUT_MS
+    timeoutMs: ANALYST_TIMEOUT_MS,
+    returnCandidates: true
   };
   const reviewerRequest = {
     model: DEFAULT_MODELS.reviewer,
@@ -1224,7 +1344,8 @@ async function analyzeFullHazeScenario({ payload, client, now = new Date() }) {
     ],
     temperature: 0,
     maxTokens: REVIEWER_BATCH_MAX_TOKENS,
-    timeoutMs: BATCH_REVIEWER_TIMEOUT_MS
+    timeoutMs: BATCH_REVIEWER_TIMEOUT_MS,
+    returnCandidates: true
   };
 
   const settledResults = await Promise.allSettled([
@@ -1237,8 +1358,12 @@ async function analyzeFullHazeScenario({ payload, client, now = new Date() }) {
   const { analyst: analystBatch, reviewer: reviewerBatch } = validateFulfilledRoleData({
     analystValidator: normalizeBatchAnalystData,
     analystData: analystResult.data,
+    analystCandidates: analystResult.candidates,
+    analystSelector: selectBatchAnalystCandidate,
     reviewerValidator: normalizeBatchReviewerData,
-    reviewerData: reviewerResult.data
+    reviewerData: reviewerResult.data,
+    reviewerCandidates: reviewerResult.candidates,
+    reviewerSelector: selectBatchReviewerCandidate
   });
   const normalizedNow = now instanceof Date ? now : new Date(now);
   const incidents = request.cases.map((caseDefinition, index) => buildFullScenarioIncident({
@@ -1300,6 +1425,10 @@ module.exports = {
   normalizeCaseLabel,
   normalizeBatchAnalystData,
   normalizeBatchReviewerData,
+  selectAnalystCandidate,
+  selectReviewerCandidate,
+  selectBatchAnalystCandidate,
+  selectBatchReviewerCandidate,
   validateAnalystData,
   validateReviewerData,
   computeConsensus,

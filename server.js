@@ -11,6 +11,10 @@ const {
   IncidentPipelineError,
   analyzeIncidents
 } = require("./backend/incidentPipeline");
+const {
+  DecisionLedgerError,
+  createDecisionLedger
+} = require("./backend/decisionLedger");
 
 const root = __dirname;
 const srcRoot = path.resolve(root, "src");
@@ -116,6 +120,24 @@ function getLiveConfiguration(gonkaClientFactory) {
 }
 
 function mapApiError(error) {
+  if (error instanceof DecisionLedgerError) {
+    const statusByCode = {
+      INVALID_DECISION_REQUEST: 400,
+      INVALID_CASE_ID: 400,
+      UNKNOWN_DECISION_ACTION: 422,
+      ANALYSIS_CONTEXT_NOT_FOUND: 404,
+      DECISION_NOT_ALLOWED: 409,
+      ACKNOWLEDGEMENT_REQUIRED: 409,
+      IDEMPOTENCY_CONFLICT: 409
+    };
+    return {
+      status: statusByCode[error.code] || 500,
+      code: statusByCode[error.code] ? error.code : "INTERNAL_ERROR",
+      message: statusByCode[error.code] ? error.message : "Internal server error.",
+      retryable: false
+    };
+  }
+
   if (error instanceof IncidentPipelineError) {
     const failureMetadata = safeFailureMetadata(error);
     if (error.code === "INVALID_REQUEST") {
@@ -229,7 +251,34 @@ async function parseJsonBody(req) {
   }
 }
 
-async function handleApi(req, res, { gonkaClientFactory }) {
+function parseDecisionRoute(requestTarget) {
+  if (typeof requestTarget !== "string") return null;
+  const separatorIndex = requestTarget.search(/[?#]/);
+  const rawPathname = separatorIndex === -1
+    ? requestTarget
+    : requestTarget.slice(0, separatorIndex);
+  if (!rawPathname.startsWith("/api/incidents/")) return null;
+
+  const suffixMatch = rawPathname.match(/\/(decision|audit)(?:\/|$)/);
+  if (!suffixMatch) return null;
+  const exactMatch = rawPathname.match(/^\/api\/incidents\/([^/]+)\/(decision|audit)$/);
+  if (!exactMatch || exactMatch[1].length > 96) {
+    throw new DecisionLedgerError("INVALID_CASE_ID");
+  }
+
+  let caseId;
+  try {
+    caseId = decodeURIComponent(exactMatch[1]);
+  } catch {
+    throw new DecisionLedgerError("INVALID_CASE_ID");
+  }
+  if (caseId.includes("/") || caseId.includes("\\") || caseId.includes("\0")) {
+    throw new DecisionLedgerError("INVALID_CASE_ID");
+  }
+  return { caseId, kind: exactMatch[2] };
+}
+
+async function handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, decisionLedger }) {
   if (req.method === "GET" && req.url === "/api/health/gonka") {
     const configuration = getLiveConfiguration(gonkaClientFactory);
     return sendJson(res, 200, {
@@ -238,9 +287,12 @@ async function handleApi(req, res, { gonkaClientFactory }) {
       capabilities: {
         analyzeCase01: configuration.ready,
         fullScenario: configuration.ready,
-        decision: false,
+        decision: true,
         brief: false
       },
+      decisionStorage: "ephemeral",
+      decisionExternalAnchoring: "none",
+      decisionAuthentication: "demo_local_only",
       baseUrl: configuration.client?.baseUrl || process.env.GONKA_BASE_URL || DEFAULT_GONKA_BASE_URL,
       analystModel: configuration.client?.models.analyst || process.env.GONKA_ANALYST_MODEL || DEFAULT_MODELS.analyst,
       reviewerModel: configuration.client?.models.reviewer || process.env.GONKA_REVIEWER_MODEL || DEFAULT_MODELS.reviewer,
@@ -253,10 +305,48 @@ async function handleApi(req, res, { gonkaClientFactory }) {
   if (req.method === "POST" && req.url === "/api/incidents/analyze") {
     try {
       const payload = await parseJsonBody(req);
-      const client = gonkaClientFactory();
-      const result = await analyzeIncidents({
+      const client = analyzeIncidentsFn === analyzeIncidents ? gonkaClientFactory() : undefined;
+      const result = await analyzeIncidentsFn({ payload, client });
+      decisionLedger.registerAnalysisResult(result);
+      return sendJson(res, 200, result);
+    } catch (error) {
+      return sendApiError(res, error);
+    }
+  }
+
+  let decisionRoute;
+  try {
+    decisionRoute = parseDecisionRoute(req.url);
+  } catch (error) {
+    return sendApiError(res, error);
+  }
+  if (decisionRoute) {
+    const expectedMethod = decisionRoute.kind === "decision" ? "POST" : "GET";
+    if (req.method !== expectedMethod) {
+      res.setHeader("Allow", expectedMethod);
+      return sendJson(res, 405, {
+        ok: false,
+        error: {
+          code: "METHOD_NOT_ALLOWED",
+          message: "Method not allowed for this API route.",
+          retryable: false
+        }
+      });
+    }
+    try {
+      if (decisionRoute.kind === "audit") {
+        return sendJson(res, 200, decisionLedger.getAudit(decisionRoute.caseId));
+      }
+      let payload;
+      try {
+        payload = await parseJsonBody(req);
+      } catch {
+        throw new DecisionLedgerError("INVALID_DECISION_REQUEST");
+      }
+      const result = decisionLedger.recordDecision({
+        caseId: decisionRoute.caseId,
         payload,
-        client
+        idempotencyKey: req.headers["idempotency-key"]
       });
       return sendJson(res, 200, result);
     } catch (error) {
@@ -391,12 +481,14 @@ async function serveStatic(req, res) {
 }
 
 function createServer({
-  gonkaClientFactory = createGonkaClientFromEnv
+  gonkaClientFactory = createGonkaClientFromEnv,
+  analyzeIncidentsFn = analyzeIncidents,
+  decisionLedger = createDecisionLedger()
 } = {}) {
   return http.createServer(async (req, res) => {
     try {
       if (req.url?.startsWith("/api/")) {
-        await handleApi(req, res, { gonkaClientFactory });
+        await handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, decisionLedger });
         return;
       }
       await serveStatic(req, res);

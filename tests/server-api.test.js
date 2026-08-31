@@ -567,9 +567,290 @@ test("health reports CASE 01 readiness without making a Gonka request", async t 
   assert.deepEqual(health.capabilities, {
     analyzeCase01: true,
     fullScenario: true,
-    decision: false,
+    decision: true,
     brief: false
   });
+  assert.equal(health.decisionStorage, "ephemeral");
+  assert.equal(health.decisionExternalAnchoring, "none");
+  assert.equal(health.decisionAuthentication, "demo_local_only");
   assert.equal(modelCalls, 0);
   assert.doesNotMatch(JSON.stringify(health), /GONKA_API_KEY|authorization|server-api-fake-token/i);
+});
+
+function decisionIncident({
+  caseId = "CR-LIVE-CASE-01",
+  operationalState = "DISPATCH_CANDIDATE",
+  consensus = "AGREEMENT",
+  conflictStatus = "passed",
+  gateOverrides = {}
+} = {}) {
+  return {
+    caseId,
+    label: caseId.slice(-2),
+    operationalState,
+    scores: { verification: 80, urgency: 90, actionability: 85 },
+    modelDebate: {
+      consensus,
+      scoreGaps: { verification: 2, urgency: 3, actionability: 4 }
+    },
+    safetyGates: [
+      ["G_LOCATION", true],
+      ["G_CONTACT", true],
+      ["G_RESOURCE", true],
+      ["G_CONFLICT", conflictStatus === "passed"],
+      ["G_DISPATCH", operationalState === "DISPATCH_CANDIDATE"]
+    ].map(([id, defaultPassed]) => ({
+      id,
+      status: id === "G_CONFLICT" ? conflictStatus : defaultPassed ? "passed" : "blocked",
+      passed: Object.hasOwn(gateOverrides, id) ? gateOverrides[id] : defaultPassed,
+      detail: "SERVER_PRIVATE_GATE_DETAIL"
+    })),
+    qualityWarnings: [],
+    receivedAt: "2026-08-31T08:00:00.000Z",
+    rawMessage: "RAW_MODEL_CONTENT_MUST_NOT_LEAK",
+    prompt: "PROMPT_MUST_NOT_LEAK",
+    authorization: "Bearer sk-SERVER-SECRET-MUST-NOT-LEAK",
+    gonka: {
+      analyst: { model: "safe-analyst", responseId: "safe-a", rawContent: "RAW_A" },
+      reviewer: { model: "safe-reviewer", responseId: "safe-r", prompt: "PROMPT_R" }
+    }
+  };
+}
+
+function decisionRequestBody(overrides = {}) {
+  return {
+    action: "APPROVE_ACTION",
+    reason: "Human approved this bounded proposal.",
+    acknowledgeHumanDecision: true,
+    acknowledgeNoAutomaticExecution: true,
+    ...overrides
+  };
+}
+
+async function createDecisionApi(t, incidents = [decisionIncident()]) {
+  let fakeAnalyzeCalls = 0;
+  let gonkaFactoryCalls = 0;
+  const analyzeIncidentsFn = async () => {
+    fakeAnalyzeCalls += 1;
+    return {
+      incidents: structuredClone(incidents),
+      resources: [],
+      meta: { mode: "offline-test" }
+    };
+  };
+  const server = createServer({
+    analyzeIncidentsFn,
+    gonkaClientFactory: () => {
+      gonkaFactoryCalls += 1;
+      throw new Error("Gonka factory must not run in decision tests");
+    }
+  });
+  const baseUrl = await startServer(t, server);
+  return {
+    baseUrl,
+    get fakeAnalyzeCalls() { return fakeAnalyzeCalls; },
+    get gonkaFactoryCalls() { return gonkaFactoryCalls; }
+  };
+}
+
+async function registerDecisionContexts(baseUrl) {
+  return fetch(`${baseUrl}/api/incidents/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages: ["offline fixture"] })
+  });
+}
+
+test("injected analyzer registers context without invoking the Gonka factory", async t => {
+  const app = await createDecisionApi(t);
+  const analyzeResponse = await registerDecisionContexts(app.baseUrl);
+  assert.equal(analyzeResponse.status, 200);
+  assert.equal(app.fakeAnalyzeCalls, 1);
+  assert.equal(app.gonkaFactoryCalls, 0);
+
+  const decisionResponse = await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(decisionRequestBody())
+  });
+  const body = await decisionResponse.json();
+  assert.equal(decisionResponse.status, 200);
+  assert.equal(body.decision.executionStatus, "NOT_EXECUTED");
+  assert.equal(body.decision.actorType, "human_operator");
+  assertSafeErrorBody(body);
+  assert.doesNotMatch(JSON.stringify(body), /RAW_MODEL|PROMPT|SERVER_PRIVATE|sk-SERVER|authorization/i);
+});
+
+test("unknown cases return safe 404 and are not analyzed automatically", async t => {
+  const app = await createDecisionApi(t);
+  const response = await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-02/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "HOLD_FOR_REVIEW" })
+  });
+  const body = await response.json();
+  assert.equal(response.status, 404);
+  assert.equal(body.error.code, "ANALYSIS_CONTEXT_NOT_FOUND");
+  assert.equal(app.fakeAnalyzeCalls, 0);
+  assert.equal(app.gonkaFactoryCalls, 0);
+  assertSafeErrorBody(body);
+});
+
+test("decision routes reject traversal, encoded slashes, null bytes and extra slashes", async t => {
+  const app = await createDecisionApi(t);
+  for (const route of [
+    "/api/incidents/%2e%2e%2FCR-LIVE-CASE-01/decision",
+    "/api/incidents/CR-LIVE-CASE-01%2Fextra/decision",
+    "/api/incidents/CR-LIVE-CASE-01%00/decision",
+    "/api/incidents/CR-LIVE-CASE-01/extra/decision",
+    "/api/incidents/CR-LIVE-CASE-01/decision/extra"
+  ]) {
+    const response = await fetch(`${app.baseUrl}${route}`, { method: "POST" });
+    const body = await response.json();
+    assert.equal(response.status, 400, route);
+    assert.equal(body.error.code, "INVALID_CASE_ID", route);
+    assertSafeErrorBody(body);
+  }
+});
+
+test("decision and audit routes enforce exact methods with Allow", async t => {
+  const app = await createDecisionApi(t);
+  for (const [route, method, expectedAllow] of [
+    ["/api/incidents/CR-LIVE-CASE-01/decision", "GET", "POST"],
+    ["/api/incidents/CR-LIVE-CASE-01/audit", "POST", "GET"]
+  ]) {
+    const response = await fetch(`${app.baseUrl}${route}`, { method });
+    assert.equal(response.status, 405);
+    assert.equal(response.headers.get("allow"), expectedAllow);
+    assert.equal((await response.json()).error.code, "METHOD_NOT_ALLOWED");
+  }
+});
+
+test("decision API maps unknown actions and malformed reasons to safe errors", async t => {
+  const app = await createDecisionApi(t);
+  await registerDecisionContexts(app.baseUrl);
+  const checks = [
+    [{ action: "dispatch-now" }, 422, "UNKNOWN_DECISION_ACTION"],
+    [decisionRequestBody({ reason: "x".repeat(501) }), 400, "INVALID_DECISION_REQUEST"],
+    [decisionRequestBody({ reason: "valid\0reason" }), 400, "INVALID_DECISION_REQUEST"]
+  ];
+  for (const [payload, status, code] of checks) {
+    const response = await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/decision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const body = await response.json();
+    assert.equal(response.status, status);
+    assert.equal(body.error.code, code);
+    assertSafeErrorBody(body);
+  }
+});
+
+test("decision API ignores forged fields and normalizes frontend aliases", async t => {
+  const app = await createDecisionApi(t);
+  await registerDecisionContexts(app.baseUrl);
+  const response = await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(decisionRequestBody({
+      action: "APPROVED",
+      actorType: "administrator",
+      role: "owner",
+      approvedBy: "forged",
+      recordedAt: "1900-01-01T00:00:00.000Z",
+      decisionId: "FORGED",
+      sequence: 99,
+      entryHash: "FORGED",
+      override: true
+    }))
+  });
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.decision.action, "APPROVE_ACTION");
+  assert.equal(body.decision.actorType, "human_operator");
+  assert.equal(body.decision.authentication, "demo_local_only");
+  assert.equal(body.decision.sequence, 1);
+  assert.notEqual(body.decision.decisionId, "FORGED");
+  assert.notEqual(body.decision.entryHash, "FORGED");
+  assert.equal(body.decision.override, false);
+  assert.equal(Object.hasOwn(body.decision, "approvedBy"), false);
+});
+
+test("HTTP idempotency replays identical requests and rejects key reuse conflicts", async t => {
+  const app = await createDecisionApi(t);
+  await registerDecisionContexts(app.baseUrl);
+  const endpoint = `${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/decision`;
+  const request = payload => fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": "server-idempotency-key-01"
+    },
+    body: JSON.stringify(payload)
+  });
+  const first = await (await request(decisionRequestBody())).json();
+  const replayResponse = await request(decisionRequestBody());
+  const replay = await replayResponse.json();
+  assert.equal(replayResponse.status, 200);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.decision.decisionId, first.decision.decisionId);
+
+  const conflictResponse = await request(decisionRequestBody({ reason: "A different human-entered reason." }));
+  const conflict = await conflictResponse.json();
+  assert.equal(conflictResponse.status, 409);
+  assert.equal(conflict.error.code, "IDEMPOTENCY_CONFLICT");
+
+  const audit = await (await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/audit`)).json();
+  assert.equal(audit.entryCount, 1);
+});
+
+test("API state policy blocks unsafe approval and allows bounded state actions", async t => {
+  const incidents = [
+    decisionIncident({ caseId: "CR-LIVE-CASE-01" }),
+    decisionIncident({ caseId: "CR-LIVE-CASE-02", operationalState: "MERGE_OR_VERIFY" }),
+    decisionIncident({ caseId: "CR-LIVE-CASE-03", operationalState: "URGENT_VERIFICATION", gateOverrides: { G_LOCATION: false, G_CONTACT: false } }),
+    decisionIncident({ caseId: "CR-LIVE-CASE-04", operationalState: "NEEDS_HUMAN_REVIEW", conflictStatus: "review" }),
+    decisionIncident({ caseId: "CR-LIVE-CASE-05", operationalState: "QUEUED_ACTION" })
+  ];
+  const app = await createDecisionApi(t, incidents);
+  await registerDecisionContexts(app.baseUrl);
+
+  const post = (caseId, body) => fetch(`${app.baseUrl}/api/incidents/${caseId}/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  assert.equal((await post("CR-LIVE-CASE-02", { action: "merge" })).status, 200);
+  assert.equal((await post("CR-LIVE-CASE-03", { action: "verify" })).status, 200);
+  assert.equal((await post("CR-LIVE-CASE-04", {
+    action: "hold",
+    reason: "Human reviewed the material conflict.",
+    acknowledgeReview: true
+  })).status, 200);
+  assert.equal((await post("CR-LIVE-CASE-05", { action: "queue" })).status, 200);
+  const forbidden = await post("CR-LIVE-CASE-03", decisionRequestBody());
+  assert.equal(forbidden.status, 409);
+  assert.equal((await forbidden.json()).error.code, "DECISION_NOT_ALLOWED");
+});
+
+test("audit API returns only the append-only safe chain and honest storage markers", async t => {
+  const app = await createDecisionApi(t);
+  await registerDecisionContexts(app.baseUrl);
+  await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(decisionRequestBody())
+  });
+  const response = await fetch(`${app.baseUrl}/api/incidents/CR-LIVE-CASE-01/audit`);
+  const body = await response.json();
+  const serialized = JSON.stringify(body);
+  assert.equal(response.status, 200);
+  assert.equal(body.entryCount, 1);
+  assert.equal(body.chainValid, true);
+  assert.equal(body.persistence, "ephemeral");
+  assert.equal(body.externalAnchoring, "none");
+  assert.equal(body.chainScope, "per_case");
+  assert.match(body.entries[0].analysisSnapshotHash, /^[a-f0-9]{64}$/);
+  assert.doesNotMatch(serialized, /RAW_MODEL|PROMPT|Authorization|sk-SERVER|SERVER_PRIVATE|on-chain|blockchain/i);
 });

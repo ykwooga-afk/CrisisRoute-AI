@@ -64,18 +64,42 @@ export async function submitHumanDecision(incident, decision, mode = DATA_MODES.
   const decidedAt = new Date().toISOString();
 
   if (mode === DATA_MODES.live) {
+    const action = normalizeLiveDecision(decision, incident.operationalState);
+    const reason = liveDecisionReason(decision);
+    const acknowledgeReview = incident.safetyGates?.some(
+      gate => gate.id === "G_CONFLICT" && gate.status === "review"
+    ) === true;
     const response = await fetch(`/api/incidents/${incident.caseId}/decision`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ decision, decidedAt })
+      body: JSON.stringify({
+        action,
+        reason,
+        acknowledgeHumanDecision: true,
+        acknowledgeNoAutomaticExecution: true,
+        acknowledgeReview
+      })
     });
 
     if (!response.ok) {
       const error = await safeJson(response);
-      throw new Error(error?.message || "Decision API failed.");
+      throw new Error(error?.error?.message || error?.message || "Decision API failed.");
     }
 
-    return response.json();
+    const result = await response.json();
+    return {
+      ...incident,
+      humanDecision: {
+        decision,
+        canonicalAction: result.decision.action,
+        decidedAt: result.decision.recordedAt,
+        decidedBy: "Local human operator",
+        recordStatus: result.decision.recordStatus,
+        executionStatus: result.decision.executionStatus,
+        requiresExternalExecution: result.decision.requiresExternalExecution
+      },
+      decisionAudit: result.audit
+    };
   }
 
   const receiptPayload = {
@@ -104,12 +128,7 @@ export async function submitHumanDecision(incident, decision, mode = DATA_MODES.
 
 export async function generateActionBrief(incident, mode = DATA_MODES.mock) {
   if (mode === DATA_MODES.live) {
-    const response = await fetch(`/api/incidents/${incident.caseId}/brief`, { method: "POST" });
-    if (!response.ok) {
-      const error = await safeJson(response);
-      throw new Error(error?.message || "Brief generation failed.");
-    }
-    return response.json();
+    return incident.actionBrief;
   }
 
   await wait(240);
@@ -118,6 +137,28 @@ export async function generateActionBrief(incident, mode = DATA_MODES.mock) {
     zh: "请先补充缺失资料，再安排志愿者行动。",
     ms: "Sila lengkapkan maklumat yang hilang sebelum tindakan sukarelawan."
   };
+}
+
+function normalizeLiveDecision(decision, operationalState) {
+  const aliases = {
+    APPROVED: "APPROVE_ACTION",
+    URGENT_VERIFICATION: "REQUEST_VERIFICATION",
+    NEEDS_MORE_INFO: "REQUEST_VERIFICATION"
+  };
+  if (decision === "MERGE_OR_REJECT") {
+    return operationalState === "MERGE_OR_VERIFY" ? "MERGE_REPORT" : "REJECT_ACTION";
+  }
+  return aliases[decision] || decision;
+}
+
+function liveDecisionReason(decision) {
+  const reasons = {
+    APPROVED: "Human selected Approve Dispatch in the local demo UI.",
+    URGENT_VERIFICATION: "Human selected Urgent Verify in the local demo UI.",
+    NEEDS_MORE_INFO: "Human requested more information in the local demo UI.",
+    MERGE_OR_REJECT: "Human selected Merge or Reject in the local demo UI."
+  };
+  return reasons[decision] || "Human selected this decision in the local demo UI.";
 }
 
 export async function getGonkaHealth() {

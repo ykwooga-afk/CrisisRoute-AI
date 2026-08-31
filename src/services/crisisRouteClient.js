@@ -45,7 +45,7 @@ export function createCrisisRouteClient({
   fetchImpl = (...args) => globalThis.fetch(...args),
   baseUrl = ""
 } = {}) {
-  async function requestJson(path, { method = "GET", body, headers = {} } = {}) {
+  async function requestJson(path, { method = "GET", body, headers = {}, signal } = {}) {
     let response;
     try {
       response = await fetchImpl(joinUrl(baseUrl, path), {
@@ -55,9 +55,17 @@ export function createCrisisRouteClient({
           ...(body === undefined ? {} : { "Content-Type": "application/json" }),
           ...headers
         },
+        ...(signal ? { signal } : {}),
         ...(body === undefined ? {} : { body: JSON.stringify(body) })
       });
     } catch {
+      if (signal?.aborted) {
+        throw new CrisisRouteClientError({
+          code: "CLIENT_WAIT_CANCELLED",
+          message: "This browser stopped waiting for the local request; server or remote computation cancellation is not confirmed.",
+          retryable: true
+        });
+      }
       throw new CrisisRouteClientError({ code: "NETWORK_ERROR", message: "The local CrisisRoute service is unavailable.", retryable: true });
     }
     let payload;
@@ -78,13 +86,15 @@ export function createCrisisRouteClient({
   }
 
   return Object.freeze({
-    loadScenario: messages => requestJson("/api/incidents/analyze", {
+    loadScenario: (messages, { signal } = {}) => requestJson("/api/incidents/analyze", {
       method: "POST",
-      body: { scenario: "malaysia_haze_fire_smoke", messages }
+      body: { scenario: "malaysia_haze_fire_smoke", messages },
+      signal
     }),
-    analyzeIncidents: messages => requestJson("/api/incidents/analyze", {
+    analyzeIncidents: (messages, { signal } = {}) => requestJson("/api/incidents/analyze", {
       method: "POST",
-      body: { messages }
+      body: { messages },
+      signal
     }),
     recordHumanDecision: ({ caseId, submission, idempotencyKey }) => requestJson(
       `/api/incidents/${encodeURIComponent(caseId)}/decision`,
@@ -112,15 +122,15 @@ export function createCrisisRouteClient({
 
 const browserClient = createCrisisRouteClient();
 
-export async function loadHazeScenario(mode = DATA_MODES.mock) {
+export async function loadHazeScenario(mode = DATA_MODES.mock, { signal } = {}) {
   await wait(320);
   if (mode === DATA_MODES.replay) return getReplayScenario();
-  if (mode === DATA_MODES.live) return browserClient.loadScenario(rawReports);
+  if (mode === DATA_MODES.live) return browserClient.loadScenario(rawReports, { signal });
   return cloneScenario();
 }
 
-export async function analyzeIncidents(messages, mode = DATA_MODES.mock) {
-  if (mode === DATA_MODES.live) return browserClient.analyzeIncidents(messages);
+export async function analyzeIncidents(messages, mode = DATA_MODES.mock, { signal } = {}) {
+  if (mode === DATA_MODES.live) return browserClient.analyzeIncidents(messages, { signal });
   const scenario = mode === DATA_MODES.replay ? getReplayScenario() : cloneScenario();
   return {
     ...scenario,

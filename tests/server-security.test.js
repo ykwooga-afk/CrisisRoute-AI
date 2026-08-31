@@ -102,6 +102,8 @@ test("static server exposes only the public allowlist", { timeout: 20_000 }, asy
     "/src/main.js",
     "/src/styles.css",
     "/src/ui/decisionWorkflow.js",
+    "/src/ui/demoReliability.js",
+    "/src/data/replayResponses.js",
     "/src/assets/favicon.svg"
   ];
 
@@ -138,7 +140,10 @@ test("static server exposes only the public allowlist", { timeout: 20_000 }, asy
     "/scripts/decision-flow-smoke.js",
     "/scripts/brief-proof-smoke.js",
     "/scripts/frontend-workflow-smoke.js",
+    "/scripts/judge-demo-smoke.js",
+    "/scripts/live-judge-rehearsal.js",
     "/tests/frontend-workflow.test.js",
+    "/tests/demo-reliability.test.js",
     "/src/../.env.local",
     "/src/%2e%2e/.env.local",
     "/src/%2e%2e%2f.env.local",

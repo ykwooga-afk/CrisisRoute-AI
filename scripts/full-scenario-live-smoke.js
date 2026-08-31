@@ -113,6 +113,39 @@ function evaluateScenarioQuality(result) {
   };
 }
 
+function evaluateFullScenarioAcceptance(result, { durationMs } = {}) {
+  const incidents = Array.isArray(result?.incidents) ? result.incidents : [];
+  const labels = incidents.map(incident => incident?.label);
+  const uniqueCaseIds = new Set(incidents.map(incident => incident?.caseId)).size;
+  const shapePassed = incidents.length === 5 && incidents.every(incidentShapeContractPassed);
+  const uiPassed = shapePassed && labels.join(",") === "01,02,03,04,05";
+  const quality = evaluateScenarioQuality(result);
+  const first = incidents[0];
+  const analystLatency = first?.gonka?.analyst?.latencyMs;
+  const reviewerLatency = first?.gonka?.reviewer?.latencyMs;
+  const timingEvaluated = Number.isFinite(durationMs);
+  const timingConsistent = !timingEvaluated || (
+    Number.isFinite(analystLatency) && Number.isFinite(reviewerLatency) &&
+    durationMs + 100 >= Math.max(analystLatency, reviewerLatency)
+  );
+  const modelRequestCountPassed = result?.meta?.modelRequestCount === 2;
+  const sensitiveContentPassed = !containsSensitiveOrRawContent(result);
+  return {
+    ...quality,
+    incidentCount: incidents.length,
+    labels,
+    uniqueCaseIds,
+    shapePassed,
+    uiPassed,
+    timingEvaluated,
+    timingConsistent,
+    modelRequestCountPassed,
+    sensitiveContentPassed,
+    fullPassed: quality.passed && incidents.length === 5 && uniqueCaseIds === 5 &&
+      shapePassed && uiPassed && timingConsistent && modelRequestCountPassed && sensitiveContentPassed
+  };
+}
+
 function safeErrorSummary(error) {
   const role = ["analyst", "reviewer", "both"].includes(error?.failedRole || error?.role)
     ? error.failedRole || error.role
@@ -193,7 +226,7 @@ async function run({
   const reviewerSharedTrace = incidents.length === 5 &&
     incidents.every(item => typeof item.gonka?.reviewer?.responseId === "string" && item.gonka.reviewer.responseId.trim()) &&
     reviewerIds.size === 1;
-  const quality = evaluateScenarioQuality(result);
+  const quality = evaluateFullScenarioAcceptance(result, { durationMs });
   const healthPassed = health?.ok === true &&
     health?.liveRoutesReady === true &&
     health?.capabilities?.fullScenario === true;
@@ -220,13 +253,7 @@ async function run({
   const reviewerLatency = first?.gonka?.reviewer?.latencyMs;
   const latencyPresent = Number.isFinite(analystLatency) && Number.isFinite(reviewerLatency);
   const timingConsistent = latencyPresent && durationMs + 100 >= Math.max(analystLatency, reviewerLatency);
-  const overallQualityPassed = healthPassed &&
-    shapePassed &&
-    uiPassed &&
-    quality.passed &&
-    timingConsistent &&
-    result?.meta?.modelRequestCount === 2 &&
-    !sensitiveFound;
+  const overallQualityPassed = healthPassed && quality.fullPassed;
   log(`Analyst Model: ${first?.gonka?.analyst?.model || "Not Available"}`);
   log(`Analyst Response ID: ${first?.gonka?.analyst?.responseId || "Not Available"}`);
   log(`Analyst Latency: ${analystLatency ?? "Not Available"}ms`);
@@ -256,10 +283,7 @@ async function run({
     uniqueCaseIds === 5 &&
     shapePassed &&
     uiPassed &&
-    quality.passed &&
-    timingConsistent &&
-    result?.meta?.modelRequestCount === 2 &&
-    !sensitiveFound
+    quality.fullPassed
   );
 }
 
@@ -277,6 +301,7 @@ if (require.main === module) {
 module.exports = {
   run,
   evaluateScenarioQuality,
+  evaluateFullScenarioAcceptance,
   incidentShapeContractPassed,
   LOCAL_SCENARIO_TIMEOUT_MS
 };

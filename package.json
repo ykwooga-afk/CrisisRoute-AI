@@ -12,7 +12,9 @@
     "smoke:scenario": "node scripts/full-scenario-live-smoke.js",
     "smoke:decision": "node scripts/decision-flow-smoke.js",
     "smoke:brief": "node scripts/brief-proof-smoke.js",
-    "smoke:frontend": "node scripts/frontend-workflow-smoke.js"
+    "smoke:frontend": "node scripts/frontend-workflow-smoke.js",
+    "smoke:judge": "node scripts/judge-demo-smoke.js",
+    "rehearse:live": "node --env-file-if-exists=.env.local scripts/live-judge-rehearsal.js"
   },
   "keywords": [
     "gonka",

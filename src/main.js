@@ -24,6 +24,20 @@ import {
   liveReadiness,
   safeReceiptExport
 } from "./ui/decisionWorkflow.js";
+import {
+  CANCEL_SCOPE_COPY,
+  RESET_SCOPE_COPY,
+  analyzeProgress,
+  beginLiveAttempt,
+  completeLiveAttempt,
+  createReliabilityState,
+  failLiveAttempt,
+  judgeWalkthroughState,
+  modeProvenance,
+  openSanitizedReplay,
+  replayTraceLabels,
+  shouldApplyLiveResult
+} from "./ui/demoReliability.js";
 
 const VIEWS = {
   command: "command",
@@ -46,8 +60,15 @@ const state = {
   error: null,
   health: null,
   toast: null,
-  decisionWorkflows: {}
+  decisionWorkflows: {},
+  reliability: createReliabilityState(DATA_MODES.mock),
+  replayMeta: null,
+  liveProgress: null
 };
+
+let liveAttemptSequence = 0;
+let liveAbortController = null;
+let liveProgressTimer = null;
 
 const app = document.querySelector("#app");
 
@@ -131,6 +152,8 @@ function bindEvents() {
 
     if (action === "load-demo") {
       state.mode = DATA_MODES.mock;
+      state.reliability = createReliabilityState(DATA_MODES.mock);
+      state.replayMeta = null;
       await withLoading(() => loadDemoScenario());
       return;
     }
@@ -141,8 +164,27 @@ function bindEvents() {
     }
 
     if (action === "mode") {
-      state.mode = button.dataset.mode;
-      await withLoading(() => loadModeScenario(state.mode));
+      await loadModeScenario(button.dataset.mode);
+      return;
+    }
+
+    if (action === "retry-live") {
+      await retryLiveAnalyze();
+      return;
+    }
+
+    if (action === "open-sanitized-replay") {
+      await openReplayFromRecovery();
+      return;
+    }
+
+    if (action === "cancel-live-wait") {
+      cancelLiveUiWait();
+      return;
+    }
+
+    if (action === "reset-browser-view") {
+      resetBrowserView();
       return;
     }
 
@@ -233,28 +275,42 @@ async function loadDemoScenario() {
 }
 
 async function loadModeScenario(mode) {
-  state.error = null;
-  try {
-    if (mode === DATA_MODES.live) {
-      await refreshHealth();
-      if (!isLiveConnected()) {
-        state.error = "Live backend unavailable: Gonka backend routes are not connected yet.";
-        showToast("Live backend unavailable. No fake Gonka result was created.");
-        return;
-      }
-    }
-
-    const result = await loadHazeScenario(mode);
-    state.incidents = result.incidents || [];
-    state.resources = result.resources || state.resources;
-    state.decisionWorkflows = {};
-    selectIncident(findCaseByLabel("03")?.caseId || state.incidents[0]?.caseId || null);
-    showToast(mode === DATA_MODES.replay ? "Recorded replay loaded." : "Live scenario loaded.");
-  } catch (error) {
-    state.error = `Live backend unavailable: ${error.message}`;
-    showToast("Live backend unavailable. Demo data was not converted into live data.");
+  if (mode === DATA_MODES.mock) {
+    state.mode = DATA_MODES.mock;
+    state.reliability = createReliabilityState(DATA_MODES.mock);
+    state.replayMeta = null;
+    await withLoading(() => loadDemoScenario());
+    return;
   }
+  if (mode === DATA_MODES.replay) {
+    await withLoading(async () => {
+      const result = await loadHazeScenario(DATA_MODES.replay);
+      state.mode = DATA_MODES.replay;
+      state.reliability = openSanitizedReplay(state.reliability);
+      state.replayMeta = result.meta || null;
+      applyScenarioResult(result, "03");
+      showToast("Sanitized acceptance replay opened locally. Network requests: 0.");
+    });
+    return;
+  }
+  if (mode !== DATA_MODES.live) return;
+
   await refreshHealth();
+  const readiness = liveReadiness(state.health);
+  if (!readiness.ready) {
+    const requestId = `live-readiness-${++liveAttemptSequence}`;
+    state.reliability = beginLiveAttempt(state.reliability, { requestId, messages: [] });
+    state.reliability = failLiveAttempt(state.reliability, {
+      status: 503,
+      code: "HTTP_ERROR",
+      message: `Live readiness is incomplete: ${readiness.missing.join(", ")}.`,
+      retryable: false,
+      failedRole: "not_available"
+    }, requestId);
+    render();
+    return;
+  }
+  await runLiveAnalyze({ kind: "fixed", messages: [] });
 }
 
 async function handleVerifyInput() {
@@ -263,33 +319,124 @@ async function handleVerifyInput() {
     .map(line => line.trim())
     .filter(Boolean);
 
-  if (!messages.length) {
+  if (state.mode === DATA_MODES.replay) {
+    await loadModeScenario(DATA_MODES.replay);
+    return;
+  }
+
+  if (!messages.length && state.mode !== DATA_MODES.live) {
     showToast("Paste a crisis report or source URL first.");
+    return;
+  }
+
+  if (state.mode === DATA_MODES.live) {
+    await refreshHealth();
+    if (!liveReadiness(state.health).ready) {
+      await loadModeScenario(DATA_MODES.live);
+      return;
+    }
+    await runLiveAnalyze({ kind: "fixed", messages: [] });
     return;
   }
 
   state.error = null;
   await withLoading(async () => {
-    try {
-      if (state.mode === DATA_MODES.live) {
-        await refreshHealth();
-        if (!isLiveConnected()) {
-          throw new Error("Gonka backend routes are not connected yet.");
-        }
-      }
-
-      const result = await analyzeIncidents(messages, state.mode);
-      state.incidents = result.incidents || [];
-      state.resources = result.resources || state.resources;
-      state.decisionWorkflows = {};
-      selectIncident(state.incidents[0]?.caseId || null);
-      state.currentView = VIEWS.intelligence;
-      showToast(state.mode === DATA_MODES.live ? "Live analysis returned." : "Demo analysis generated by local adapter.");
-    } catch (error) {
-      state.error = `Verification unavailable: ${error.message}`;
-      showToast("Live verification unavailable. No fake Gonka result was created.");
-    }
+    const result = await analyzeIncidents(messages, state.mode);
+    applyScenarioResult(result, null);
+    state.currentView = VIEWS.intelligence;
+    showToast(state.mode === DATA_MODES.replay
+      ? "Sanitized replay remains local; no current inference was performed."
+      : "Synthetic demo analysis generated by the local adapter.");
   });
+}
+
+function applyScenarioResult(result, preferredLabel) {
+  state.incidents = result.incidents || [];
+  state.resources = result.resources || state.resources;
+  state.decisionWorkflows = {};
+  const preferred = preferredLabel ? findCaseByLabel(preferredLabel)?.caseId : null;
+  selectIncident(preferred || state.incidents[0]?.caseId || null);
+}
+
+async function runLiveAnalyze(requestSpec) {
+  if (state.reliability.phase === "live_wait") return;
+  const requestId = `live-attempt-${++liveAttemptSequence}`;
+  const requestedCaseSet = state.selectedCaseId || "no-selected-case";
+  const messages = Array.isArray(requestSpec.messages) ? requestSpec.messages : [];
+  state.reliability = beginLiveAttempt(state.reliability, { requestId, messages });
+  state.liveProgress = { requestId, startedAt: Date.now(), requestedCaseSet };
+  state.error = null;
+  state.replayMeta = null;
+  liveAbortController = new AbortController();
+  clearLiveProgressTimer();
+  liveProgressTimer = window.setInterval(() => {
+    if (state.liveProgress?.requestId === requestId) render();
+  }, 1_000);
+  render();
+
+  try {
+    const result = requestSpec.kind === "fixed"
+      ? await loadHazeScenario(DATA_MODES.live, { signal: liveAbortController.signal })
+      : await analyzeIncidents(messages, DATA_MODES.live, { signal: liveAbortController.signal });
+    const canApply = shouldApplyLiveResult({
+      requestId,
+      activeRequestId: state.reliability.activeRequestId,
+      requestedCaseSet,
+      activeCaseSet: state.selectedCaseId || "no-selected-case"
+    });
+    if (!canApply) return;
+    state.reliability = completeLiveAttempt(state.reliability, requestId);
+    state.mode = DATA_MODES.live;
+    applyScenarioResult(result, requestSpec.kind === "fixed" ? "03" : null);
+    state.currentView = VIEWS.intelligence;
+    showToast("Live five-case analysis returned. Human action is still required.");
+  } catch (error) {
+    state.reliability = failLiveAttempt(state.reliability, error, requestId);
+    showToast(error?.code === "CLIENT_WAIT_CANCELLED"
+      ? "Browser wait stopped. Server or remote cancellation is not confirmed."
+      : "Live attempt failed safely. No Retry or Replay fallback was automatic.");
+  } finally {
+    if (state.liveProgress?.requestId === requestId) state.liveProgress = null;
+    clearLiveProgressTimer();
+    liveAbortController = null;
+    render();
+  }
+}
+
+async function retryLiveAnalyze() {
+  const failure = state.reliability.lastFailure;
+  if (!failure?.retry?.allowed || state.reliability.phase === "live_wait") return;
+  await refreshHealth();
+  if (!liveReadiness(state.health).ready) {
+    showToast("Manual Retry is unavailable until LIVE capabilities are ready.");
+    return;
+  }
+  const messages = state.reliability.lastLiveMessages || [];
+  await runLiveAnalyze({ kind: messages.length ? "custom" : "fixed", messages });
+}
+
+async function openReplayFromRecovery() {
+  await loadModeScenario(DATA_MODES.replay);
+}
+
+function cancelLiveUiWait() {
+  if (!liveAbortController || !state.liveProgress) return;
+  liveAbortController.abort();
+}
+
+function resetBrowserView() {
+  state.currentView = VIEWS.command;
+  state.error = null;
+  state.toast = null;
+  state.reliability = createReliabilityState(state.mode);
+  state.liveProgress = null;
+  clearLiveProgressTimer();
+  render();
+}
+
+function clearLiveProgressTimer() {
+  if (liveProgressTimer !== null) window.clearInterval(liveProgressTimer);
+  liveProgressTimer = null;
 }
 
 async function handleDecisionSubmission() {
@@ -470,10 +617,89 @@ function render() {
     <div class="app-shell">
       ${renderTopNavigation()}
       ${state.error ? `<div class="system-alert">${escapeHtml(state.error)}</div>` : ""}
+      ${renderModeTrustPanel()}
+      ${renderReliabilityPanel()}
+      ${renderJudgeWalkthrough()}
       ${renderCurrentView(incident)}
       ${state.toast ? `<div class="toast" role="status">${escapeHtml(state.toast)}</div>` : ""}
       ${state.loading ? `<div class="loading-indicator" aria-live="polite">Processing</div>` : ""}
     </div>
+  `;
+}
+
+function renderModeTrustPanel() {
+  const provenance = modeProvenance(state.mode);
+  const replayLabels = state.mode === DATA_MODES.replay ? replayTraceLabels(state.replayMeta || {}) : null;
+  return `
+    <section class="mode-trust-panel mode-${escapeHtml(state.mode)}" aria-label="Current mode provenance">
+      <div>
+        <span class="section-kicker">${escapeHtml(provenance.mode)} TRUST LABEL</span>
+        <strong>${escapeHtml(provenance.title)}</strong>
+      </div>
+      <ul>${provenance.lines.map(line => `<li>${escapeHtml(line)}</li>`).join("")}</ul>
+      ${replayLabels ? `<p>${escapeHtml(replayLabels.source)} · ${escapeHtml(replayLabels.network)} · ${escapeHtml(replayLabels.responseIds)}</p>` : ""}
+      <button type="button" class="text-link" data-action="reset-browser-view">Reset browser view</button>
+      <small>${escapeHtml(RESET_SCOPE_COPY)}</small>
+    </section>
+  `;
+}
+
+function renderReliabilityPanel() {
+  if (state.liveProgress) {
+    const progress = analyzeProgress(Date.now() - state.liveProgress.startedAt, { cancelSupported: true });
+    return `
+      <section class="reliability-panel progress-panel" aria-live="polite" aria-busy="true">
+        <div>
+          <span class="section-kicker">LIVE ANALYZE · ${escapeHtml(progress.elapsedSeconds)}s elapsed</span>
+          <h2>${escapeHtml(progress.stage)}</h2>
+          <p>These are workflow explanations, not server-confirmed internal model progress.</p>
+          <p>${escapeHtml(progress.blindReviewStatement)} No automatic Retry will occur.</p>
+        </div>
+        <ol>${progress.stages.map((stage, index) => `<li class="${index === progress.stageIndex ? "active" : ""}">${escapeHtml(stage)}</li>`).join("")}</ol>
+        <button type="button" class="secondary-action" data-action="cancel-live-wait">Cancel UI Wait</button>
+        <small>${escapeHtml(CANCEL_SCOPE_COPY)}</small>
+      </section>
+    `;
+  }
+  const failure = state.reliability.lastFailure;
+  if (!failure) return "";
+  return `
+    <section class="reliability-panel failure-panel" role="alert">
+      <div>
+        <span class="section-kicker">SAFE LIVE FAILURE</span>
+        <h2>${escapeHtml(failure.headline)}</h2>
+        <p>${escapeHtml(failure.message)}</p>
+        <p>${escapeHtml(failure.roleLine)} · HTTP ${escapeHtml(failure.status || "not available")}</p>
+        ${failure.roleErrors ? `<p>Role errors: ${escapeHtml(Object.entries(failure.roleErrors).map(([role, code]) => `${role}=${code}`).join(" · "))}</p>` : ""}
+        <p>${escapeHtml(failure.retryLine)}</p>
+        ${state.reliability.cancelledUiWait ? `<p>${escapeHtml(CANCEL_SCOPE_COPY)}</p>` : ""}
+      </div>
+      <div class="recovery-actions">
+        <button type="button" class="primary-action" data-action="retry-live" ${failure.retry.allowed ? "" : "disabled"}>Retry Live</button>
+        <button type="button" class="secondary-action" data-action="open-sanitized-replay">Open Sanitized Replay</button>
+      </div>
+      <small>Existing ${escapeHtml(modeLabel(state.mode))} data remains unchanged. Replay opens only after an explicit operator click.</small>
+    </section>
+  `;
+}
+
+function renderJudgeWalkthrough() {
+  const workflows = Object.values(state.decisionWorkflows);
+  const steps = judgeWalkthroughState({
+    incidentCount: state.incidents.length,
+    independentScoresVisible: state.incidents.length === 5 && state.incidents.every(incident => incident.modelReviews?.analyst?.scores && incident.modelReviews?.reviewer?.scores),
+    decisionRecorded: workflows.some(workflow => workflow.decisionStatus === "RECORDED"),
+    briefReady: workflows.some(workflow => workflow.briefStatus === "READY"),
+    proofChecked: workflows.some(workflow => ["VALID", "INVALID"].includes(workflow.proofStatus))
+  });
+  return `
+    <details class="judge-walkthrough">
+      <summary>Judge Walkthrough — operator guide only</summary>
+      <ol>
+        ${steps.map(step => `<li class="${step.completed ? "completed" : "pending"}"><span>${step.completed ? "Completed" : "Pending"}</span> ${escapeHtml(step.number)}. ${escapeHtml(step.label)}</li>`).join("")}
+      </ol>
+      <p>This guide does not click, submit a Human Decision, check acknowledgements, bypass a Safety Gate, or claim real-world execution.</p>
+    </details>
   `;
 }
 
@@ -728,13 +954,18 @@ function assessmentRow(incident, gateId) {
 }
 
 function renderVerifyInput() {
+  const buttonLabel = state.mode === DATA_MODES.live
+    ? "Analyze Five Fixed Reports"
+    : state.mode === DATA_MODES.replay
+      ? "Reload Sanitized Replay"
+      : "Run Synthetic Demo Analysis";
   return `
     <section class="verify-panel">
       <h2 class="section-kicker">Verify a Crisis Report</h2>
       <p>Paste a crisis report or source URL. CrisisRoute AI will extract claims, evaluate evidence, and flag safety constraints.</p>
       <textarea id="verify-input" placeholder="Paste a Telegram message, WhatsApp report, emergency text, or source URL...">${escapeHtml(state.intakeValue)}</textarea>
       <div class="verify-actions">
-        <button class="primary-action" data-action="verify-input">Verify with Gonka</button>
+        <button class="primary-action" data-action="verify-input">${escapeHtml(buttonLabel)}</button>
         <button class="secondary-action" data-action="load-demo">Load Malaysia Haze Demo</button>
       </div>
       <small>${escapeHtml(modeFootnote())}</small>
@@ -966,10 +1197,13 @@ function renderBlindModelReview(incident) {
 }
 
 function renderModelReviewCard(title, trace, review, role) {
+  const traceCopy = state.mode === DATA_MODES.replay
+    ? `${trace.model} · Response ID [REDACTED] · Sanitized recorded trace; not this load's latency`
+    : `${trace.model} · ${trace.responseId} · ${trace.promptVersion} · ${String(trace.latencyMs)}ms`;
   return `
     <article class="model-card ${role}">
       <h3>${escapeHtml(title)}</h3>
-      <p class="trace-line">${escapeHtml(trace.model)} · ${escapeHtml(trace.responseId)} · ${escapeHtml(trace.promptVersion)} · ${escapeHtml(String(trace.latencyMs))}ms</p>
+      <p class="trace-line">${escapeHtml(traceCopy)}</p>
       ${modelRow("Conclusion", review.conclusion)}
       ${review.evidenceCited ? modelRow("Evidence cited", review.evidenceCited.join(" · ")) : ""}
       ${review.counterEvidence ? modelRow("Counter-evidence", arrayText(review.counterEvidence)) : ""}
@@ -1617,7 +1851,7 @@ function shortModeLabel(mode) {
 
 function gonkaLabel() {
   if (state.mode === DATA_MODES.mock) return "DEMO DATA";
-  if (state.mode === DATA_MODES.replay) return "RECORDED RESPONSE";
+  if (state.mode === DATA_MODES.replay) return "SANITIZED REPLAY";
   return isLiveConnected() ? "CONNECTED" : "UNAVAILABLE";
 }
 
@@ -1628,12 +1862,8 @@ function gonkaTone() {
 }
 
 function modeFootnote() {
-  if (state.mode === DATA_MODES.mock) {
-    return "Demo mode uses local snapshot data. It does not pretend to be live Gonka verification.";
-  }
-  if (state.mode === DATA_MODES.replay) {
-    return "Replay mode uses recorded-style responses for demo rehearsal.";
-  }
+  if (state.mode === DATA_MODES.mock) return "Synthetic local demonstration data. Not a model result. No server-issued Proof.";
+  if (state.mode === DATA_MODES.replay) return "Sanitized recorded acceptance replay. No network request in this load. Response IDs redacted. Not current live inference.";
   const readiness = liveReadiness(state.health);
   return readiness.ready
     ? "Live mode has Analyze, Decision, Brief, and full-scenario capabilities available."

@@ -325,7 +325,7 @@ async function handleVerifyInput() {
   }
 
   if (!messages.length && state.mode !== DATA_MODES.live) {
-    showToast("Paste a crisis report or source URL first.");
+    showToast("Paste crisis report text first.");
     return;
   }
 
@@ -962,8 +962,8 @@ function renderVerifyInput() {
   return `
     <section class="verify-panel">
       <h2 class="section-kicker">Verify a Crisis Report</h2>
-      <p>Paste a crisis report or source URL. CrisisRoute AI will extract claims, evaluate evidence, and flag safety constraints.</p>
-      <textarea id="verify-input" placeholder="Paste a Telegram message, WhatsApp report, emergency text, or source URL...">${escapeHtml(state.intakeValue)}</textarea>
+      <p>Paste crisis report text. Public URL content retrieval is not included in this demo.</p>
+      <textarea id="verify-input" placeholder="Paste a Telegram message, WhatsApp report, or emergency text...">${escapeHtml(state.intakeValue)}</textarea>
       <div class="verify-actions">
         <button class="primary-action" data-action="verify-input">${escapeHtml(buttonLabel)}</button>
         <button class="secondary-action" data-action="load-demo">Load Malaysia Haze Demo</button>

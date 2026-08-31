@@ -24,6 +24,19 @@ const root = __dirname;
 const srcRoot = path.resolve(root, "src");
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 4173);
+const PRODUCTION_DEFAULT_MAX_ANALYSES = 12;
+const MAX_ANALYSES_UPPER_BOUND = 100;
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "connect-src 'self'",
+  "img-src 'self' data:",
+  "base-uri 'none'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+  "object-src 'none'"
+].join("; ");
 
 const publicRootFiles = new Map([
   ["/", "index.html"],
@@ -99,6 +112,13 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body, null, 2));
 }
 
+function sendFixedApiError(res, status, code, message, retryable = false) {
+  return sendJson(res, status, {
+    ok: false,
+    error: { code, message, retryable }
+  });
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -120,6 +140,134 @@ function getLiveConfiguration(gonkaClientFactory) {
     return { ready: true, client };
   } catch {
     return { ready: false, client: null };
+  }
+}
+
+function hasConfiguredValue(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isValidProductionBaseUrl(value) {
+  if (!hasConfiguredValue(value)) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash &&
+      url.pathname.replace(/\/+$/, "") === "/v1";
+  } catch {
+    return false;
+  }
+}
+
+function productionReadiness(env) {
+  const liveAnalysisEnabled = env.GONKA_LIVE_ENABLED === "true";
+  const modelsConfigured = hasConfiguredValue(env.GONKA_ANALYST_MODEL) &&
+    hasConfiguredValue(env.GONKA_REVIEWER_MODEL);
+  const configurationComplete = hasConfiguredValue(env.GONKA_API_KEY) &&
+    isValidProductionBaseUrl(env.GONKA_BASE_URL) &&
+    modelsConfigured;
+  const ready = liveAnalysisEnabled && configurationComplete;
+  return {
+    ready,
+    liveAnalysisEnabled,
+    modelsConfigured,
+    errorCode: liveAnalysisEnabled
+      ? configurationComplete ? null : "LIVE_CONFIGURATION_INCOMPLETE"
+      : "LIVE_ANALYSIS_DISABLED"
+  };
+}
+
+function runtimeReadiness({ env, isProduction, gonkaClientFactory, shuttingDown }) {
+  if (shuttingDown) {
+    return {
+      ready: false,
+      liveAnalysisEnabled: false,
+      modelsConfigured: false,
+      errorCode: "SERVICE_SHUTTING_DOWN",
+      client: null
+    };
+  }
+  if (isProduction) return { ...productionReadiness(env), client: null };
+  const configuration = getLiveConfiguration(gonkaClientFactory);
+  return {
+    ready: configuration.ready,
+    liveAnalysisEnabled: configuration.ready,
+    modelsConfigured: configuration.ready,
+    errorCode: configuration.ready ? null : "LIVE_CONFIGURATION_INCOMPLETE",
+    client: configuration.client
+  };
+}
+
+function parseAnalysisLimit(value, fallback = PRODUCTION_DEFAULT_MAX_ANALYSES) {
+  if (typeof value === "number") {
+    return Number.isInteger(value) && value >= 1 && value <= MAX_ANALYSES_UPPER_BOUND
+      ? value
+      : fallback;
+  }
+  if (typeof value !== "string" || !/^\d+$/.test(value.trim())) return fallback;
+  const parsed = Number(value.trim());
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= MAX_ANALYSES_UPPER_BOUND
+    ? parsed
+    : fallback;
+}
+
+function createAnalysisProtection({ enabled, maxSubmissions }) {
+  let submissions = 0;
+  let active = 0;
+  let shuttingDown = false;
+
+  return {
+    beginShutdown() {
+      shuttingDown = true;
+    },
+    isShuttingDown() {
+      return shuttingDown;
+    },
+    isEnabled() {
+      return enabled;
+    },
+    acquire() {
+      if (shuttingDown) {
+        return { code: "SERVICE_SHUTTING_DOWN", status: 503 };
+      }
+      if (enabled && active >= 1) {
+        return { code: "ANALYSIS_BUSY", status: 429 };
+      }
+      if (enabled && submissions >= maxSubmissions) {
+        return { code: "ANALYSIS_LIMIT_REACHED", status: 429 };
+      }
+      submissions += 1;
+      active += 1;
+      let released = false;
+      return {
+        release() {
+          if (released) return;
+          released = true;
+          active = Math.max(0, active - 1);
+        }
+      };
+    }
+  };
+}
+
+function isForwardedHttps(req) {
+  if (req.socket?.encrypted === true) return true;
+  const forwarded = req.headers?.["x-forwarded-proto"];
+  return typeof forwarded === "string" && forwarded.split(",")[0].trim().toLowerCase() === "https";
+}
+
+function applySecurityHeaders(req, res, { isProduction }) {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("Content-Security-Policy", CONTENT_SECURITY_POLICY);
+  if (req.url?.startsWith("/api/")) res.setHeader("Cache-Control", "no-store");
+  if (isProduction && isForwardedHttps(req)) {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   }
 }
 
@@ -296,15 +444,56 @@ function parseCaseRoute(requestTarget) {
   return { caseId, kind: exactMatch[2] };
 }
 
-async function handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, decisionLedger, briefService }) {
+async function handleApi(req, res, {
+  gonkaClientFactory,
+  analyzeIncidentsFn,
+  decisionLedger,
+  briefService,
+  env,
+  isProduction,
+  analysisProtection
+}) {
+  if (req.method === "GET" && req.url === "/api/health/ready") {
+    const readiness = runtimeReadiness({
+      env,
+      isProduction,
+      gonkaClientFactory,
+      shuttingDown: analysisProtection.isShuttingDown()
+    });
+    const body = {
+      ok: readiness.ready,
+      service: "crisisroute-ai",
+      liveAnalysisEnabled: readiness.liveAnalysisEnabled,
+      modelsConfigured: readiness.modelsConfigured,
+      analyzeProtectionEnabled: analysisProtection.isEnabled()
+    };
+    if (!readiness.ready) {
+      body.error = {
+        code: readiness.errorCode,
+        message: "Live analysis is not ready for this deployment."
+      };
+    }
+    return sendJson(res, readiness.ready ? 200 : 503, body);
+  }
+
   if (req.method === "GET" && req.url === "/api/health/gonka") {
-    const configuration = getLiveConfiguration(gonkaClientFactory);
+    const readiness = runtimeReadiness({
+      env,
+      isProduction,
+      gonkaClientFactory,
+      shuttingDown: analysisProtection.isShuttingDown()
+    });
+    let configuration = { ready: readiness.ready, client: readiness.client };
+    if (isProduction && readiness.ready) {
+      configuration = getLiveConfiguration(gonkaClientFactory);
+    }
+    const ready = readiness.ready && configuration.ready;
     return sendJson(res, 200, {
-      ok: configuration.ready,
-      liveRoutesReady: configuration.ready,
+      ok: ready,
+      liveRoutesReady: ready,
       capabilities: {
-        analyzeCase01: configuration.ready,
-        fullScenario: configuration.ready,
+        analyzeCase01: ready,
+        fullScenario: ready,
         decision: true,
         brief: true
       },
@@ -314,16 +503,48 @@ async function handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, dec
       briefGeneration: "deterministic",
       proofIntegrityScope: "local_payload_integrity",
       proofExternalAnchoring: "none",
-      baseUrl: configuration.client?.baseUrl || process.env.GONKA_BASE_URL || DEFAULT_GONKA_BASE_URL,
-      analystModel: configuration.client?.models.analyst || process.env.GONKA_ANALYST_MODEL || DEFAULT_MODELS.analyst,
-      reviewerModel: configuration.client?.models.reviewer || process.env.GONKA_REVIEWER_MODEL || DEFAULT_MODELS.reviewer,
-      message: configuration.ready
+      analyzeProtectionEnabled: analysisProtection.isEnabled(),
+      baseUrl: configuration.client?.baseUrl || env.GONKA_BASE_URL || DEFAULT_GONKA_BASE_URL,
+      analystModel: configuration.client?.models.analyst || env.GONKA_ANALYST_MODEL || DEFAULT_MODELS.analyst,
+      reviewerModel: configuration.client?.models.reviewer || env.GONKA_REVIEWER_MODEL || DEFAULT_MODELS.reviewer,
+      message: ready
         ? "Live CASE 01 analysis route is configured; human approval remains required."
         : "Gonka configuration is missing or invalid."
     });
   }
 
   if (req.method === "POST" && req.url === "/api/incidents/analyze") {
+    if (isProduction) {
+      const readiness = runtimeReadiness({
+        env,
+        isProduction,
+        gonkaClientFactory,
+        shuttingDown: analysisProtection.isShuttingDown()
+      });
+      if (!readiness.ready) {
+        const code = readiness.errorCode === "LIVE_ANALYSIS_DISABLED"
+          ? "LIVE_ANALYSIS_DISABLED"
+          : "LIVE_CONFIGURATION_INCOMPLETE";
+        return sendFixedApiError(
+          res,
+          503,
+          code,
+          code === "LIVE_ANALYSIS_DISABLED"
+            ? "Live analysis is disabled for this deployment."
+            : "Live analysis configuration is incomplete."
+        );
+      }
+    }
+
+    const lease = analysisProtection.acquire();
+    if (lease.code) {
+      const message = lease.code === "ANALYSIS_BUSY"
+        ? "Another analysis is currently running."
+        : lease.code === "ANALYSIS_LIMIT_REACHED"
+          ? "This process has reached its analysis submission limit."
+          : "The service is shutting down.";
+      return sendFixedApiError(res, lease.status, lease.code, message, lease.code === "ANALYSIS_BUSY");
+    }
     try {
       const payload = await parseJsonBody(req);
       const client = analyzeIncidentsFn === analyzeIncidents ? gonkaClientFactory() : undefined;
@@ -332,6 +553,8 @@ async function handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, dec
       return sendJson(res, 200, result);
     } catch (error) {
       return sendApiError(res, error);
+    } finally {
+      lease.release();
     }
   }
 
@@ -533,12 +756,33 @@ function createServer({
   gonkaClientFactory = createGonkaClientFromEnv,
   analyzeIncidentsFn = analyzeIncidents,
   decisionLedger = createDecisionLedger(),
-  briefService = createBriefService({ decisionLedger })
+  briefService = createBriefService({ decisionLedger }),
+  env = process.env,
+  maxAnalysisSubmissions,
+  analysisProtectionEnabled
 } = {}) {
-  return http.createServer(async (req, res) => {
+  const isProduction = env.NODE_ENV === "production";
+  const maxSubmissions = parseAnalysisLimit(
+    maxAnalysisSubmissions ?? env.GONKA_MAX_ANALYSES_PER_PROCESS,
+    PRODUCTION_DEFAULT_MAX_ANALYSES
+  );
+  const analysisProtection = createAnalysisProtection({
+    enabled: isProduction || analysisProtectionEnabled === true || maxAnalysisSubmissions !== undefined,
+    maxSubmissions
+  });
+  const server = http.createServer(async (req, res) => {
+    applySecurityHeaders(req, res, { isProduction });
     try {
       if (req.url?.startsWith("/api/")) {
-        await handleApi(req, res, { gonkaClientFactory, analyzeIncidentsFn, decisionLedger, briefService });
+        await handleApi(req, res, {
+          gonkaClientFactory,
+          analyzeIncidentsFn,
+          decisionLedger,
+          briefService,
+          env,
+          isProduction,
+          analysisProtection
+        });
         return;
       }
       await serveStatic(req, res);
@@ -550,13 +794,57 @@ function createServer({
       }
     }
   });
+  server.beginShutdown = () => analysisProtection.beginShutdown();
+  return server;
+}
+
+function createGracefulShutdown(server, { timeoutMs = 30_000 } = {}) {
+  let shutdownPromise;
+  return function shutdown() {
+    if (shutdownPromise) return shutdownPromise;
+    server.beginShutdown?.();
+    shutdownPromise = new Promise(resolve => {
+      if (!server.listening) {
+        resolve();
+        return;
+      }
+      let settled = false;
+      let timer;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      timer = setTimeout(() => {
+        server.closeAllConnections?.();
+        finish();
+      }, timeoutMs);
+      timer.unref?.();
+      server.close(() => finish());
+    });
+    return shutdownPromise;
+  };
 }
 
 if (require.main === module) {
   const server = createServer();
+  const shutdown = createGracefulShutdown(server);
+  process.once("SIGTERM", () => {
+    shutdown().then(() => process.exitCode = 0);
+  });
+  process.once("SIGINT", () => {
+    shutdown().then(() => process.exitCode = 0);
+  });
   server.listen(port, host, () => {
     console.log(`CrisisRoute AI running at http://${host}:${port}`);
   });
 }
 
-module.exports = { createServer };
+module.exports = {
+  createServer,
+  createGracefulShutdown,
+  productionReadiness,
+  parseAnalysisLimit,
+  CONTENT_SECURITY_POLICY
+};

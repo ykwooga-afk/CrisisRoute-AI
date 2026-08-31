@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: crisisroute-ai
+    runtime: node
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health/ready
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: NODE_ENV
+        value: production
+      - key: GONKA_LIVE_ENABLED
+        value: "true"
+      - key: GONKA_MAX_ANALYSES_PER_PROCESS
+        value: "12"
+      - key: GONKA_BASE_URL
+        value: https://api.gonkarouter.io/v1
+      - key: GONKA_ANALYST_MODEL
+        value: deepseek-ai/DeepSeek-V4-Flash-0731
+      - key: GONKA_REVIEWER_MODEL
+        value: moonshotai/Kimi-K2.6
+      - key: GONKA_API_KEY
+        sync: false

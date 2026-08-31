@@ -14,7 +14,11 @@
     "smoke:brief": "node scripts/brief-proof-smoke.js",
     "smoke:frontend": "node scripts/frontend-workflow-smoke.js",
     "smoke:judge": "node scripts/judge-demo-smoke.js",
-    "rehearse:live": "node --env-file-if-exists=.env.local scripts/live-judge-rehearsal.js"
+    "rehearse:live": "node --env-file-if-exists=.env.local scripts/live-judge-rehearsal.js",
+    "audit:release": "node scripts/release-audit.js"
+  },
+  "engines": {
+    "node": ">=24 <25"
   },
   "keywords": [
     "gonka",

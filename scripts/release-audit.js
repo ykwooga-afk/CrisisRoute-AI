@@ -96,6 +96,35 @@ check(!tracked.some(file => file === ".env" || file === ".env.local" || /^\.env\
 check(!fs.existsSync(path.join(root, "node_modules")), "filesystem:node_modules-present");
 
 const render = read("render.yaml");
+const renderServiceTypes = [...render.matchAll(/^  - type:\s*(\S+)\s*$/gm)].map(match => match[1]);
+const renderPlans = [...render.matchAll(/^\s+plan:\s*(\S+)\s*$/gm)].map(match => match[1]);
+function renderServiceField(name) {
+  const matches = [...render.matchAll(new RegExp(`^    ${name}:\\s*([^\\r\\n]+)\\s*$`, "gm"))];
+  return matches.length === 1 ? matches[0][1].trim() : null;
+}
+const gonkaApiKeyBlocks = [...render.matchAll(
+  /^      - key:\s*GONKA_API_KEY\s*\r?\n((?:^        [^\r\n]*(?:\r?\n|$))*)/gm
+)];
+
+check(renderServiceTypes.length === 1, "render:service-count");
+check(renderServiceTypes.length === 1 && renderServiceTypes[0] === "web", "render:service-not-web");
+check(renderServiceField("runtime") === "node", "render:runtime-not-node");
+check(renderPlans.length === 1, "render:plan-missing-or-duplicate");
+check(renderPlans.length === 1 && renderPlans[0] === "free", "render:plan-not-free");
+check(renderServiceField("region") === "singapore", "render:region-not-singapore");
+check(renderServiceField("branch") === "main", "render:branch-not-main");
+check(
+  !/^(?:databases|envVarGroups):/m.test(render) &&
+    !/^\s+(?:disk|diskSizeGB|previewDiskSizeGB):/m.test(render) &&
+    !/^  - type:\s*(?:pserv|worker|cron|keyvalue|redis)\s*$/m.test(render) &&
+    renderPlans.every(plan => plan === "free"),
+  "render:unexpected-billable-resource"
+);
+check(gonkaApiKeyBlocks.length === 1, "render:key-placeholder-count");
+check(
+  gonkaApiKeyBlocks.length === 1 && gonkaApiKeyBlocks[0][1].trim() === "sync: false",
+  "render:key-placeholder-shape"
+);
 for (const fragment of [
   "runtime: node",
   "buildCommand: npm ci --omit=dev",

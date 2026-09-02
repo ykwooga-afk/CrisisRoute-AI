@@ -2,6 +2,9 @@ services:
   - type: web
     name: crisisroute-ai
     runtime: node
+    plan: free
+    region: singapore
+    branch: main
     buildCommand: npm ci --omit=dev
     startCommand: npm start
     healthCheckPath: /api/health/ready

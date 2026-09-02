@@ -304,6 +304,38 @@ test("Render config, lockfile, README, and UI meet the Production release contra
   assert.doesNotMatch(frontend, /Paste a crisis report or source URL/);
 });
 
+test("Render Blueprint pins one free Singapore web service with a manual secret", () => {
+  const render = fs.readFileSync(path.join(root, "render.yaml"), "utf8");
+  const serviceTypes = [...render.matchAll(/^  - type:\s*(\S+)\s*$/gm)].map(match => match[1]);
+  const field = name => {
+    const matches = [...render.matchAll(new RegExp(`^    ${name}:\\s*([^\\r\\n]+)\\s*$`, "gm"))];
+    assert.equal(matches.length, 1, `${name} must occur exactly once on the service`);
+    return matches[0][1].trim();
+  };
+
+  assert.deepEqual(serviceTypes, ["web"]);
+  assert.equal(field("runtime"), "node");
+  assert.equal(field("plan"), "free");
+  assert.equal(field("region"), "singapore");
+  assert.equal(field("branch"), "main");
+  assert.equal(field("buildCommand"), "npm ci --omit=dev");
+  assert.equal(field("startCommand"), "npm start");
+  assert.equal(field("healthCheckPath"), "/api/health/ready");
+
+  const plans = [...render.matchAll(/^\s+plan:\s*(\S+)\s*$/gm)].map(match => match[1]);
+  assert.deepEqual(plans, ["free"]);
+  assert.doesNotMatch(render, /^(?:databases|envVarGroups):/m);
+  assert.doesNotMatch(render, /^\s+(?:disk|diskSizeGB|previewDiskSizeGB):/m);
+  assert.doesNotMatch(render, /^  - type:\s*(?:pserv|worker|cron|keyvalue|redis)\s*$/m);
+
+  const apiKeyBlocks = [...render.matchAll(
+    /^      - key:\s*GONKA_API_KEY\s*\r?\n((?:^        [^\r\n]*(?:\r?\n|$))*)/gm
+  )];
+  assert.equal(apiKeyBlocks.length, 1);
+  assert.equal(apiKeyBlocks[0][1].trim(), "sync: false");
+  assert.doesNotMatch(apiKeyBlocks[0][1], /^\s*value:/m);
+});
+
 test("Release Audit stays offline and never reads .env.local", () => {
   const auditSource = fs.readFileSync(path.join(root, "scripts/release-audit.js"), "utf8");
   assert.doesNotMatch(auditSource, /read\(["']\.env\.local["']\)/);

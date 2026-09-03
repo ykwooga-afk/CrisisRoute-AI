@@ -484,3 +484,41 @@ test("Audit distinguishes pending from a recorded human decision without claimin
   assert.equal(ui.auditEvents(case01).find(item => item.label === "Action").detail, "Recorded — not executed");
   assert.equal(ui.auditEvents(case01).find(item => item.label === "Safety").detail, "Human review required");
 });
+
+test("actual Demo CASE 01 renders agreement and available after explicit human approval", async () => {
+  const case01 = (await importSource("src/data/hazeScenario.mock.js")).cloneScenario().incidents[0];
+  const ui = await renderers();
+  for (const render of [ui.renderDecisionPath, ui.renderDispatchLockPanel, ui.renderSafetyAssessment, ui.renderHumanDecisionButtons]) {
+    const html = render(case01);
+    assert.match(html, /DISPATCH AVAILABLE|Volunteer Dispatch — Available/);
+    assert.match(html, /after explicit human approval/);
+    assert.match(html, /Nothing has been dispatched/);
+    assert.doesNotMatch(html, /DISPATCH LOCKED|DISPATCH REVIEW REQUIRED/);
+  }
+  const form = ui.renderHumanDecisionButtons(case01);
+  assert.match(form, /State <strong>DISPATCH_CANDIDATE<\/strong>/);
+  assert.match(form, /Consensus <strong>AGREEMENT<\/strong>/);
+  assert.doesNotMatch(form, /\schecked(?:\s|>)/);
+  assert.equal(ui.auditEvents(case01).find(item => item.label === "Action").detail, "Pending");
+});
+
+test("actual Demo non-dispatch states never offer volunteer dispatch and CASE 04 requires conflict review", async () => {
+  const demo = (await importSource("src/data/hazeScenario.mock.js")).cloneScenario();
+  const ui = await renderers();
+  for (const item of demo.incidents.slice(1)) {
+    for (const render of [ui.renderDecisionPath, ui.renderDispatchLockPanel, ui.renderSafetyAssessment, ui.renderHumanDecisionButtons]) {
+      const html = render(item);
+      assert.match(html, /dispatch[^<]*locked/i);
+      assert.doesNotMatch(html, /dispatch[^<]*available/i);
+    }
+    const form = ui.renderHumanDecisionButtons(item);
+    assert.ok(form.includes(`State <strong>${item.operationalState}</strong>`));
+    assert.ok(form.includes(`Consensus <strong>${item.modelDebate.consensus}</strong>`));
+  }
+  const case04 = demo.incidents.find(item => item.label === "04");
+  assert.equal(workflow.acknowledgementRequirements(case04, "HOLD_FOR_REVIEW").acknowledgeReview, true);
+  const form = ui.renderHumanDecisionButtons(case04);
+  assert.match(form, /data-acknowledgement="acknowledgeReview"[^>]*\/>\s*<span>[^<]*<small>Required<\/small>/);
+  assert.match(form, /CONFLICT: <strong>review<\/strong>/);
+  assert.equal(workflow.validateDecisionForm(case04, { ...workflow.createDecisionForm(case04), reason: "Offline human review test." }).valid, false);
+});

@@ -59,6 +59,7 @@ export function getReplayScenario() {
   const incidents = scenario.incidents.map(incident => {
     const accepted = ACCEPTED_RESULTS[incident.label];
     if (!accepted) throw new Error("Sanitized replay fixture is incomplete.");
+    const gaps = scoreGaps(accepted.analyst, accepted.reviewer);
     return {
       ...incident,
       scores: { ...accepted.final },
@@ -66,7 +67,8 @@ export function getReplayScenario() {
       modelDebate: {
         ...incident.modelDebate,
         consensus: accepted.consensus,
-        scoreGaps: scoreGaps(accepted.analyst, accepted.reviewer),
+        scoreGaps: gaps,
+        maxScoreGap: Math.max(gaps.verification, gaps.urgency, gaps.actionability),
         replayNotice: "Sanitized B7-Q2-R1 acceptance result; not current live inference."
       },
       modelReviews: {

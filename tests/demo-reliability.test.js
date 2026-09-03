@@ -2,6 +2,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const { createHash } = require("node:crypto");
+const { computeConsensus } = require("../backend/incidentPipeline");
 
 const projectRoot = path.resolve(__dirname, "..");
 
@@ -13,8 +15,8 @@ async function importPure(relativePath) {
   return import(dataModule(fs.readFileSync(path.join(projectRoot, relativePath), "utf8")));
 }
 
-async function importReplay() {
-  const hazeUrl = dataModule(fs.readFileSync(path.join(projectRoot, "src/data/hazeScenario.mock.js"), "utf8"));
+async function importReplay(demoSource = fs.readFileSync(path.join(projectRoot, "src/data/hazeScenario.mock.js"), "utf8")) {
+  const hazeUrl = dataModule(demoSource);
   let source = fs.readFileSync(path.join(projectRoot, "src/data/replayResponses.js"), "utf8");
   source = source.replace(
     /import\s+\{\s*cloneScenario\s*,\s*rawReports\s*\}\s+from\s+["'][^"']+["'];/,
@@ -646,4 +648,119 @@ test("reliability UI strings are connected through escaped rendering", () => {
   assert.match(main, /failure\.headline\)}/);
   assert.match(main, /escapeHtml\(failure\.message\)/);
   assert.doesNotMatch(main, /innerHTML\s*\+=/);
+});
+
+test("Demo five-case final scores, gaps, maximum gaps and consensus match the production arithmetic", async () => {
+  const demo = (await importPure("src/data/hazeScenario.mock.js")).cloneScenario();
+  const expected = [
+    [[91, 96, 88], [89, 94, 86], [90, 95, 87], [2, 2, 2], 2, "AGREEMENT"],
+    [[42, 64, 55], [34, 58, 49], [38, 61, 52], [8, 6, 6], 8, "AGREEMENT"],
+    [[43, 97, 24], [41, 97, 22], [42, 97, 23], [2, 0, 2], 2, "AGREEMENT"],
+    [[70, 72, 63], [55, 77, 45], [63, 75, 54], [15, 5, 18], 18, "DISAGREEMENT"],
+    [[78, 42, 81], [75, 39, 83], [77, 41, 82], [3, 3, 2], 3, "AGREEMENT"]
+  ];
+  const axes = scores => [scores.verification, scores.urgency, scores.actionability];
+  assert.deepEqual(demo.incidents.map(item => item.label), ["01", "02", "03", "04", "05"]);
+  demo.incidents.forEach((item, index) => {
+    const actual = computeConsensus(item.modelReviews.analyst.scores, item.modelReviews.reviewer.scores);
+    const [analyst, reviewer, final, gaps, max, consensus] = expected[index];
+    assert.deepEqual(axes(item.modelReviews.analyst.scores), analyst);
+    assert.deepEqual(axes(item.modelReviews.reviewer.scores), reviewer);
+    assert.deepEqual(axes(item.scores), final);
+    assert.deepEqual(axes(item.modelDebate.scoreGaps), gaps);
+    assert.equal(item.modelDebate.maxScoreGap, max);
+    assert.equal(item.modelDebate.consensus, consensus);
+    assert.ok(["AGREEMENT", "DISAGREEMENT", "CRITICAL_CONFLICT"].includes(item.modelDebate.consensus));
+    assert.deepEqual(item.scores, actual.scores);
+    assert.deepEqual(item.modelDebate.scoreGaps, actual.gaps);
+    assert.equal(item.modelDebate.maxScoreGap, actual.maxScoreGap);
+    assert.equal(item.modelDebate.consensus, actual.level);
+  });
+});
+
+test("consensus boundaries remain 15 inclusive, 30 inclusive and above 30 critical", () => {
+  for (const [gap, expected] of [[0, "AGREEMENT"], [15, "AGREEMENT"], [16, "DISAGREEMENT"], [30, "DISAGREEMENT"], [31, "CRITICAL_CONFLICT"], [100, "CRITICAL_CONFLICT"]]) {
+    const result = computeConsensus({ verification: 0, urgency: 50, actionability: 50 }, { verification: gap, urgency: 50, actionability: 50 });
+    assert.equal(result.level, expected);
+    assert.equal(result.maxScoreGap, gap);
+  }
+});
+
+test("Demo operational states stay separate from consensus and only CASE 01 passes dispatch", async () => {
+  const demo = (await importPure("src/data/hazeScenario.mock.js")).cloneScenario();
+  assert.deepEqual(demo.incidents.map(item => item.operationalState), ["DISPATCH_CANDIDATE", "MERGE_OR_VERIFY", "URGENT_VERIFICATION", "NEEDS_HUMAN_REVIEW", "QUEUED_ACTION"]);
+  for (const item of demo.incidents) {
+    assert.notEqual(item.operationalState, item.modelDebate.consensus);
+    const gate = id => item.safetyGates.find(value => value.id === id);
+    const canDispatch = item.operationalState === "DISPATCH_CANDIDATE" && item.modelDebate.consensus === "AGREEMENT" &&
+      ["G_LOCATION", "G_CONTACT", "G_RESOURCE"].every(id => gate(id).passed === true);
+    assert.equal(gate("G_DISPATCH").status, canDispatch ? "passed" : "locked");
+    assert.equal(gate("G_DISPATCH").passed, canDispatch);
+    assert.equal(gate("G_CONFLICT").status, item.label === "04" ? "review" : "passed");
+    if (item.label === "03") {
+      for (const id of ["G_LOCATION", "G_CONTACT"]) {
+        assert.equal(gate(id).status, "blocked");
+        assert.equal(gate(id).passed, false);
+      }
+    }
+  }
+});
+
+test("Replay maximum gaps are calculated from its own accepted role scores", () => {
+  const result = replay.getReplayScenario();
+  assert.deepEqual(result.incidents.map(item => item.modelDebate.maxScoreGap), [25, 20, 5, 20, 20]);
+  for (const item of result.incidents) {
+    const expected = computeConsensus(item.modelReviews.analyst.scores, item.modelReviews.reviewer.scores);
+    const gaps = item.modelDebate.scoreGaps;
+    assert.deepEqual(gaps, expected.gaps);
+    assert.equal(item.modelDebate.maxScoreGap, Math.max(gaps.verification, gaps.urgency, gaps.actionability));
+    assert.equal(item.modelDebate.maxScoreGap, expected.maxScoreGap);
+  }
+});
+
+test("Replay ignores missing, added or changed Demo maxScoreGap and scoreGaps metadata", async () => {
+  const source = fs.readFileSync(path.join(projectRoot, "src/data/hazeScenario.mock.js"), "utf8");
+  const expected = replay.getReplayScenario();
+  for (const mutation of [
+    "delete item.modelDebate.maxScoreGap; delete item.modelDebate.scoreGaps;",
+    "item.modelDebate.maxScoreGap = 99; item.modelDebate.scoreGaps = { verification: 99, urgency: 99, actionability: 99 };",
+    "item.modelDebate.maxScoreGap = 0; item.modelDebate.scoreGaps = { verification: 0, urgency: 0, actionability: 0 };"
+  ]) {
+    const isolatedReplay = await importReplay(`${source}\nfor (const item of incidents) { ${mutation} }`);
+    assert.deepEqual(isolatedReplay.getReplayScenario(), expected);
+  }
+});
+
+test("Replay retains its entire pre-F2 payload except the authorized maximum gap addition", () => {
+  const result = replay.getReplayScenario();
+  for (const item of result.incidents) delete item.modelDebate.maxScoreGap;
+  const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object"
+    ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+  // Canonical SHA-256 captured from the complete sanitized Replay at baseline 1f8bee4.
+  const hash = createHash("sha256").update(JSON.stringify(canonical(result))).digest("hex");
+  assert.equal(hash, "2e9c738fa2425e38a2715fad925db8b560360f3a098a5bedd071bc2afc07c8ea");
+});
+
+test("mutating a Demo or Replay clone cannot contaminate later loads of either mode", async () => {
+  const fixture = await importPure("src/data/hazeScenario.mock.js");
+  const demoBefore = fixture.cloneScenario();
+  const replayBefore = replay.getReplayScenario();
+  const demoCopy = fixture.cloneScenario();
+  const replayCopy = replay.getReplayScenario();
+  demoCopy.incidents[0].modelDebate.maxScoreGap = 100;
+  demoCopy.incidents[0].modelReviews.analyst.scores.urgency = 0;
+  replayCopy.incidents[0].modelDebate.maxScoreGap = 0;
+  replayCopy.incidents[0].scores.verification = 100;
+  assert.deepEqual(fixture.cloneScenario(), demoBefore);
+  assert.deepEqual(replay.getReplayScenario(), replayBefore);
+});
+
+test("Judge smoke stays loopback-only with fake analysis and no production Gonka factory", async () => {
+  const lines = [];
+  const success = await require("../scripts/judge-demo-smoke").run({ log: line => lines.push(line) });
+  assert.equal(success, true);
+  const output = lines.join("\n");
+  for (const required of ["Five-case Fake Analyze: PASS", "Production Gonka Factory Calls: 0", "External Network Count: 0", "Inference Request Count: 0", "Execution Status: NOT_EXECUTED", "Random Port Residue: PASS"]) {
+    assert.ok(output.includes(required), required);
+  }
 });

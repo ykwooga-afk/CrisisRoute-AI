@@ -89,14 +89,16 @@ export const incidents = [
         uncertainties: ["AQI may change rapidly"]
       }
     ],
-    scores: { verification: 91, urgency: 96, actionability: 88 },
+    scores: { verification: 90, urgency: 95, actionability: 87 },
     operationalState: "DISPATCH_CANDIDATE",
     missingFields: ["student contact for asthma case"],
     modelDebate: {
       agreement: ["respiratory risk is serious", "Block C location is clear", "masks and transport are reasonable"],
       disagreement: ["exact headcount should be confirmed before final public reporting"],
       counterEvidence: ["no official evacuation notice has been issued"],
-      consensus: "DISPATCH CANDIDATE"
+      consensus: "AGREEMENT",
+      scoreGaps: { verification: 2, urgency: 2, actionability: 2 },
+      maxScoreGap: 2
     },
     modelReviews: {
       analyst: {
@@ -231,7 +233,9 @@ export const incidents = [
       agreement: ["duplicate forwards should be merged", "forwarded text does not count as independent evidence"],
       disagreement: ["reviewer assigns lower verification because the original source is missing"],
       counterEvidence: ["no second independent sender has verified trapped students"],
-      consensus: "MERGE DUPLICATE"
+      consensus: "AGREEMENT",
+      scoreGaps: { verification: 8, urgency: 6, actionability: 6 },
+      maxScoreGap: 8
     },
     modelReviews: {
       analyst: {
@@ -367,7 +371,7 @@ export const incidents = [
         uncertainties: ["exact address", "callback number", "current medical status"]
       }
     ],
-    scores: { verification: 43, urgency: 97, actionability: 24 },
+    scores: { verification: 42, urgency: 97, actionability: 23 },
     operationalState: "URGENT_VERIFICATION",
     missingFields: [
       "exact address or GPS coordinates",
@@ -379,7 +383,9 @@ export const incidents = [
       agreement: ["dispatch unsafe", "urgency high", "verification required"],
       disagreement: ["score gap: 2 points between analyst and reviewer, minor"],
       counterEvidence: ["no independent corroboration found"],
-      consensus: "URGENT VERIFICATION"
+      consensus: "AGREEMENT",
+      scoreGaps: { verification: 2, urgency: 0, actionability: 2 },
+      maxScoreGap: 2
     },
     modelReviews: {
       analyst: {
@@ -499,14 +505,16 @@ export const incidents = [
         uncertainties: ["source of cancellation claim"]
       }
     ],
-    scores: { verification: 64, urgency: 74, actionability: 58 },
+    scores: { verification: 63, urgency: 75, actionability: 54 },
     operationalState: "NEEDS_HUMAN_REVIEW",
     missingFields: ["latest official notice", "organizer confirmation"],
     modelDebate: {
       agreement: ["large outdoor group creates avoidable haze exposure risk"],
       disagreement: ["analyst treats older notice as sufficient; reviewer says official status is stale and conflicting"],
       counterEvidence: ["cancellation claim lacks official source"],
-      consensus: "NEEDS HUMAN REVIEW"
+      consensus: "DISAGREEMENT",
+      scoreGaps: { verification: 15, urgency: 5, actionability: 18 },
+      maxScoreGap: 18
     },
     modelReviews: {
       analyst: {
@@ -529,7 +537,7 @@ export const incidents = [
       { id: "G_LOCATION", label: "Exact Location", status: "passed", passed: true, detail: "Campus grounds are known." },
       { id: "G_CONTACT", label: "Verified Contact", status: "blocked", passed: false, detail: "Organizer confirmation is missing." },
       { id: "G_RESOURCE", label: "Resource Availability", status: "passed", passed: true, detail: "Indoor alternatives can be prepared." },
-      { id: "G_CONFLICT", label: "Critical Model Conflict", status: "blocked", passed: false, detail: "Analyst and reviewer materially disagree." },
+      { id: "G_CONFLICT", label: "Critical Model Conflict", status: "review", passed: false, detail: "Analyst and reviewer materially disagree." },
       { id: "G_DISPATCH", label: "Volunteer Dispatch", status: "locked", passed: false, detail: "Public action locked until human review." }
     ],
     recommendedAction: "Contact organizer, request latest notice, and prepare an indoor contingency announcement.",
@@ -609,14 +617,16 @@ export const incidents = [
         uncertainties: ["delivery timing"]
       }
     ],
-    scores: { verification: 78, urgency: 42, actionability: 81 },
+    scores: { verification: 77, urgency: 41, actionability: 82 },
     operationalState: "QUEUED_ACTION",
     missingFields: ["air purifier availability"],
     modelDebate: {
       agreement: ["resource request is actionable", "water and masks can be assigned before purifier is found"],
       disagreement: ["reviewer notes purifier need should not delay immediate supplies"],
       counterEvidence: ["no respiratory red flag reported for this case"],
-      consensus: "QUEUED ACTION"
+      consensus: "AGREEMENT",
+      scoreGaps: { verification: 3, urgency: 3, actionability: 2 },
+      maxScoreGap: 3
     },
     modelReviews: {
       analyst: {
@@ -640,7 +650,7 @@ export const incidents = [
       { id: "G_CONTACT", label: "Verified Contact", status: "passed", passed: true, detail: "Hostel committee form has a coordinator." },
       { id: "G_RESOURCE", label: "Resource Availability", status: "passed", passed: true, detail: "Masks, water and safe room are available." },
       { id: "G_CONFLICT", label: "Critical Model Conflict", status: "passed", passed: true, detail: "No material model conflict." },
-      { id: "G_DISPATCH", label: "Volunteer Dispatch", status: "passed", passed: true, detail: "Supply run can be queued after urgent cases." }
+      { id: "G_DISPATCH", label: "Volunteer Dispatch", status: "locked", passed: false, detail: "Supply run can be queued after urgent cases." }
     ],
     recommendedAction: "Queue supply run after Block C. Assign masks, water and one indoor safe room; flag air purifier as unmet need.",
     actionPlan: null,

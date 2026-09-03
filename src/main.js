@@ -20,6 +20,7 @@ import {
   beginBriefRetry,
   beginDecisionSubmission,
   createWorkflowState,
+  dispatchPresentation,
   displayRules,
   liveReadiness,
   safeReceiptExport
@@ -104,6 +105,7 @@ const gateStatusLabels = {
   triggered: "TRIGGERED",
   blocked: "BLOCKED",
   passed: "PASSED",
+  review: "REVIEW REQUIRED",
   locked: "LOCKED"
 };
 
@@ -917,7 +919,7 @@ function renderKeyInsight(incident) {
 }
 
 function renderSafetyAssessment(incident) {
-  const dispatchBlocked = isDispatchBlocked(incident);
+  const dispatch = dispatchPresentation(incident);
   return `
     <section>
       <h2 class="section-kicker">Safety Assessment</h2>
@@ -928,6 +930,7 @@ function renderSafetyAssessment(incident) {
         ${assessmentRow(incident, "G_RESOURCE")}
         ${assessmentRow(incident, "G_DISPATCH")}
       </div>
+      <p class="dispatch-status-note ${dispatch.status}">${escapeHtml(dispatch.detail)}</p>
       <p class="recommendation">${escapeHtml(incident.recommendedAction)}</p>
       <div class="decision-stack">
         <button class="primary-action" data-action="view" data-view="safety">Open Human Decision Form</button>
@@ -942,6 +945,10 @@ function renderSafetyAssessment(incident) {
 }
 
 function assessmentRow(incident, gateId) {
+  if (gateId === "G_DISPATCH") {
+    const dispatch = dispatchPresentation(incident);
+    return `<div class="assessment-row"><span>Volunteer Dispatch</span><b class="gate-status ${dispatch.status}">${escapeHtml(dispatch.label)}</b></div>`;
+  }
   const gate = getGate(incident, gateId);
   if (!gate) return "";
   const status = gate.status || (gate.passed ? "passed" : "blocked");
@@ -1276,7 +1283,7 @@ function renderDecisionPath(incident) {
   const medical = getGate(incident, "G_MEDICAL");
   const location = getGate(incident, "G_LOCATION");
   const contact = getGate(incident, "G_CONTACT");
-  const dispatch = getGate(incident, "G_DISPATCH");
+  const dispatch = dispatchPresentation(incident);
   const steps = [
     { label: "REPORT RECEIVED", status: "passed", detail: "" },
     { label: `URGENCY: ${incident.scores.urgency}`, status: medical?.status || "passed", detail: medical?.detail || "" },
@@ -1300,11 +1307,11 @@ function renderDecisionPath(incident) {
           )
           .join("")}
       </div>
-      <div class="dispatch-box ${dispatch?.status === "passed" ? "passed" : "locked"}">
-        ${dispatch?.status === "passed" ? "DISPATCH AVAILABLE" : "DISPATCH LOCKED"}<br />
-        <small>${dispatch?.status === "passed" ? "after human approval" : "required gates blocked"}</small>
+      <div class="dispatch-box ${dispatch.status}">
+        ${escapeHtml(dispatch.label)}<br />
+        <small>${escapeHtml(dispatch.requirement)}</small>
       </div>
-      <p class="path-footnote">${blockedGateCount(incident)} of ${dispatchRelevantGates(incident).length} gates blocked. ${escapeHtml(dispatch?.detail || "")}</p>
+      <p class="path-footnote">${escapeHtml(dispatch.countText)} ${escapeHtml(dispatch.detail)}</p>
     </section>
   `;
 }
@@ -1335,20 +1342,17 @@ function renderSafetyGateTable(incident) {
 }
 
 function renderDispatchLockPanel(incident) {
-  const blocked = isDispatchBlocked(incident);
+  const dispatch = dispatchPresentation(incident);
   return `
-    <section class="dispatch-lock-panel ${blocked ? "locked" : "passed"}">
-      <h2>${blocked ? "Volunteer Dispatch — Locked" : "Volunteer Dispatch — Available"}</h2>
-      <p>${escapeHtml(
-        blocked
-          ? "Exact location and verified contact are required before volunteer dispatch can be approved."
-          : "Safety gates have passed. A human coordinator can approve a bounded volunteer action."
-      )}</p>
+    <section class="dispatch-lock-panel ${dispatch.status}">
+      <h2>${escapeHtml(dispatch.panelTitle)}</h2>
+      <p>${escapeHtml(dispatch.detail)}</p>
     </section>
   `;
 }
 
 function renderHumanDecisionButtons(incident) {
+  const dispatch = dispatchPresentation(incident);
   const workflow = getDecisionWorkflow(incident);
   const form = workflow.form;
   const requirements = acknowledgementRequirements(incident, form.action);
@@ -1357,6 +1361,7 @@ function renderHumanDecisionButtons(incident) {
   const liveReady = state.mode !== DATA_MODES.live || liveReadiness(state.health).ready;
   return `
     <form class="decision-form" aria-busy="${busy}">
+      <p class="dispatch-status-note ${dispatch.status}" aria-label="Dispatch status"><strong>${escapeHtml(dispatch.label)}</strong><br />${escapeHtml(dispatch.detail)}</p>
       <div class="decision-context">
         <span>Case ID <strong>${escapeHtml(incident.caseId)}</strong></span>
         <span>State <strong>${escapeHtml(incident.operationalState)}</strong></span>
@@ -1674,6 +1679,7 @@ function renderAuditTimeline(incident) {
 }
 
 function auditEvents(incident) {
+  const dispatch = dispatchPresentation(incident);
   const reportTime = incident.receivedAt;
   const evidenceTime = incident.evidence[0]?.retrievedAt || addMinutes(reportTime, 1);
   const analystTime = addMinutes(reportTime, 3);
@@ -1688,9 +1694,9 @@ function auditEvents(incident) {
     { label: "Analyst", time: analystTime, detail: incident.gonka.analyst.responseId },
     { label: "Reviewer", time: reviewerTime, detail: incident.gonka.reviewer.responseId },
     { label: "Consensus", time: consensusTime, detail: scoreText(incident) },
-    { label: "Safety", time: safetyTime, detail: isDispatchBlocked(incident) ? "Gates blocked" : "Gates pass" },
+    { label: "Safety", time: safetyTime, detail: dispatch.auditSafety },
     { label: "Human", time: humanTime, detail: incident.humanDecision?.decidedBy || "Pending" },
-    { label: "Action", time: humanTime, detail: incident.humanDecision?.decision === "APPROVED" ? "Approved" : "Locked" }
+    { label: "Action", time: humanTime, detail: dispatch.auditAction }
   ];
 }
 
@@ -1749,19 +1755,6 @@ function getGate(incident, id) {
 
 function gatePassed(incident, id) {
   return getGate(incident, id)?.passed === true;
-}
-
-function isDispatchBlocked(incident) {
-  const dispatchGate = getGate(incident, "G_DISPATCH");
-  return dispatchGate?.status === "locked" || incident.safetyGates.some(gate => gate.status === "blocked");
-}
-
-function dispatchRelevantGates(incident) {
-  return incident.safetyGates.filter(gate => gate.id !== "G_DISPATCH");
-}
-
-function blockedGateCount(incident) {
-  return dispatchRelevantGates(incident).filter(gate => gate.status === "blocked").length;
 }
 
 function supportedClaimCount(incident) {

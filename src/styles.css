@@ -882,6 +882,18 @@ blockquote {
   color: #1d9257;
 }
 
+.gate-status.review,
+.dispatch-status-note.review strong {
+  color: #956009;
+}
+
+.dispatch-status-note {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
 .recommendation {
   margin: 26px 0 24px;
   border-left: 2px solid #f1af55;
@@ -1549,6 +1561,11 @@ blockquote {
   color: #168f52;
 }
 
+.dispatch-box.review {
+  border-color: #b78025;
+  color: #956009;
+}
+
 .path-footnote {
   max-width: 360px;
   color: var(--muted);
@@ -1612,6 +1629,14 @@ blockquote {
 
 .dispatch-lock-panel.passed h2 {
   color: var(--green-900);
+}
+
+.dispatch-lock-panel.review {
+  border-color: #b78025;
+}
+
+.dispatch-lock-panel.review h2 {
+  color: #956009;
 }
 
 .dispatch-lock-panel p {

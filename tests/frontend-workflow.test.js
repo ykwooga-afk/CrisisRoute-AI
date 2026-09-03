@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const vm = require("node:vm");
 
 const projectRoot = path.resolve(__dirname, "..");
 
@@ -296,4 +297,190 @@ test("UI source connects explicit human fields, all actions, proof controls and 
   ]) assert.ok(main.includes(required), `missing connected UI contract: ${required}`);
   assert.match(main, /import\s+\{[\s\S]*liveReadiness[\s\S]*\}\s+from\s+"\.\/ui\/decisionWorkflow\.js"/);
   assert.doesNotMatch(main, /acknowledgeHumanDecision:\s*true[\s\S]*acknowledgeNoAutomaticExecution:\s*true/);
+});
+
+function dispatchIncident(status = "passed", overrides = {}) {
+  const value = incident(overrides.state || "DISPATCH_CANDIDATE", overrides);
+  value.safetyGates.push({ id: "G_DISPATCH", status, passed: status === "passed" });
+  return value;
+}
+
+async function replayFixture() {
+  const asModule = source => `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`;
+  const hazeUrl = asModule(fs.readFileSync(path.join(projectRoot, "src/data/hazeScenario.mock.js"), "utf8"));
+  const source = fs.readFileSync(path.join(projectRoot, "src/data/replayResponses.js"), "utf8")
+    .replace(/import\s+\{\s*cloneScenario\s*,\s*rawReports\s*\}\s+from\s+["'][^"']+["'];/,
+      `const { cloneScenario, rawReports } = await import(${JSON.stringify(hazeUrl)});`);
+  return (await import(asModule(source))).getReplayScenario();
+}
+
+// Execute the actual renderers, without app initialization, DOM mutations or a server.
+async function renderers() {
+  const source = fs.readFileSync(path.join(projectRoot, "src/main.js"), "utf8")
+    .replace(/import\s+\{[\s\S]*?\}\s+from\s+["'][^"']+["'];\s*/g, "")
+    .replace(/\binit\(\);\s*$/, "");
+  const reliability = await importSource("src/ui/demoReliability.js");
+  return vm.runInNewContext(`${source}\n({ renderDecisionPath, renderDispatchLockPanel, renderSafetyAssessment, renderHumanDecisionButtons, renderAuditTimeline, auditEvents });`, {
+    ...workflow,
+    ...reliability,
+    DATA_MODES: { mock: "mock", replay: "replay", live: "live" },
+    document: { querySelector: () => ({}) },
+    fetch: () => { throw new Error("Rendering must not access the network."); }
+  });
+}
+
+test("dispatch passed presentation requires explicit human approval and zero blocked/review counts", () => {
+  const result = workflow.dispatchPresentation(dispatchIncident());
+  assert.equal(result.status, "passed");
+  assert.equal(result.label, "DISPATCH AVAILABLE");
+  assert.equal(result.requirement, "after explicit human approval");
+  assert.match(result.detail, /Nothing has been dispatched/);
+  assert.equal(result.blockedCount, 0);
+  assert.equal(result.reviewCount, 0);
+  assert.equal(result.prerequisiteCount, 4);
+});
+
+test("dispatch review presentation separates blocked and review prerequisites without claiming availability", () => {
+  const result = workflow.dispatchPresentation(dispatchIncident("review", { consensus: "DISAGREEMENT", conflict: "review" }));
+  assert.equal(result.status, "review");
+  assert.equal(result.label, "DISPATCH REVIEW REQUIRED");
+  assert.equal(result.panelTitle, "Volunteer Dispatch — Human Review Required");
+  assert.match(result.detail, /Model disagreement.*human review and acknowledgement/);
+  assert.match(result.detail, /Nothing has been dispatched/);
+  assert.doesNotMatch(JSON.stringify(result), /Available|required gates blocked/i);
+  assert.equal(result.blockedCount, 0);
+  assert.equal(result.reviewCount, 1);
+  assert.equal(result.countText, "0 prerequisite gates blocked; 1 prerequisite gate requires review.");
+});
+
+test("dispatch locked presentation counts failed prerequisites and never offers availability", () => {
+  const result = workflow.dispatchPresentation(dispatchIncident("locked", { location: false, contact: false }));
+  assert.equal(result.status, "locked");
+  assert.equal(result.label, "DISPATCH LOCKED");
+  assert.match(result.detail, /Required gates or dispatch eligibility have not been confirmed/);
+  assert.match(result.detail, /location, contact, resources/);
+  assert.equal(result.blockedCount, 2);
+  assert.equal(result.reviewCount, 0);
+  assert.doesNotMatch(JSON.stringify(result), /Available/i);
+});
+
+test("missing, unknown and illegal dispatch statuses remain locked even when other gates pass", () => {
+  for (const value of [null, {}, { safetyGates: null }, incident(), ...[undefined, null, "", "PASSED", "available", true, {}, "<script>"].map(status => {
+    const value = dispatchIncident();
+    value.safetyGates.find(gate => gate.id === "G_DISPATCH").status = status;
+    return value;
+  })]) {
+    const result = workflow.dispatchPresentation(value);
+    assert.equal(result.status, "locked");
+    assert.doesNotMatch(JSON.stringify(result), /Available|<script>/i);
+  }
+});
+
+test("only an agreement dispatch candidate with required gates passed can display available", () => {
+  for (const overrides of [{ location: false }, { contact: false }, { resource: false },
+    { state: "URGENT_VERIFICATION" }, { consensus: "CRITICAL_CONFLICT" }, { consensus: "UNKNOWN" }]) {
+    assert.equal(workflow.dispatchPresentation(dispatchIncident("passed", overrides)).status, "locked");
+  }
+  assert.equal(workflow.dispatchPresentation(dispatchIncident("passed", { consensus: "DISAGREEMENT" })).status, "review");
+  assert.equal(workflow.dispatchPresentation(dispatchIncident("passed", { conflict: "review" })).status, "review");
+  const missing = dispatchIncident();
+  missing.safetyGates = missing.safetyGates.filter(gate => gate.id !== "G_LOCATION");
+  assert.equal(workflow.dispatchPresentation(missing).status, "locked");
+  assert.equal(workflow.dispatchPresentation(dispatchIncident("review", { location: false })).status, "locked");
+});
+
+test("prerequisite counts exclude dispatch and use correct singular/plural grammar", () => {
+  const value = dispatchIncident("locked", { location: false, conflict: "review" });
+  value.safetyGates.push({ id: "G_EXTRA", status: "review" });
+  const result = workflow.dispatchPresentation(value);
+  assert.equal(result.blockedCount, 1);
+  assert.equal(result.reviewCount, 2);
+  assert.equal(result.countText, "1 prerequisite gate blocked; 2 prerequisite gates require review.");
+});
+
+test("Replay CASE 01 renders consistent review semantics on all five dispatch surfaces", async () => {
+  const replay = await replayFixture();
+  const original = JSON.stringify(replay);
+  const case01 = replay.incidents.find(item => item.label === "01");
+  const ui = await renderers();
+  for (const render of [ui.renderDecisionPath, ui.renderDispatchLockPanel, ui.renderSafetyAssessment]) {
+    const html = render(case01);
+    assert.match(html, /review required/i);
+    assert.match(html, /Nothing has been dispatched/);
+    assert.doesNotMatch(html, /dispatch[^<]*locked|dispatch[^<]*available|required gates blocked/i);
+  }
+  const pathHtml = ui.renderDecisionPath(case01);
+  assert.match(pathHtml, /0 prerequisite gates blocked; 1 prerequisite gate requires review/);
+  const formHtml = ui.renderHumanDecisionButtons(case01);
+  const note = formHtml.match(/<p class="dispatch-status-note[^>]*>[\s\S]*?<\/p>/)[0];
+  assert.match(note, /DISPATCH REVIEW REQUIRED/);
+  assert.doesNotMatch(note, /locked|available/i);
+  assert.match(formHtml, /data-acknowledgement="acknowledgeReview"[^>]*\/>\s*<span>[^<]*<small>Required<\/small>/);
+  assert.doesNotMatch(formHtml, /\schecked(?:\s|>)/);
+  const form = { ...workflow.createDecisionForm(case01), reason: "Offline test of explicit review acknowledgement.",
+    acknowledgeHumanDecision: true, acknowledgeNoAutomaticExecution: true };
+  assert.equal(workflow.validateDecisionForm(case01, form).valid, false);
+  assert.equal(workflow.validateDecisionForm(case01, { ...form, acknowledgeReview: true }).valid, true);
+  const events = ui.auditEvents(case01);
+  assert.equal(events.find(item => item.label === "Safety").detail, "Human review required");
+  assert.equal(events.find(item => item.label === "Action").detail, "Pending");
+  assert.match(ui.renderAuditTimeline(case01), /Human review required/);
+  assert.deepEqual(case01.scores, { verification: 53, urgency: 80, actionability: 83 });
+  assert.equal(case01.modelDebate.consensus, "DISAGREEMENT");
+  assert.equal(case01.operationalState, "DISPATCH_CANDIDATE");
+  assert.equal(JSON.stringify(replay), original, "rendering must not mutate any of the five replay incidents");
+});
+
+test("Replay CASE 03 remains locked across surfaces with blocked Location/Contact and unchanged scores", async () => {
+  const case03 = (await replayFixture()).incidents.find(item => item.label === "03");
+  const ui = await renderers();
+  const result = workflow.dispatchPresentation(case03);
+  assert.equal(result.status, "locked");
+  assert.equal(result.blockedCount, case03.safetyGates.filter(gate => gate.id !== "G_DISPATCH" && ["blocked", "locked"].includes(gate.status)).length);
+  for (const id of ["G_LOCATION", "G_CONTACT"]) assert.equal(case03.safetyGates.find(gate => gate.id === id).status, "blocked");
+  for (const render of [ui.renderDecisionPath, ui.renderDispatchLockPanel, ui.renderSafetyAssessment]) {
+    const html = render(case03);
+    assert.match(html, /dispatch[^<]*locked/i);
+    assert.doesNotMatch(html, /dispatch[^<]*available/i);
+  }
+  assert.match(ui.renderHumanDecisionButtons(case03), /DISPATCH LOCKED/);
+  assert.match(ui.auditEvents(case03).find(item => item.label === "Safety").detail, /Dispatch locked/);
+  assert.deepEqual(case03.scores, { verification: 20, urgency: 78, actionability: 15 });
+});
+
+test("passed candidate actual UI output consistently says available only after explicit approval", async () => {
+  const case01 = (await replayFixture()).incidents.find(item => item.label === "01");
+  case01.modelDebate.consensus = "AGREEMENT";
+  for (const gate of case01.safetyGates.filter(item => ["G_CONFLICT", "G_DISPATCH"].includes(item.id))) {
+    gate.status = "passed";
+    gate.passed = true;
+  }
+  const ui = await renderers();
+  for (const render of [ui.renderDecisionPath, ui.renderDispatchLockPanel, ui.renderSafetyAssessment, ui.renderHumanDecisionButtons]) {
+    const html = render(case01);
+    assert.match(html, /DISPATCH AVAILABLE|Volunteer Dispatch — Available/);
+    assert.match(html, /after explicit human approval/);
+    assert.match(html, /Nothing has been dispatched/);
+  }
+  assert.equal(ui.auditEvents(case01).find(item => item.label === "Action").detail, "Pending");
+});
+
+test("missing dispatch gate renders locked in every dispatch surface, including Command Center", async () => {
+  const case01 = (await replayFixture()).incidents.find(item => item.label === "01");
+  case01.safetyGates = case01.safetyGates.filter(gate => gate.id !== "G_DISPATCH");
+  const ui = await renderers();
+  for (const render of [ui.renderDecisionPath, ui.renderDispatchLockPanel, ui.renderSafetyAssessment, ui.renderHumanDecisionButtons]) {
+    const html = render(case01);
+    assert.match(html, /dispatch[^<]*locked/i);
+    assert.doesNotMatch(html, /dispatch[^<]*available/i);
+  }
+});
+
+test("Audit distinguishes pending from a recorded human decision without claiming execution", async () => {
+  const case01 = (await replayFixture()).incidents.find(item => item.label === "01");
+  const ui = await renderers();
+  assert.equal(ui.auditEvents(case01).find(item => item.label === "Action").detail, "Pending");
+  case01.humanDecision = { decision: "APPROVE_ACTION" };
+  assert.equal(ui.auditEvents(case01).find(item => item.label === "Action").detail, "Recorded — not executed");
+  assert.equal(ui.auditEvents(case01).find(item => item.label === "Safety").detail, "Human review required");
 });

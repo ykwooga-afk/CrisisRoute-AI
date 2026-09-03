@@ -35,6 +35,64 @@ export function conflictReviewRequired(incident) {
   return incident?.safetyGates?.some(gate => gate.id === "G_CONFLICT" && gate.status === "review") === true;
 }
 
+// Presentation only: never changes gates, consensus or the human-action policy.
+export function dispatchPresentation(incident) {
+  const gates = Array.isArray(incident?.safetyGates) ? incident.safetyGates : [];
+  const prerequisites = gates.filter(gate => gate && gate.id !== "G_DISPATCH");
+  const blockedCount = prerequisites.filter(gate => ["blocked", "locked"].includes(gate.status)).length;
+  const reviewCount = prerequisites.filter(gate => gate.status === "review").length;
+  const dispatchStatus = gates.find(gate => gate?.id === "G_DISPATCH")?.status;
+  const requiredGatesPassed = ["G_LOCATION", "G_CONTACT", "G_RESOURCE"].every(id =>
+    gates.some(gate => gate?.id === id && gate.status === "passed" && gate.passed === true)
+  );
+  const conflict = gates.find(gate => gate?.id === "G_CONFLICT");
+  const consensus = incident?.modelDebate?.consensus;
+  let status = "locked";
+  if (["passed", "review"].includes(dispatchStatus) && blockedCount === 0 &&
+      requiredGatesPassed && incident?.operationalState === "DISPATCH_CANDIDATE" &&
+      ["AGREEMENT", "DISAGREEMENT"].includes(consensus) &&
+      ["passed", "review"].includes(conflict?.status)) {
+    if (dispatchStatus === "review" || reviewCount > 0 || consensus === "DISAGREEMENT") {
+      status = "review";
+    } else if (conflict.passed === true) {
+      status = "passed";
+    }
+  }
+  const copy = {
+    passed: {
+      label: "DISPATCH AVAILABLE",
+      panelTitle: "Volunteer Dispatch — Available",
+      requirement: "after explicit human approval",
+      detail: "Safety gates have passed. Dispatch is available after explicit human approval. Nothing has been dispatched.",
+      auditSafety: "Available after explicit human approval"
+    },
+    review: {
+      label: "DISPATCH REVIEW REQUIRED",
+      panelTitle: "Volunteer Dispatch — Human Review Required",
+      requirement: "explicit human review and acknowledgement required",
+      detail: "Model disagreement requires explicit human review and acknowledgement. Nothing has been dispatched.",
+      auditSafety: "Human review required"
+    },
+    locked: {
+      label: "DISPATCH LOCKED",
+      panelTitle: "Volunteer Dispatch — Locked",
+      requirement: "required gates or dispatch eligibility not confirmed",
+      detail: "Required gates or dispatch eligibility have not been confirmed. Verify location, contact, resources and model conflict before approval. Nothing has been dispatched.",
+      auditSafety: "Dispatch locked — required gates or eligibility not confirmed"
+    }
+  }[status];
+  return {
+    status,
+    ...copy,
+    blockedCount,
+    reviewCount,
+    prerequisiteCount: prerequisites.length,
+    countText: `${blockedCount} prerequisite ${blockedCount === 1 ? "gate" : "gates"} blocked; ${reviewCount} prerequisite ${reviewCount === 1 ? "gate requires" : "gates require"} review.`,
+    auditAction: incident?.humanDecision?.decision || incident?.humanDecision?.action
+      ? "Recorded — not executed" : "Pending"
+  };
+}
+
 export function acknowledgementRequirements(incident, action) {
   return {
     acknowledgeHumanDecision: action === "APPROVE_ACTION",

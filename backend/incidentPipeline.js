@@ -1264,7 +1264,8 @@ async function analyzeCase01({ payload, client, now = new Date() }) {
     temperature: 0,
     maxTokens: 600,
     timeoutMs: ANALYST_TIMEOUT_MS,
-    returnCandidates: true
+    returnCandidates: true,
+    diagnosticRole: "analyst"
   };
   const reviewerRequest = {
     model: DEFAULT_MODELS.reviewer,
@@ -1275,7 +1276,8 @@ async function analyzeCase01({ payload, client, now = new Date() }) {
     temperature: 0,
     maxTokens: 500,
     timeoutMs: REVIEWER_TIMEOUT_MS,
-    returnCandidates: true
+    returnCandidates: true,
+    diagnosticRole: "reviewer"
   };
 
   const settledResults = await Promise.allSettled([
@@ -1334,7 +1336,8 @@ async function analyzeFullHazeScenario({ payload, client, now = new Date() }) {
     temperature: 0,
     maxTokens: ANALYST_BATCH_MAX_TOKENS,
     timeoutMs: ANALYST_TIMEOUT_MS,
-    returnCandidates: true
+    returnCandidates: true,
+    diagnosticRole: "analyst"
   };
   const reviewerRequest = {
     model: DEFAULT_MODELS.reviewer,
@@ -1345,7 +1348,8 @@ async function analyzeFullHazeScenario({ payload, client, now = new Date() }) {
     temperature: 0,
     maxTokens: REVIEWER_BATCH_MAX_TOKENS,
     timeoutMs: BATCH_REVIEWER_TIMEOUT_MS,
-    returnCandidates: true
+    returnCandidates: true,
+    diagnosticRole: "reviewer"
   };
 
   const settledResults = await Promise.allSettled([

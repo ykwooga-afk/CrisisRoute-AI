@@ -8,6 +8,8 @@ const DEFAULT_MODELS = Object.freeze({
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const MAX_ERROR_DIAGNOSTIC_BYTES = 8 * 1024;
+const MAX_ERROR_DIAGNOSTIC_CHARS = 700;
 const MAX_JSON_CANDIDATES = 8;
 const MAX_JSON_NESTING_DEPTH = 64;
 const clientSecrets = new WeakMap();
@@ -43,7 +45,8 @@ class GonkaClientError extends Error {
     responseId,
     issues,
     candidateCount,
-    candidateKinds
+    candidateKinds,
+    upstream
   } = {}) {
     super(ERROR_MESSAGES[code] || "Gonka client error.");
     this.name = "GonkaClientError";
@@ -65,6 +68,9 @@ class GonkaClientError extends Error {
       ? candidateKinds.filter(kind => SAFE_CANDIDATE_KINDS.has(kind)).slice(0, MAX_JSON_CANDIDATES)
       : [];
     if (safeKinds.length) this.candidateKinds = safeKinds;
+    if (upstream && typeof upstream === "object" && !Array.isArray(upstream)) {
+      this.upstream = sanitizeUpstreamDiagnostics(upstream);
+    }
   }
 
   toPublicError() {
@@ -291,6 +297,109 @@ function isRetryableHttpStatus(status) {
   return status === 429 || status >= 500;
 }
 
+function safeDiagnosticRole(value) {
+  return value === "analyst" || value === "reviewer" ? value : "unknown";
+}
+
+function safeDiagnosticString(value, maxLength = MAX_ERROR_DIAGNOSTIC_CHARS, sensitiveValues = []) {
+  if (typeof value !== "string") return "";
+  let text = value;
+  for (const sensitive of sensitiveValues) {
+    if (typeof sensitive === "string" && sensitive.length >= 6) {
+      text = text.split(sensitive).join("[redacted-token]");
+    }
+  }
+  return text
+    .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [redacted]")
+    .replace(/\b(?:sk|gk|pk|rk)_[A-Za-z0-9._-]{12,}\b/g, "[redacted-token]")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function sanitizeUpstreamDiagnostics(value) {
+  const upstream = {};
+  if (Number.isInteger(value.status)) upstream.status = value.status;
+  if (Number.isInteger(value.durationMs) && value.durationMs >= 0) upstream.durationMs = value.durationMs;
+  if (Number.isInteger(value.timeoutMs) && value.timeoutMs > 0) upstream.timeoutMs = value.timeoutMs;
+  const requestId = safeDiagnosticString(value.requestId, 160);
+  if (requestId) upstream.requestId = requestId;
+  const errorExcerpt = safeDiagnosticString(value.errorExcerpt);
+  if (errorExcerpt) upstream.errorExcerpt = errorExcerpt;
+  return upstream;
+}
+
+async function readBoundedErrorText(response, sensitiveValues = []) {
+  if (!response?.body || typeof response.body.getReader !== "function") {
+    try {
+      return safeDiagnosticString(await response.text?.(), MAX_ERROR_DIAGNOSTIC_CHARS, sensitiveValues);
+    } catch {
+      return "";
+    }
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytesRead = 0;
+  try {
+    while (bytesRead < MAX_ERROR_DIAGNOSTIC_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const buffer = Buffer.from(value);
+      const remaining = MAX_ERROR_DIAGNOSTIC_BYTES - bytesRead;
+      chunks.push(buffer.subarray(0, Math.max(0, remaining)));
+      bytesRead += Math.min(buffer.length, remaining);
+      if (buffer.length > remaining) break;
+    }
+  } catch {
+    return "";
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return safeDiagnosticString(Buffer.concat(chunks).toString("utf8"), MAX_ERROR_DIAGNOSTIC_CHARS, sensitiveValues);
+}
+
+function responseRequestId(headers) {
+  if (!headers || typeof headers.get !== "function") return "";
+  for (const header of [
+    "x-request-id",
+    "x-gonka-request-id",
+    "x-router-request-id",
+    "x-amzn-requestid",
+    "cf-ray"
+  ]) {
+    const value = headers.get(header);
+    if (value) return safeDiagnosticString(value, 160);
+  }
+  return "";
+}
+
+function shouldLogGonkaDiagnostics() {
+  return process.env.NODE_ENV === "production" || process.env.GONKA_DIAGNOSTICS === "true";
+}
+
+function logGonkaDiagnostic(event) {
+  if (!shouldLogGonkaDiagnostics()) return;
+  const safe = {
+    event: "gonka_upstream_diagnostic",
+    role: safeDiagnosticRole(event.role),
+    model: safeDiagnosticString(event.model, 160),
+    classification: safeDiagnosticString(event.classification, 80),
+    status: Number.isInteger(event.status) ? event.status : undefined,
+    retryable: typeof event.retryable === "boolean" ? event.retryable : undefined,
+    durationMs: Number.isInteger(event.durationMs) ? event.durationMs : undefined,
+    timeoutMs: Number.isInteger(event.timeoutMs) ? event.timeoutMs : undefined,
+    requestId: safeDiagnosticString(event.requestId, 160) || undefined,
+    errorExcerpt: safeDiagnosticString(event.errorExcerpt) || undefined
+  };
+  for (const key of Object.keys(safe)) {
+    if (safe[key] === undefined || safe[key] === "") delete safe[key];
+  }
+  console.error(JSON.stringify(safe));
+}
+
 class GonkaClient {
   constructor({
     apiKey,
@@ -329,7 +438,8 @@ class GonkaClient {
     temperature = 0,
     maxTokens,
     timeoutMs = this.defaultTimeoutMs,
-    returnCandidates = false
+    returnCandidates = false,
+    diagnosticRole
   } = {}) {
     if (
       typeof model !== "string" ||
@@ -355,6 +465,7 @@ class GonkaClient {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const startedAt = performance.now();
+    const role = safeDiagnosticRole(diagnosticRole);
     let response;
     let rawResponse;
     let payload;
@@ -382,10 +493,31 @@ class GonkaClient {
       }
 
       if (!response.ok) {
-        if (response.body) await response.body.cancel().catch(() => {});
+        const durationMs = Math.round(performance.now() - startedAt);
+        const requestId = responseRequestId(response.headers);
+        const errorExcerpt = await readBoundedErrorText(response, [secret.apiKey]);
+        const retryable = isRetryableHttpStatus(response.status);
+        logGonkaDiagnostic({
+          role,
+          model,
+          classification: "HTTP_ERROR",
+          status: response.status,
+          retryable,
+          durationMs,
+          timeoutMs,
+          requestId,
+          errorExcerpt
+        });
         throw new GonkaClientError("HTTP_ERROR", {
           status: response.status,
-          retryable: isRetryableHttpStatus(response.status)
+          retryable,
+          upstream: {
+            status: response.status,
+            durationMs,
+            timeoutMs,
+            requestId,
+            errorExcerpt
+          }
         });
       }
 
@@ -447,9 +579,25 @@ class GonkaClient {
         : { data, trace };
     } catch (error) {
       if (controller.signal.aborted) {
+        logGonkaDiagnostic({
+          role,
+          model,
+          classification: "TIMEOUT",
+          retryable: true,
+          durationMs: Math.round(performance.now() - startedAt),
+          timeoutMs
+        });
         throw new GonkaClientError("TIMEOUT", { retryable: true });
       }
       if (error instanceof GonkaClientError) throw error;
+      logGonkaDiagnostic({
+        role,
+        model,
+        classification: response ? "INVALID_RESPONSE" : "NETWORK_ERROR",
+        retryable: response ? false : true,
+        durationMs: Math.round(performance.now() - startedAt),
+        timeoutMs
+      });
       throw new GonkaClientError(
         response ? "INVALID_RESPONSE" : "NETWORK_ERROR",
         { retryable: response ? false : true }

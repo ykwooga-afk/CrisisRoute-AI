@@ -22,6 +22,6 @@ services:
       - key: GONKA_ANALYST_MODEL
         value: deepseek-ai/DeepSeek-V4-Flash-0731
       - key: GONKA_REVIEWER_MODEL
-        value: moonshotai/Kimi-K2.6
+        value: MiniMaxAI/MiniMax-M2.7
       - key: GONKA_API_KEY
         sync: false

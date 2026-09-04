@@ -5,7 +5,7 @@
 - Base URL: `https://api.gonkarouter.io/v1`
 - Request path: `POST /chat/completions`
 - Analyst: `deepseek-ai/DeepSeek-V4-Flash-0731`
-- Reviewer: `moonshotai/Kimi-K2.6`
+- Reviewer: `MiniMaxAI/MiniMax-M2.7`
 
 `GONKA_API_KEY` is read server-side. It is never included in browser responses, tracked files, debug headers, or public errors.
 

@@ -21,7 +21,7 @@ This hackathon demo does not replace 999, hospitals, police, fire and rescue ser
 
 ## Why Gonka Is Essential
 
-Live mode uses GonkaRouter as the server-side inference gateway. A complete five-case Analyze makes exactly two model calls: one to `deepseek-ai/DeepSeek-V4-Flash-0731` and one to `moonshotai/Kimi-K2.6`. The Reviewer receives the same original reports but never the Analyst output, reducing anchoring and allowing meaningful disagreement.
+Live mode uses GonkaRouter as the server-side inference gateway. A complete five-case Analyze makes exactly two model calls: one to `deepseek-ai/DeepSeek-V4-Flash-0731` and one to `MiniMaxAI/MiniMax-M2.7`. The Reviewer receives the same original reports but never the Analyst output, reducing anchoring and allowing meaningful disagreement.
 
 Gonka Response IDs are retained as observability references. They are not blockchain records, evidence that a report is true, or proof that an action occurred.
 
@@ -109,7 +109,7 @@ Open `http://localhost:4173`. Never commit `.env.local` or put the key in browse
 GONKA_API_KEY=<server-side secret>
 GONKA_BASE_URL=https://api.gonkarouter.io/v1
 GONKA_ANALYST_MODEL=deepseek-ai/DeepSeek-V4-Flash-0731
-GONKA_REVIEWER_MODEL=moonshotai/Kimi-K2.6
+GONKA_REVIEWER_MODEL=MiniMaxAI/MiniMax-M2.7
 ```
 
 Development keeps the existing key-based local workflow. Production additionally requires `GONKA_LIVE_ENABLED=true` and uses `GONKA_MAX_ANALYSES_PER_PROCESS` for the single-process demo budget.

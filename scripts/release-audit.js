@@ -136,7 +136,7 @@ for (const fragment of [
   "value: production",
   "value: https://api.gonkarouter.io/v1",
   "value: deepseek-ai/DeepSeek-V4-Flash-0731",
-  "value: moonshotai/Kimi-K2.6"
+  "value: MiniMaxAI/MiniMax-M2.7"
 ]) check(render.includes(fragment), `render:missing:${fragment}`);
 check(/key:\s*GONKA_API_KEY\s*\r?\n\s*sync:\s*false/.test(render), "render:key-not-manual-secret");
 check(!/GONKA_API_KEY\s*\r?\n\s*value:/i.test(render), "render:key-value-present");

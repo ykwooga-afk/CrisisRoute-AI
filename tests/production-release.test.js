@@ -20,7 +20,7 @@ const productionEnv = Object.freeze({
   GONKA_API_KEY: "unit-test-production-key",
   GONKA_BASE_URL: "https://api.gonkarouter.io/v1",
   GONKA_ANALYST_MODEL: "deepseek-ai/DeepSeek-V4-Flash-0731",
-  GONKA_REVIEWER_MODEL: "moonshotai/Kimi-K2.6",
+  GONKA_REVIEWER_MODEL: "MiniMaxAI/MiniMax-M2.7",
   GONKA_MAX_ANALYSES_PER_PROCESS: "12"
 });
 

@@ -100,7 +100,7 @@ function complete(client, options = {}) {
 test("exports the required safe defaults", () => {
   assert.equal(DEFAULT_GONKA_BASE_URL, "https://api.gonkarouter.io/v1");
   assert.equal(DEFAULT_MODELS.analyst, "deepseek-ai/DeepSeek-V4-Flash-0731");
-  assert.equal(DEFAULT_MODELS.reviewer, "moonshotai/Kimi-K2.6");
+  assert.equal(DEFAULT_MODELS.reviewer, "MiniMaxAI/MiniMax-M2.7");
 });
 
 test("createGonkaClientFromEnv rejects a missing API key", () => {

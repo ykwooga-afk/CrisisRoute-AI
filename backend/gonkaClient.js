@@ -3,7 +3,7 @@ const { performance } = require("node:perf_hooks");
 const DEFAULT_GONKA_BASE_URL = "https://api.gonkarouter.io/v1";
 const DEFAULT_MODELS = Object.freeze({
   analyst: "deepseek-ai/DeepSeek-V4-Flash-0731",
-  reviewer: "moonshotai/Kimi-K2.6"
+  reviewer: "MiniMaxAI/MiniMax-M2.7"
 });
 
 const DEFAULT_TIMEOUT_MS = 20_000;

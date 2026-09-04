@@ -96,6 +96,11 @@ export function createCrisisRouteClient({
       body: { messages },
       signal
     }),
+    analyzePublicUrl: (url, { signal } = {}) => requestJson("/api/public-source/analyze", {
+      method: "POST",
+      body: { url },
+      signal
+    }),
     recordHumanDecision: ({ caseId, submission, idempotencyKey }) => requestJson(
       `/api/incidents/${encodeURIComponent(caseId)}/decision`,
       {
@@ -137,6 +142,26 @@ export async function analyzeIncidents(messages, mode = DATA_MODES.mock, { signa
     incidents: messages.length
       ? messages.map((message, index) => makeDraftIncident(message, index, mode))
       : scenario.incidents
+  };
+}
+
+export async function analyzePublicUrl(url, mode = DATA_MODES.mock, { signal } = {}) {
+  if (mode === DATA_MODES.live) return browserClient.analyzePublicUrl(url, { signal });
+  if (mode === DATA_MODES.replay) return getReplayScenario();
+  const scenario = cloneScenario();
+  return {
+    ...scenario,
+    rawReports: [url],
+    meta: {
+      ...(scenario.meta || {}),
+      mode: DATA_MODES.mock,
+      publicSource: {
+        originalUrl: url,
+        finalUrl: url,
+        extraction: "demo_placeholder"
+      }
+    },
+    incidents: [makeDraftUrlIncident(url, mode)]
   };
 }
 
@@ -304,6 +329,23 @@ function makeDraftIncident(message, index, mode) {
     },
     humanDecision: null
   };
+}
+
+function makeDraftUrlIncident(url, mode) {
+  const incident = makeDraftIncident(`Public source URL submitted for analysis: ${url}`, 0, mode);
+  incident.caseId = "draft_url_1";
+  incident.label = "A";
+  incident.title = "Public URL report 1";
+  incident.source = "Public URL demo";
+  incident.location = "Location pending extraction";
+  incident.scores = { verification: 44, urgency: 58, actionability: 30 };
+  incident.operationalState = "QUEUED_ACTION";
+  incident.missingFields = ["live page extraction", "independent evidence", "coordinator review"];
+  incident.riskFlags = ["public URL demo placeholder"];
+  incident.recommendedAction = "Switch to Live to extract the public page through the server-side safe URL pipeline.";
+  incident.gonka.analyst.responseId = "demo-response-public-url-analyst-001";
+  incident.gonka.reviewer.responseId = "demo-response-public-url-reviewer-001";
+  return incident;
 }
 
 function inferNeeds(message) {

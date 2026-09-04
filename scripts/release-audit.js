@@ -14,11 +14,13 @@ const requiredFiles = [
   "render.yaml",
   ".nvmrc",
   "package-lock.json",
+  "backend/publicSourceExtractor.js",
   "docs/README.md",
   "docs/DEMO_RUNBOOK.md",
   "docs/GONKA_INTEGRATION.md",
   "docs/SUBMISSION_CHECKLIST.md",
   "docs/PITCH_SCRIPT_2_MIN.md",
+  "tests/public-source-extractor.test.js",
   "tests/production-release.test.js"
 ];
 const requiredReadmeSections = [
@@ -156,7 +158,7 @@ for (const file of files) {
     !/^sk-(?:TEST|SERVER|UNIT|FAKE|EXAMPLE)-/i.test(value)
   ).length;
   const ids = content.match(/(?:chatcmpl|req|resp|response)-[A-Za-z0-9_-]{16,}/gi) || [];
-  liveResponseIdMatches += ids.filter(value => !/(?:mock|test|example|placeholder)/i.test(value)).length;
+  liveResponseIdMatches += ids.filter(value => !/(?:mock|test|example|placeholder|response-public-url|demo-response-public-url)/i.test(value)).length;
 }
 check(secretMatches === 0, "scan:secret-shaped-content");
 check(liveResponseIdMatches === 0, "scan:live-response-id");
@@ -178,11 +180,27 @@ check(/Historical Planning Documents/i.test(read("docs/README.md")), "docs:histo
 const server = read("server.js");
 const productionTests = read("tests/production-release.test.js");
 const frontend = read("src/main.js");
+const client = read("src/services/crisisRouteClient.js");
+const publicExtractor = read("backend/publicSourceExtractor.js");
 check(server.includes('"/api/health/ready"'), "server:ready-route-missing");
 check(server.includes("GONKA_LIVE_ENABLED"), "server:live-gate-missing");
 check(server.includes("ANALYSIS_LIMIT_REACHED"), "server:budget-missing");
+check(server.includes('"/api/public-source/analyze"'), "server:public-url-route-missing");
+check(server.includes("publicSourceExtractor"), "server:public-url-extractor-missing");
 check(productionTests.includes("Production"), "tests:production-safety-missing");
-check(frontend.includes("Public URL content retrieval is not included in this demo."), "frontend:url-limitation-missing");
+check(frontend.includes("Paste a crisis report or public source URL"), "frontend:url-entry-copy-missing");
+check(frontend.includes("Publicly accessible HTTP/HTTPS pages only"), "frontend:url-safety-copy-missing");
+check(frontend.includes("analyzePublicUrl"), "frontend:url-flow-missing");
+check(client.includes("analyzePublicUrl"), "client:url-adapter-missing");
+check(
+  publicExtractor.includes("PUBLIC_URL_PRIVATE_ADDRESS_BLOCKED") &&
+    publicExtractor.includes("PUBLIC_URL_PRIVATE_HOST_BLOCKED"),
+  "public-url:ssrf-private-block-missing"
+);
+check(publicExtractor.includes("PUBLIC_URL_UNSUPPORTED_CONTENT_TYPE"), "public-url:content-type-guard-missing");
+check(publicExtractor.includes("PUBLIC_URL_TOO_LARGE"), "public-url:size-guard-missing");
+check(publicExtractor.includes("PUBLIC_URL_TIMEOUT"), "public-url:timeout-guard-missing");
+check(!frontend.includes("Public URL content retrieval is not included in this demo."), "frontend:obsolete-url-limitation-present");
 check(/local payload-integrity evidence only/i.test(readme), "readme:proof-limitation-missing");
 check(/ephemeral/i.test(readme), "readme:ephemeral-limitation-missing");
 check(/earlier accepted Live run/i.test(readme), "readme:replay-provenance-missing");

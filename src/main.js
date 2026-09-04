@@ -1,5 +1,6 @@
 import {
   DATA_MODES,
+  analyzePublicUrl,
   analyzeIncidents,
   generateActionBrief,
   getCaseAudit,
@@ -56,7 +57,9 @@ const state = {
   selectedCaseId: null,
   selectedEvidenceId: null,
   selectedLanguage: "en",
+  intakeMode: "text",
   intakeValue: "",
+  urlValue: "",
   loading: false,
   error: null,
   health: null,
@@ -64,7 +67,8 @@ const state = {
   decisionWorkflows: {},
   reliability: createReliabilityState(DATA_MODES.mock),
   replayMeta: null,
-  liveProgress: null
+  liveProgress: null,
+  lastLiveRequestSpec: null
 };
 
 let liveAttemptSequence = 0;
@@ -110,11 +114,7 @@ const gateStatusLabels = {
 };
 
 async function init() {
-  state.intakeValue = [
-    "Family near Shah Alam says an elderly parent has breathing difficulty due to haze. Exact location and callback number are unclear.",
-    "Block C hostel: six students are coughing badly, one has asthma. Need N95 masks and clinic transport."
-  ].join("\n");
-  await withLoading(() => loadDemoScenario());
+  render();
   await refreshHealth();
   bindEvents();
 }
@@ -165,6 +165,12 @@ function bindEvents() {
       return;
     }
 
+    if (action === "input-mode") {
+      state.intakeMode = button.dataset.inputMode === "url" ? "url" : "text";
+      render();
+      return;
+    }
+
     if (action === "mode") {
       await loadModeScenario(button.dataset.mode);
       return;
@@ -187,6 +193,11 @@ function bindEvents() {
 
     if (action === "reset-browser-view") {
       resetBrowserView();
+      return;
+    }
+
+    if (action === "request-info") {
+      showToast("Request More Info is a coordinator action placeholder in this demo.");
       return;
     }
 
@@ -238,6 +249,10 @@ function bindEvents() {
       state.intakeValue = event.target.value;
       return;
     }
+    if (event.target.matches("#verify-url")) {
+      state.urlValue = event.target.value;
+      return;
+    }
     const workflow = getDecisionWorkflow();
     if (workflow && event.target.matches("#human-reason")) {
       workflow.form.reason = event.target.value;
@@ -279,9 +294,13 @@ async function loadDemoScenario() {
 async function loadModeScenario(mode) {
   if (mode === DATA_MODES.mock) {
     state.mode = DATA_MODES.mock;
+    clearAnalysisState();
     state.reliability = createReliabilityState(DATA_MODES.mock);
     state.replayMeta = null;
-    await withLoading(() => loadDemoScenario());
+    state.liveProgress = null;
+    state.error = null;
+    showToast("Demo mode selected. Load demo cases or analyze pasted text when ready.");
+    render();
     return;
   }
   if (mode === DATA_MODES.replay) {
@@ -291,6 +310,7 @@ async function loadModeScenario(mode) {
       state.reliability = openSanitizedReplay(state.reliability);
       state.replayMeta = result.meta || null;
       applyScenarioResult(result, "03");
+      state.currentView = VIEWS.command;
       showToast("Sanitized acceptance replay opened locally. Network requests: 0.");
     });
     return;
@@ -298,58 +318,97 @@ async function loadModeScenario(mode) {
   if (mode !== DATA_MODES.live) return;
 
   await refreshHealth();
+  state.mode = DATA_MODES.live;
+  clearAnalysisState();
+  state.reliability = createReliabilityState(DATA_MODES.live);
+  state.replayMeta = null;
+  state.liveProgress = null;
   const readiness = liveReadiness(state.health);
   if (!readiness.ready) {
-    const requestId = `live-readiness-${++liveAttemptSequence}`;
-    state.reliability = beginLiveAttempt(state.reliability, { requestId, messages: [] });
-    state.reliability = failLiveAttempt(state.reliability, {
-      status: 503,
-      code: "HTTP_ERROR",
-      message: `Live readiness is incomplete: ${readiness.missing.join(", ")}.`,
-      retryable: false,
-      failedRole: "not_available"
-    }, requestId);
+    showToast(`Live mode selected, but backend is unavailable: ${readiness.missing.join(", ") || "configuration"}.`);
     render();
     return;
   }
-  await runLiveAnalyze({ kind: "fixed", messages: [] });
+  showToast("Live mode selected. Paste text or a public URL, then Analyze Report.");
+  render();
 }
 
 async function handleVerifyInput() {
-  const messages = state.intakeValue
-    .split("\n")
-    .map(line => line.trim())
-    .filter(Boolean);
-
   if (state.mode === DATA_MODES.replay) {
-    await loadModeScenario(DATA_MODES.replay);
+    showToast("Replay displays a recorded run. Switch to Demo or Live to analyze new input.");
     return;
   }
 
-  if (!messages.length && state.mode !== DATA_MODES.live) {
-    showToast("Paste crisis report text first.");
+  const requestSpec = currentIntakeRequest();
+  if (!requestSpec) return;
+
+  if (requestSpec.kind === "url" && state.mode !== DATA_MODES.live) {
+    state.error = null;
+    await withLoading(async () => {
+      const result = await analyzePublicUrl(requestSpec.url, state.mode);
+      applyScenarioResult(result, null);
+      state.currentView = VIEWS.command;
+      showToast("Synthetic demo URL intake generated locally. Switch to Live for real public-page extraction.");
+    });
     return;
   }
 
   if (state.mode === DATA_MODES.live) {
     await refreshHealth();
     if (!liveReadiness(state.health).ready) {
-      await loadModeScenario(DATA_MODES.live);
+      const readiness = liveReadiness(state.health);
+      const requestId = `live-readiness-${++liveAttemptSequence}`;
+      state.reliability = beginLiveAttempt(state.reliability, { requestId, messages: requestSpec.messages || [requestSpec.url] });
+      state.reliability = failLiveAttempt(state.reliability, {
+        status: 503,
+        code: "HTTP_ERROR",
+        message: `Live readiness is incomplete: ${readiness.missing.join(", ")}.`,
+        retryable: false,
+        failedRole: "not_available"
+      }, requestId);
+      render();
       return;
     }
-    await runLiveAnalyze({ kind: "fixed", messages: [] });
+    await runLiveAnalyze(requestSpec);
     return;
   }
 
   state.error = null;
   await withLoading(async () => {
-    const result = await analyzeIncidents(messages, state.mode);
+    const result = await analyzeIncidents(requestSpec.messages, state.mode);
     applyScenarioResult(result, null);
-    state.currentView = VIEWS.intelligence;
-    showToast(state.mode === DATA_MODES.replay
-      ? "Sanitized replay remains local; no current inference was performed."
-      : "Synthetic demo analysis generated by the local adapter.");
+    state.currentView = VIEWS.command;
+    showToast("Synthetic demo analysis generated by the local adapter.");
   });
+}
+
+function currentIntakeRequest() {
+  if (state.intakeMode === "url") {
+    const url = state.urlValue.trim();
+    if (!url) {
+      showToast("Paste a public source URL first.");
+      return null;
+    }
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      showToast("Use a valid public HTTP or HTTPS URL.");
+      return null;
+    }
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      showToast("Public URL analysis supports HTTP and HTTPS pages only.");
+      return null;
+    }
+    return { kind: "url", url: parsed.toString(), messages: [parsed.toString()] };
+  }
+
+  const text = state.intakeValue.trim();
+  if (!text) {
+    showToast("Paste crisis report text first.");
+    return null;
+  }
+  return { kind: "custom", messages: [text] };
 }
 
 function applyScenarioResult(result, preferredLabel) {
@@ -360,13 +419,27 @@ function applyScenarioResult(result, preferredLabel) {
   selectIncident(preferred || state.incidents[0]?.caseId || null);
 }
 
+function clearAnalysisState() {
+  state.incidents = [];
+  state.resources = [];
+  state.selectedCaseId = null;
+  state.selectedEvidenceId = null;
+  state.selectedLanguage = "en";
+  state.decisionWorkflows = {};
+}
+
 async function runLiveAnalyze(requestSpec) {
   if (state.reliability.phase === "live_wait") return;
   const requestId = `live-attempt-${++liveAttemptSequence}`;
   const requestedCaseSet = state.selectedCaseId || "no-selected-case";
   const messages = Array.isArray(requestSpec.messages) ? requestSpec.messages : [];
+  state.lastLiveRequestSpec = {
+    kind: requestSpec.kind,
+    messages: [...messages],
+    url: requestSpec.url || ""
+  };
   state.reliability = beginLiveAttempt(state.reliability, { requestId, messages });
-  state.liveProgress = { requestId, startedAt: Date.now(), requestedCaseSet };
+  state.liveProgress = { requestId, startedAt: Date.now(), requestedCaseSet, requestKind: requestSpec.kind };
   state.error = null;
   state.replayMeta = null;
   liveAbortController = new AbortController();
@@ -377,9 +450,11 @@ async function runLiveAnalyze(requestSpec) {
   render();
 
   try {
-    const result = requestSpec.kind === "fixed"
-      ? await loadHazeScenario(DATA_MODES.live, { signal: liveAbortController.signal })
-      : await analyzeIncidents(messages, DATA_MODES.live, { signal: liveAbortController.signal });
+    const result = requestSpec.kind === "url"
+      ? await analyzePublicUrl(requestSpec.url, DATA_MODES.live, { signal: liveAbortController.signal })
+      : requestSpec.kind === "fixed"
+        ? await loadHazeScenario(DATA_MODES.live, { signal: liveAbortController.signal })
+        : await analyzeIncidents(messages, DATA_MODES.live, { signal: liveAbortController.signal });
     const canApply = shouldApplyLiveResult({
       requestId,
       activeRequestId: state.reliability.activeRequestId,
@@ -390,8 +465,12 @@ async function runLiveAnalyze(requestSpec) {
     state.reliability = completeLiveAttempt(state.reliability, requestId);
     state.mode = DATA_MODES.live;
     applyScenarioResult(result, requestSpec.kind === "fixed" ? "03" : null);
-    state.currentView = VIEWS.intelligence;
-    showToast("Live five-case analysis returned. Human action is still required.");
+    state.currentView = VIEWS.command;
+    showToast(requestSpec.kind === "fixed"
+      ? "Live five-case analysis returned. Human action is still required."
+      : requestSpec.kind === "url"
+        ? "Live public URL analysis returned. Human action is still required."
+        : "Live text analysis returned. Human action is still required.");
   } catch (error) {
     state.reliability = failLiveAttempt(state.reliability, error, requestId);
     showToast(error?.code === "CLIENT_WAIT_CANCELLED"
@@ -413,8 +492,11 @@ async function retryLiveAnalyze() {
     showToast("Manual Retry is unavailable until LIVE capabilities are ready.");
     return;
   }
-  const messages = state.reliability.lastLiveMessages || [];
-  await runLiveAnalyze({ kind: messages.length ? "custom" : "fixed", messages });
+  const retrySpec = state.lastLiveRequestSpec || {
+    kind: (state.reliability.lastLiveMessages || []).length ? "custom" : "fixed",
+    messages: state.reliability.lastLiveMessages || []
+  };
+  await runLiveAnalyze(retrySpec);
 }
 
 async function openReplayFromRecovery() {
@@ -619,14 +701,16 @@ function render() {
     <div class="app-shell">
       ${renderTopNavigation()}
       ${state.error ? `<div class="system-alert">${escapeHtml(state.error)}</div>` : ""}
-      ${renderModeTrustPanel()}
-      ${renderReliabilityPanel()}
-      ${renderJudgeWalkthrough()}
+      ${renderOperatorPanels()}
       ${renderCurrentView(incident)}
       ${state.toast ? `<div class="toast" role="status">${escapeHtml(state.toast)}</div>` : ""}
       ${state.loading ? `<div class="loading-indicator" aria-live="polite">Processing</div>` : ""}
     </div>
   `;
+}
+
+function renderOperatorPanels() {
+  return renderReliabilityPanel();
 }
 
 function renderModeTrustPanel() {
@@ -649,11 +733,12 @@ function renderModeTrustPanel() {
 function renderReliabilityPanel() {
   if (state.liveProgress) {
     const progress = analyzeProgress(Date.now() - state.liveProgress.startedAt, { cancelSupported: true });
+    const stage = progressStageCopy(progress.stage);
     return `
       <section class="reliability-panel progress-panel" aria-live="polite" aria-busy="true">
         <div>
           <span class="section-kicker">LIVE ANALYZE · ${escapeHtml(progress.elapsedSeconds)}s elapsed</span>
-          <h2>${escapeHtml(progress.stage)}</h2>
+          <h2>${escapeHtml(stage)}</h2>
           <p>These are workflow explanations, not server-confirmed internal model progress.</p>
           <p>${escapeHtml(progress.blindReviewStatement)} No automatic Retry will occur.</p>
         </div>
@@ -726,8 +811,7 @@ function renderTopNavigation() {
               )
               .join("")}
           </div>
-          <span class="mode-pill">MODE: ${escapeHtml(modeLabel(state.mode))}</span>
-          <span class="gonka-pill ${gonkaTone()}">Gonka: ${escapeHtml(gonkaLabel())}</span>
+          <span class="provenance-pill ${gonkaTone()}">${escapeHtml(compactProvenanceLabel())}</span>
           <span class="avatar">AR</span>
         </div>
       </div>
@@ -747,13 +831,18 @@ function renderTopNavigation() {
 }
 
 function renderCurrentView(incident) {
+  if (state.currentView === VIEWS.intelligence) {
+    return renderCaseIntelligence(getStrictSelectedIncident());
+  }
+
   if (!incident) {
+    if (state.currentView === VIEWS.command) return renderCommandEmpty();
     return `
       <main class="page-canvas">
         <section class="empty-page">
-          <h1>CrisisRoute AI</h1>
-          <p>No incident loaded yet.</p>
-          <button class="primary-action" data-action="load-demo">Load Malaysia Haze Demo</button>
+          <h1>No case selected.</h1>
+          <p>Load a demo scenario or complete an analysis before opening this workflow screen.</p>
+          <button class="primary-action" data-action="view" data-view="command">Back to Command Center</button>
         </section>
       </main>
     `;
@@ -766,28 +855,419 @@ function renderCurrentView(incident) {
   return renderCommandCenter(incident);
 }
 
-function renderCommandCenter(incident) {
+function renderCommandEmpty() {
   return `
-    <main class="page-canvas command-center">
-      ${renderStatusLine()}
-      ${renderWorkflowRail("Safety Gate")}
-      <section class="command-grid">
-        <aside class="incident-queue" aria-label="Incident Queue">
-          <h2 class="section-kicker">Incident Queue</h2>
-          ${state.incidents.map(renderQueueItem).join("")}
-        </aside>
-        <section class="command-main-panel">
-          ${renderSelectedCaseSummary(incident)}
-          ${renderThreeAxisScores(incident, "command")}
-          ${renderKeyInsight(incident)}
-        </section>
-        <aside class="safety-assessment">
-          ${renderSafetyAssessment(incident)}
+    <main class="page-canvas command-empty-page command-initial">
+      ${renderVerifyInput({ compact: false })}
+      ${renderIntakeWorkflowRail()}
+      <section class="command-initial-grid">
+        <article class="command-start-panel">
+          <div class="empty-illustration" aria-hidden="true">
+            <span></span>
+          </div>
+          <h1>Paste a crisis report or load demo cases to begin analysis.</h1>
+          <div class="starter-card-grid">
+            ${starterCard("Extract claims", "Identify key claims and entities from the report.", "document")}
+            ${starterCard("Check evidence", "Assess supporting and conflicting evidence.", "search")}
+            ${starterCard("Recommend safe next actions", "Prioritize actions while respecting safety constraints.", "shield")}
+          </div>
+        </article>
+        <aside class="next-panel">
+          <h2>What happens next</h2>
+          <ol>
+            <li><span>1</span><p>We extract claims and gather relevant evidence.</p></li>
+            <li><span>2</span><p>Independent AI models evaluate the case.</p></li>
+            <li><span>3</span><p>You review the findings and make the final decision.</p></li>
+          </ol>
         </aside>
       </section>
-      ${renderVerifyInput()}
     </main>
   `;
+}
+
+function renderCommandCenter(incident) {
+  return `
+    <main class="page-canvas command-center command-result">
+      ${renderVerifyInput({ compact: true })}
+      ${renderIntakeWorkflowRail()}
+      ${renderSummaryCards()}
+      <section class="command-grid">
+        <aside class="incident-queue" aria-label="Incident Queue">
+          <div class="panel-title-line">
+            <h2>Incident Queue</h2>
+          </div>
+          ${state.incidents.map(renderQueueItem).join("")}
+          <button type="button" class="secondary-action queue-footer-action">View all incidents →</button>
+        </aside>
+        <section class="command-main-panel result-case-panel">
+          ${renderResultCasePanel(incident)}
+        </section>
+        <aside class="decision-readiness result-side-panel">
+          ${renderCommandReadinessPanel(incident)}
+        </aside>
+      </section>
+    </main>
+  `;
+}
+
+function starterCard(title, copy, type) {
+  return `
+    <article class="starter-card ${type}">
+      <span aria-hidden="true">${starterIcon(type)}</span>
+      <div>
+        <h2>${escapeHtml(title)}</h2>
+        <p>${escapeHtml(copy)}</p>
+      </div>
+    </article>
+  `;
+}
+
+function starterIcon(type) {
+  const icons = {
+    document: "□",
+    search: "⌕",
+    shield: "✓"
+  };
+  return icons[type] || "•";
+}
+
+function renderIntakeWorkflowRail() {
+  const items = [
+    ["Incoming", "Receive report"],
+    ["Evidence", "Gather & verify"],
+    ["AI Review", "Independent analysis"],
+    ["Safety", "Check impact"],
+    ["Human Decision", "Review & decide"],
+    ["Action Brief", "Communicate & act"]
+  ];
+  return `
+    <section class="intake-workflow" aria-label="CrisisRoute workflow">
+      ${items.map(([title, subtitle], index) => `
+        <article class="${index === 0 ? "active" : ""}">
+          <span>${index + 1}</span>
+          <div>
+            <strong>${escapeHtml(title)}</strong>
+            <p>${escapeHtml(subtitle)}</p>
+          </div>
+        </article>
+        ${index < items.length - 1 ? `<b aria-hidden="true">›</b>` : ""}
+      `).join("")}
+    </section>
+  `;
+}
+
+function renderSummaryCards() {
+  const items = [
+    ["Active Incidents", state.incidents.length, "green"],
+    ["Needs Human Review", countByState("NEEDS_HUMAN_REVIEW"), "violet"],
+    ["Urgent Verification", countByState("URGENT_VERIFICATION"), "amber"],
+    ["Dispatch Candidate", countByState("DISPATCH_CANDIDATE"), "green"],
+    ["N95 Masks Available", state.resources.find(resource => resource.id === "res_masks")?.available || 0, "blue"]
+  ];
+  return `
+    <section class="summary-card-grid" aria-label="Incident summary">
+      ${items.map(([label, value, tone]) => `
+        <article class="summary-card ${tone}">
+          <span aria-hidden="true"></span>
+          <div>
+            <p>${escapeHtml(label)}</p>
+            <strong>${escapeHtml(String(value))}</strong>
+          </div>
+        </article>
+      `).join("")}
+    </section>
+  `;
+}
+
+function renderResultCasePanel(incident) {
+  return `
+    <article class="selected-case-summary result-selected-case">
+      <div class="panel-title-line">
+        <h2>Selected Case</h2>
+        <span>CASE ${escapeHtml(incident.label)}</span>
+      </div>
+      <h1>${escapeHtml(incident.title)}</h1>
+      <div class="result-meta-line">
+        <span>${escapeHtml(incident.location || "Location unknown")}</span>
+        <span>${escapeHtml(formatDateTime(incident.receivedAt).replace(" 2026", ""))}</span>
+        ${incident.aqi ? `<span class="aqi">AQI ${escapeHtml(String(incident.aqi))}</span>` : ""}
+        <span>${escapeHtml(incident.source)}</span>
+        <span>Received ${escapeHtml(formatTime(incident.receivedAt))}</span>
+      </div>
+      <blockquote>${escapeHtml(incident.rawMessage)}</blockquote>
+      <div class="knowledge-grid result-knowledge-grid">
+        <div>
+          <h2>What We Know</h2>
+          <ul class="known-list">
+            ${listItems((incident.knownFacts || []).slice(0, 3))}
+          </ul>
+        </div>
+        <div>
+          <h2 class="red-title">What We Don’t Know</h2>
+          <ul class="unknown-list">
+            ${listItems((incident.unknownFacts || incident.missingFields || []).slice(0, 3))}
+          </ul>
+        </div>
+      </div>
+      <div class="compact-insight">
+        <strong>Low verification does not mean low urgency.</strong>
+        <p>Evidence gaps reduce actionability, but they do not erase possible harm.</p>
+      </div>
+      <section class="command-metrics">
+        <h2>Verification · Urgency · Actionability</h2>
+        <div class="metric-card-grid command-score-grid">
+          ${renderMetricCard("Verification", incident.scores.verification, metricCaption(incident, "verification"), "verification")}
+          ${renderMetricCard("Urgency", incident.scores.urgency, metricCaption(incident, "urgency"), "urgency")}
+          ${renderMetricCard("Actionability", incident.scores.actionability, metricCaption(incident, "actionability"), "actionability")}
+        </div>
+      </section>
+    </article>
+  `;
+}
+
+function renderCommandReadinessPanel(incident) {
+  const readiness = decisionReadinessSummary(incident);
+
+  return `
+    <section>
+      <div class="panel-title-line">
+        <h2 class="readiness-title">
+          <span class="readiness-title-icon" aria-hidden="true">${readinessIcon("ready")}</span>
+          Decision Readiness
+        </h2>
+      </div>
+      <p class="readiness-note">High-level summary. See Case Intelligence, Evidence and Safety for full details.</p>
+      <div class="readiness-list">
+        <article class="readiness-row">
+          <span class="readiness-icon ${escapeHtml(readiness.statusTone)}" aria-hidden="true">
+            ${readinessIcon("status")}
+          </span>
+          <div>
+            <div class="readiness-row-heading">
+              <h3>Current Status</h3>
+              <b class="${stateClass(incident.operationalState)}">${escapeHtml(readiness.status)}</b>
+            </div>
+            <p>${escapeHtml(readiness.statusCopy)}</p>
+          </div>
+        </article>
+        <article class="readiness-row">
+          <span class="readiness-icon progress" aria-hidden="true">
+            ${readinessIcon("progress")}
+          </span>
+          <div>
+            <div class="readiness-row-heading">
+              <h3>Review Progress</h3>
+              <strong>${escapeHtml(readiness.progressText)}</strong>
+            </div>
+            <div class="readiness-track" aria-hidden="true">
+              <i style="width:${readiness.progressPercent}%"></i>
+            </div>
+          </div>
+        </article>
+        <article class="readiness-row">
+          <span class="readiness-icon concern" aria-hidden="true">
+            ${readinessIcon("concern")}
+          </span>
+          <div>
+            <h3>Key Concern</h3>
+            <strong>${escapeHtml(readiness.concernTitle)}</strong>
+            <p>${escapeHtml(readiness.concernDetail)}</p>
+          </div>
+        </article>
+        <article class="readiness-row">
+          <span class="readiness-icon gap" aria-hidden="true">
+            ${readinessIcon("gap")}
+          </span>
+          <div>
+            <h3>Main Information Gap</h3>
+            <strong>${escapeHtml(readiness.gapTitle)}</strong>
+            <p>${escapeHtml(readiness.gapDetail)}</p>
+          </div>
+        </article>
+        <article class="readiness-row">
+          <span class="readiness-icon next" aria-hidden="true">
+            ${readinessIcon("next")}
+          </span>
+          <div>
+            <h3>Recommended Next Step</h3>
+            <strong>${escapeHtml(readiness.nextTitle)}</strong>
+            <p>${escapeHtml(readiness.nextDetail)}</p>
+          </div>
+        </article>
+      </div>
+      <div class="decision-stack">
+        <button class="primary-action" data-action="view" data-view="intelligence">Review Case Intelligence →</button>
+        <button class="secondary-action" data-action="request-info">Request More Info</button>
+      </div>
+    </section>
+  `;
+}
+
+function readinessIcon(type) {
+  const icons = {
+    status: '<svg viewBox="0 0 24 24" role="img" focusable="false"><path d="M12 3.8 21 19H3L12 3.8Z" /><path d="M12 9v4.6" /><path d="M12 17h.01" /></svg>',
+    progress: '<svg viewBox="0 0 24 24" role="img" focusable="false"><path d="M12 3v9h9" /><path d="M19.2 15.9A8 8 0 1 1 8.1 4.8" /></svg>',
+    concern: '<svg viewBox="0 0 24 24" role="img" focusable="false"><path d="M6 4v16" /><path d="M6 5h11l-1.7 3L17 11H6" /></svg>',
+    gap: '<svg viewBox="0 0 24 24" role="img" focusable="false"><path d="M12 21s6-5.2 6-11a6 6 0 0 0-12 0c0 5.8 6 11 6 11Z" /><circle cx="12" cy="10" r="2.1" /></svg>',
+    next: '<svg viewBox="0 0 24 24" role="img" focusable="false"><path d="M4 12h15" /><path d="m13 6 6 6-6 6" /></svg>',
+    ready: '<svg viewBox="0 0 24 24" role="img" focusable="false"><path d="M12 3.5 19 6.6v5.2c0 4.4-2.9 7.2-7 8.7-4.1-1.5-7-4.3-7-8.7V6.6l7-3.1Z" /><path d="m8.8 12.2 2.2 2.2 4.5-5" /></svg>'
+  };
+  return icons[type] || icons.next;
+}
+
+function decisionReadinessSummary(incident) {
+  const gates = Array.isArray(incident.safetyGates) ? incident.safetyGates : [];
+  const dispatch = dispatchPresentation(incident);
+  const status = statusLabels[incident.operationalState] || normalizeLabel(incident.operationalState);
+  const evidenceReady = Array.isArray(incident.evidence) && incident.evidence.length > 0;
+  const modelReady = Boolean(incident.modelReviews?.analyst && incident.modelReviews?.reviewer);
+  const safetyReady = dispatch.status !== "locked";
+  const humanDecisionReady = Boolean(incident.humanDecision?.decision || incident.humanDecision?.action);
+  const readyCount = [evidenceReady, modelReady, safetyReady, humanDecisionReady].filter(Boolean).length;
+  const totalChecks = 4;
+  const conflictGate = getGate(incident, "G_CONFLICT");
+  const medicalGate = getGate(incident, "G_MEDICAL");
+  const blockedRequiredGates = gates.filter(gate =>
+    ["G_LOCATION", "G_CONTACT", "G_RESOURCE"].includes(gate.id) &&
+    ["blocked", "locked", "review"].includes(gate.status)
+  );
+  const missingFields = Array.isArray(incident.missingFields) ? incident.missingFields : [];
+  const hasModelDisagreement = conflictGate?.status === "review" || incident.modelDebate?.consensus === "DISAGREEMENT";
+
+  return {
+    status,
+    statusTone: readinessTone(incident),
+    statusCopy: readinessStatusCopy(incident),
+    progressText: `${readyCount} / ${totalChecks} checks ready`,
+    progressPercent: Math.round((readyCount / totalChecks) * 100),
+    ...readinessConcern(incident, { hasModelDisagreement, medicalGate, blockedRequiredGates }),
+    ...readinessGap(incident, { blockedRequiredGates, missingFields, dispatch }),
+    ...readinessNextStep(incident, { hasModelDisagreement, blockedRequiredGates, dispatch })
+  };
+}
+
+function readinessTone(incident) {
+  if (incident.operationalState === "DISPATCH_CANDIDATE") return "ready";
+  if (incident.operationalState === "URGENT_VERIFICATION") return "urgent";
+  if (incident.operationalState === "NEEDS_HUMAN_REVIEW") return "review";
+  return "neutral";
+}
+
+function readinessStatusCopy(incident) {
+  if (incident.operationalState === "DISPATCH_CANDIDATE") {
+    return "This case is a strong candidate for further review and potential action.";
+  }
+  if (incident.operationalState === "URGENT_VERIFICATION") {
+    return "High urgency requires immediate verification before any dispatch.";
+  }
+  if (incident.operationalState === "NEEDS_HUMAN_REVIEW") {
+    return "Conflicting or sensitive evidence requires human review before action.";
+  }
+  if (incident.operationalState === "MERGE_OR_VERIFY") {
+    return "Possible duplicate forwarding needs source review before action.";
+  }
+  if (incident.operationalState === "QUEUED_ACTION") {
+    return "Useful support can be queued after higher-risk cases are reviewed.";
+  }
+  return "This case needs coordinator review before any operational action.";
+}
+
+function readinessConcern(incident, context) {
+  const { hasModelDisagreement, medicalGate, blockedRequiredGates } = context;
+  if (hasModelDisagreement) {
+    return {
+      concernTitle: "Model disagreement requires review",
+      concernDetail: incident.modelDebate?.disagreement?.[0] ||
+        getGate(incident, "G_CONFLICT")?.detail ||
+        "Independent reviewers do not fully agree."
+    };
+  }
+  if (medicalGate?.status === "triggered") {
+    return {
+      concernTitle: "Medical red flag requires review",
+      concernDetail: medicalGate.detail || "Health risk is present and needs careful coordinator review."
+    };
+  }
+  if (blockedRequiredGates.length) {
+    const gate = blockedRequiredGates[0];
+    return {
+      concernTitle: `${gate.label} needs review`,
+      concernDetail: gate.detail || "A required detail is incomplete."
+    };
+  }
+  return {
+    concernTitle: "No critical concern detected",
+    concernDetail: "No major blocker is visible in the current summary."
+  };
+}
+
+function readinessGap(incident, context) {
+  const { blockedRequiredGates, missingFields, dispatch } = context;
+  const locationBlocked = blockedRequiredGates.some(gate => gate.id === "G_LOCATION");
+  const contactBlocked = blockedRequiredGates.some(gate => gate.id === "G_CONTACT");
+
+  if (locationBlocked && contactBlocked) {
+    return {
+      gapTitle: "Exact location and verified contact missing",
+      gapDetail: "Both are required before a dispatch decision can be considered."
+    };
+  }
+  if (locationBlocked) {
+    return {
+      gapTitle: "Exact location missing",
+      gapDetail: getGate(incident, "G_LOCATION")?.detail || "Exact address or GPS coordinates are still needed."
+    };
+  }
+  if (contactBlocked) {
+    return {
+      gapTitle: "Verified contact missing",
+      gapDetail: getGate(incident, "G_CONTACT")?.detail || "A trusted callback or coordinator contact is still needed."
+    };
+  }
+  if (dispatch.status !== "locked" && incident.operationalState === "DISPATCH_CANDIDATE") {
+    return {
+      gapTitle: "None blocking",
+      gapDetail: "All key readiness checks appear available for deeper review."
+    };
+  }
+  if (missingFields.length) {
+    return {
+      gapTitle: sentenceCase(missingFields[0]),
+      gapDetail: missingFields.length > 1
+        ? `Also check: ${missingFields.slice(1, 3).join(", ")}.`
+        : "This detail should be checked during review."
+    };
+  }
+  return {
+    gapTitle: "None",
+    gapDetail: "No major information gap is recorded in the current case data."
+  };
+}
+
+function readinessNextStep(incident, context) {
+  const { hasModelDisagreement, blockedRequiredGates, dispatch } = context;
+  if (hasModelDisagreement) {
+    return {
+      nextTitle: "Review case intelligence and evidence before safety approval.",
+      nextDetail: "Inspect the model disagreement and supporting evidence first."
+    };
+  }
+  if (blockedRequiredGates.length) {
+    return {
+      nextTitle: "Review case intelligence and obtain missing information.",
+      nextDetail: incident.recommendedAction || "Check the full case details before moving to Safety."
+    };
+  }
+  if (dispatch.status === "passed" || incident.operationalState === "DISPATCH_CANDIDATE") {
+    return {
+      nextTitle: "Review case intelligence and evidence before safety approval.",
+      nextDetail: "Check the full case details and supporting evidence."
+    };
+  }
+  return {
+    nextTitle: "Review case intelligence before the next operational step.",
+    nextDetail: incident.recommendedAction || "Use the next screen to understand why this case is prioritized."
+  };
 }
 
 function renderStatusLine() {
@@ -812,7 +1292,7 @@ function renderStatusLine() {
 }
 
 function renderWorkflowRail(activeLabel) {
-  const items = ["Incoming", "Evidence", "Blind AI Review", "Safety Gate", "Human Decision", "Action Brief"];
+  const items = ["Incoming", "Evidence", "Blind AI Review", "Safety Gates", "Human Decision", "Action Brief"];
   return `
     <section class="workflow-rail" aria-label="Workflow">
       ${items
@@ -960,57 +1440,146 @@ function assessmentRow(incident, gateId) {
   `;
 }
 
-function renderVerifyInput() {
-  const buttonLabel = state.mode === DATA_MODES.live
-    ? "Analyze Five Fixed Reports"
-    : state.mode === DATA_MODES.replay
-      ? "Reload Sanitized Replay"
-      : "Run Synthetic Demo Analysis";
+function renderVerifyInput({ compact = false } = {}) {
+  const textActive = state.intakeMode !== "url";
   return `
-    <section class="verify-panel">
-      <h2 class="section-kicker">Verify a Crisis Report</h2>
-      <p>Paste crisis report text. Public URL content retrieval is not included in this demo.</p>
-      <textarea id="verify-input" placeholder="Paste a Telegram message, WhatsApp report, or emergency text...">${escapeHtml(state.intakeValue)}</textarea>
-      <div class="verify-actions">
-        <button class="primary-action" data-action="verify-input">${escapeHtml(buttonLabel)}</button>
-        <button class="secondary-action" data-action="load-demo">Load Malaysia Haze Demo</button>
+    <section class="verify-hero ${compact ? "compact" : ""}">
+      <div class="verify-symbol" aria-hidden="true">
+        <span></span>
       </div>
-      <small>${escapeHtml(modeFootnote())}</small>
+      <div class="verify-content">
+        <h1>Verify a Crisis Report</h1>
+        <p>Paste a crisis report or public source URL. CrisisRoute AI extracts claims, evaluates evidence, and recommends safe next actions.</p>
+        <div class="intake-tabs" role="tablist" aria-label="Input type">
+          <button type="button" class="${textActive ? "active" : ""}" data-action="input-mode" data-input-mode="text">Paste Text</button>
+          <button type="button" class="${!textActive ? "active" : ""}" data-action="input-mode" data-input-mode="url">Public URL</button>
+        </div>
+        ${textActive ? `
+          <label class="sr-only" for="verify-input">Crisis report text</label>
+          <div class="intake-field">
+            <textarea id="verify-input" maxlength="8000" placeholder="Paste crisis report text here...">${escapeHtml(state.intakeValue)}</textarea>
+            <span>${escapeHtml(String(state.intakeValue.length))} / 8000</span>
+          </div>
+        ` : `
+          <label class="sr-only" for="verify-url">Public source URL</label>
+          <div class="intake-field url-field">
+            <input id="verify-url" type="url" placeholder="Paste a public article or report URL..." value="${escapeHtml(state.urlValue)}" />
+            <small>Publicly accessible HTTP/HTTPS pages only.</small>
+          </div>
+        `}
+      </div>
+      <div class="verify-action-column">
+        <button class="primary-action" data-action="verify-input">Analyze Report</button>
+        <button class="secondary-action" data-action="load-demo">Load Malaysia Haze Demo</button>
+        ${compact ? renderCompactInsightBox() : `<small>Try one of the demo cases for a guided walkthrough.</small>`}
+      </div>
     </section>
   `;
 }
 
-function renderCaseIntelligence(incident) {
+function renderCompactInsightBox() {
   return `
-    <main class="page-canvas intelligence-page">
-      <section class="case-intel-header">
-        <span class="section-kicker">CASE ${escapeHtml(incident.label)}</span>
-        <h1>${escapeHtml(incident.title)}</h1>
-        ${renderMetadataLine(incident)}
-      </section>
-      ${renderThreeAxisScores(incident, "intelligence")}
-      <p class="editorial-quote">"${escapeHtml(incident.insight || insightCopy(incident))}"</p>
-      <section class="text-section">
-        <h2 class="section-kicker">Why This Case Is Prioritized</h2>
-        <p>${escapeHtml(incident.priorityRationale || incident.recommendedAction)}</p>
-      </section>
-      <section class="claims-section">
-        <h2 class="section-kicker">Extracted Claims</h2>
-        <div class="claims-table">
-          ${incident.claims.map(claim => renderClaimRow(claim)).join("")}
-        </div>
-      </section>
-      <section class="intel-bottom-grid">
+    <aside class="verify-insight-box">
+      <strong>Low verification ≠ low urgency.</strong>
+      <p>Low verification means we lack information, not that the event is not serious.</p>
+      <small>AI support · Not a final decision</small>
+    </aside>
+  `;
+}
+
+function renderCaseIntelligence(incident) {
+  if (!incident) return renderNoSelectedCase();
+  const reasons = priorityReasons(incident);
+
+  return `
+    <main class="page-canvas intelligence-page case-analysis-page">
+      <button class="text-action back-link" data-action="view" data-view="command">← Back to Command Center</button>
+
+      <section class="case-analysis-header">
         <div>
-          <h2 class="section-kicker red">Missing Information</h2>
-          <ul class="missing-list">${listItems(incident.missingFields || [])}</ul>
+          <span class="section-kicker">CASE ${escapeHtml(incident.label)}</span>
+          <h1>${escapeHtml(incident.title)}</h1>
+          ${renderCompactCaseMetadata(incident)}
         </div>
-        <div>
-          <h2 class="section-kicker">Risk Flags</h2>
-          <div class="risk-tags">${(incident.riskFlags || []).map(flag => `<span>${escapeHtml(flag)}</span>`).join("")}</div>
+        <aside class="operational-state-card ${stateClass(incident.operationalState)}">
+          <span>Operational State</span>
+          <strong>${escapeHtml(statusLabels[incident.operationalState] || normalizeLabel(incident.operationalState))}</strong>
+          <p>Received ${escapeHtml(formatTime(incident.receivedAt))}</p>
+        </aside>
+      </section>
+
+      <section class="analysis-card-grid overview-grid">
+        <article class="analysis-card">
+          <h2><span>1.</span> Case Overview</h2>
+          <p>${escapeHtml(caseOverviewCopy(incident))}</p>
+        </article>
+        <article class="analysis-card">
+          <h2><span>2.</span> Priority Rationale</h2>
+          <ul class="rationale-list">
+            ${reasons.map(reason => `<li>${escapeHtml(reason)}</li>`).join("")}
+          </ul>
+        </article>
+      </section>
+
+      <section class="metrics-section">
+        <h2><span>3.</span> Key Metrics</h2>
+        <div class="metric-card-grid">
+          ${renderMetricCard("Verification", incident.scores.verification, metricCaption(incident, "verification"), "verification")}
+          ${renderMetricCard("Urgency", incident.scores.urgency, metricCaption(incident, "urgency"), "urgency")}
+          ${renderMetricCard("Actionability", incident.scores.actionability, metricCaption(incident, "actionability"), "actionability")}
         </div>
       </section>
-      <button class="primary-action wide-cta" data-action="view" data-view="evidence">→ Inspect Evidence & Model Review</button>
+
+      <section class="analysis-card-grid detail-grid">
+        <article class="analysis-card claims-analysis-card">
+          <h2><span>4.</span> Extracted Claims</h2>
+          <div class="intelligence-claims-table">
+            <div class="claims-head">
+              <span>ID</span>
+              <span>Claim</span>
+              <span>Assessment</span>
+            </div>
+            ${incident.claims.map(claim => renderIntelligenceClaimRow(claim)).join("")}
+          </div>
+        </article>
+
+        <article class="analysis-card missing-analysis-card">
+          <h2><span>5.</span> Missing Information</h2>
+          <ul class="missing-analysis-list">${(incident.missingFields || []).map(item => `<li>${escapeHtml(item)}</li>`).join("") || "<li>No missing information recorded.</li>"}</ul>
+        </article>
+
+        <article class="analysis-card risk-analysis-card">
+          <h2><span>6.</span> Risk Flags</h2>
+          <div class="risk-chip-list">
+            ${(incident.riskFlags || []).map(flag => renderRiskFlagChip(flag)).join("") || `<span class="risk-chip neutral">No risk flags recorded</span>`}
+          </div>
+        </article>
+      </section>
+
+      <div class="case-analysis-cta">
+        <button class="primary-action wide-cta" data-action="view" data-view="evidence">Inspect Evidence & Model Review →</button>
+      </div>
+
+      <section class="case-analysis-footer">
+        <div>
+          <h2 class="section-kicker">Why This Case Is Prioritized</h2>
+          <p>${escapeHtml(incident.priorityRationale || incident.recommendedAction)}</p>
+        </div>
+        ${renderCompactProvenance()}
+      </section>
+    </main>
+  `;
+}
+
+function renderNoSelectedCase() {
+  return `
+    <main class="page-canvas intelligence-page case-analysis-page">
+      <section class="case-empty-state">
+        <span class="section-kicker">Case Intelligence</span>
+        <h1>No case selected.</h1>
+        <p>Load demo cases or complete an analysis before opening Case Intelligence.</p>
+        <button class="primary-action" data-action="view" data-view="command">Back to Command Center</button>
+      </section>
     </main>
   `;
 }
@@ -1024,6 +1593,138 @@ function renderMetadataLine(incident) {
       <span>${escapeHtml(incident.location || "Location unknown")}</span>
       ${incident.aqi ? `<span class="aqi">AQI ${escapeHtml(String(incident.aqi))}</span>` : ""}
       <span>${formatPeople(incident.peopleCount)}</span>
+    </div>
+  `;
+}
+
+function renderCompactCaseMetadata(incident) {
+  const items = [
+    incident.location || "Location unknown",
+    incident.source,
+    formatTime(incident.receivedAt),
+    incident.aqi ? `AQI ${incident.aqi}` : "",
+    formatPeople(incident.peopleCount)
+  ].filter(Boolean);
+  return `<div class="case-analysis-meta">${items.map(item => `<span>${escapeHtml(item)}</span>`).join("")}</div>`;
+}
+
+function caseOverviewCopy(incident) {
+  const facts = Array.isArray(incident.knownFacts) ? incident.knownFacts.slice(0, 3) : [];
+  const needs = Array.isArray(incident.needs) ? incident.needs.slice(0, 3) : [];
+  const gaps = Array.isArray(incident.missingFields) ? incident.missingFields.slice(0, 2) : [];
+  const sentences = [];
+
+  if (facts.length) {
+    sentences.push(`The report currently indicates ${facts.join(", ")}.`);
+  } else if (incident.rawMessage) {
+    sentences.push(incident.rawMessage.slice(0, 220));
+  }
+
+  if (incident.location) {
+    sentences.push(`The approximate location is ${incident.location}.`);
+  }
+
+  if (needs.length) {
+    sentences.push(`Requested or relevant support includes ${needs.join(", ")}.`);
+  }
+
+  if (gaps.length) {
+    sentences.push(`Important details remain unclear: ${gaps.join(", ")}.`);
+  }
+
+  return sentences.join(" ");
+}
+
+function priorityReasons(incident) {
+  const reasons = [];
+  const risks = (incident.riskFlags || []).map(flag => String(flag).toLowerCase());
+  const known = (incident.knownFacts || []).map(fact => String(fact).toLowerCase());
+  const missing = incident.missingFields || [];
+
+  if (risks.some(flag => /elderly|high-risk|asthma|medical|respiratory|breath/.test(flag)) ||
+      known.some(fact => /elderly|asthma|breath|cough|respiratory/.test(fact))) {
+    reasons.push("Reported health or respiratory risk raises the harm level if the report is true.");
+  }
+  if (incident.aqi) {
+    reasons.push(`AQI ${incident.aqi} gives the case relevant haze-risk context.`);
+  }
+  if (incident.scores?.verification < 60 && incident.scores?.urgency >= 80) {
+    reasons.push("Verification is incomplete, but urgency remains high because potential harm is time-sensitive.");
+  }
+  if (missing.length) {
+    reasons.push(`Missing information keeps actionability constrained: ${missing.slice(0, 2).join(", ")}.`);
+  }
+  if (incident.modelDebate?.consensus === "DISAGREEMENT") {
+    reasons.push("Model disagreement means this case should remain visible for human review.");
+  }
+  if (!reasons.length && incident.priorityRationale) {
+    reasons.push(incident.priorityRationale);
+  }
+  if (!reasons.length && incident.recommendedAction) {
+    reasons.push(incident.recommendedAction);
+  }
+  return reasons.slice(0, 5);
+}
+
+function renderMetricCard(label, value, caption, type) {
+  return `
+    <article class="metric-card ${type}">
+      <span class="metric-label">${escapeHtml(label)}</span>
+      <div class="metric-value"><strong>${escapeHtml(String(value))}</strong><small>/100</small></div>
+      <div class="metric-track" aria-hidden="true"><i style="width:${Number(value)}%"></i></div>
+      <p class="metric-caption">${escapeHtml(caption)}</p>
+      <small class="metric-definition">${escapeHtml(metricDefinition(type))}</small>
+    </article>
+  `;
+}
+
+function metricCaption(incident, type) {
+  if (type === "verification") {
+    if (incident.scores.verification >= 75) return "Strong evidence support";
+    if (incident.scores.verification >= 45) return "Partial evidence support";
+    return "Limited evidence";
+  }
+  if (type === "urgency") return urgencyCaption(incident);
+  return actionabilityCaption(incident);
+}
+
+function metricDefinition(type) {
+  if (type === "verification") return "How well-supported is the report?";
+  if (type === "urgency") return "If true, how dangerous or time-sensitive is it?";
+  return "Do we have enough information to act safely?";
+}
+
+function renderIntelligenceClaimRow(claim) {
+  const status = claimStatusLabels[claim.status] || normalizeLabel(claim.status);
+  return `
+    <article class="intelligence-claim-row">
+      <span class="claim-id">${escapeHtml(claim.id)}</span>
+      <p class="claim-copy">${escapeHtml(claim.text)}</p>
+      <b class="claim-assessment ${claimStatusClass(claim.status)}">${escapeHtml(status)}</b>
+    </article>
+  `;
+}
+
+function renderRiskFlagChip(flag) {
+  return `<span class="risk-chip ${riskFlagTone(flag)}">${escapeHtml(flag)}</span>`;
+}
+
+function riskFlagTone(flag) {
+  const text = String(flag).toLowerCase();
+  if (/medical|breath|respiratory|asthma|critical|emergency|severe/.test(text)) return "critical";
+  if (/elderly|high-risk|haze|smoke|large|conflict|duplicate/.test(text)) return "warning";
+  return "neutral";
+}
+
+function renderCompactProvenance() {
+  const provenance = modeProvenance(state.mode);
+  const lines = provenance.lines.join(" · ");
+  return `
+    <div class="compact-provenance">
+      <h2 class="section-kicker">${escapeHtml(provenance.mode)} Trust Label</h2>
+      <strong>${escapeHtml(provenance.title)}</strong>
+      <p>${escapeHtml(lines)}</p>
+      <button type="button" class="text-link" data-action="reset-browser-view">Reset browser view</button>
     </div>
   `;
 }
@@ -1043,13 +1744,14 @@ function renderEvidenceView(incident) {
   const selectedEvidence = getSelectedEvidence(incident);
   return `
     <main class="page-canvas evidence-page">
+      <button class="text-action back-link" data-action="view" data-view="intelligence">← Back to Case Intelligence</button>
       <section class="screen-heading">
         <div>
           <span class="section-kicker">CASE ${escapeHtml(incident.label)}</span>
           <h1>Evidence & Model Review</h1>
           <p><strong>${escapeHtml(incident.title)}</strong> · Claim-evidence mapping and blind dual-model assessment</p>
         </div>
-        <button class="primary-action" data-action="view" data-view="safety">→ Safety Decision</button>
+        <button class="primary-action" data-action="view" data-view="safety">Continue to Safety →</button>
       </section>
       <section class="evidence-layout">
         <aside class="claims-sidebar">
@@ -1242,41 +1944,115 @@ function reviewSummaryBlock(label, value, isConsensus = false) {
 
 function renderSafetyView(incident) {
   return `
-    <main class="page-canvas safety-page">
-      <section class="safety-header">
-        <span class="section-kicker">CASE ${escapeHtml(incident.label)}</span>
-        <h1>${escapeHtml(incident.title)}</h1>
-        <p>${escapeHtml(incident.caseId)} · ${escapeHtml(incident.location || "Location unknown")} · ${scoreText(incident)}</p>
-      </section>
-      <section class="safety-hero-grid">
-        ${renderDecisionPath(incident)}
-        <div class="urgent-not-dispatchable">
-          <h2>URGENT</h2>
-          <strong>≠</strong>
-          <h2>DISPATCHABLE</h2>
-          <p>High urgency triggers immediate verification priority, not automatic dispatch.</p>
-        </div>
-      </section>
-      ${renderSafetyGateTable(incident)}
-      ${renderDispatchLockPanel(incident)}
-      <section class="safe-action-grid">
-        <div>
-          <h2 class="section-kicker">Next Safe Actions</h2>
-          <ol class="safe-actions">
-            ${(incident.safeNextActions || []).map(action => `<li>${escapeHtml(action)}</li>`).join("")}
-          </ol>
-        </div>
-        <div class="human-decision-panel">
-          <h2 class="section-kicker">Human Decision</h2>
+    <main class="page-canvas safety-page safety-redesign">
+      <button class="text-action back-link" data-action="view" data-view="evidence">← Back to Evidence</button>
+      <section class="safety-workspace">
+        <section class="safety-main-column">
+          <section class="safety-top-grid">
+            ${renderSafetyCaseHeader(incident)}
+            <aside class="safety-principle-card">
+              <p>"High urgency requires verification before any dispatch."</p>
+              <strong>AI assists. Humans decide.</strong>
+            </aside>
+          </section>
+          ${renderSafetySummary(incident)}
+          <section class="safety-assessment-grid">
+            ${renderDecisionPath(incident)}
+            ${renderDispatchLessonCard(incident)}
+          </section>
+          ${renderSafetyGateTable(incident)}
+          ${renderNextSafeActions(incident)}
+        </section>
+        <aside class="human-decision-panel safety-decision-sidebar">
+          <div class="human-panel-heading">
+            <span class="human-panel-icon" aria-hidden="true">${safetyIcon("human")}</span>
+            <div>
+              <h2>Human Decision</h2>
+              <p>Review the safety assessment and select the next action. Only safe and allowed actions are available.</p>
+            </div>
+          </div>
           ${renderHumanDecisionButtons(incident)}
-        </div>
-      </section>
-      <section class="footer-principle">
-        <h2>AI ASSISTS.<br />HUMANS DECIDE.</h2>
-        <p>The system cannot override Safety Gates. Only a human coordinator can escalate to emergency services.</p>
+        </aside>
       </section>
     </main>
   `;
+}
+
+function renderSafetyCaseHeader(incident) {
+  const pill = safetyHeaderPill(incident);
+  return `
+    <section class="safety-header">
+      <span class="section-kicker">CASE ${escapeHtml(incident.label)}</span>
+      <div class="safety-title-row">
+        <h1>${escapeHtml(incident.title)}</h1>
+        <span class="safety-urgency-pill ${escapeHtml(pill.tone)}">${safetyIcon(pill.icon)} ${escapeHtml(pill.label)}</span>
+      </div>
+      <p>${escapeHtml(incident.caseId)} · ${escapeHtml(incident.location || "Location unknown")} · ${scoreText(incident)}</p>
+    </section>
+  `;
+}
+
+function safetyHeaderPill(incident) {
+  if (incident.operationalState === "DISPATCH_CANDIDATE") return { label: "Candidate", tone: "ready", icon: "check" };
+  if (incident.operationalState === "NEEDS_HUMAN_REVIEW") return { label: "Review", tone: "review", icon: "alert" };
+  if (incident.operationalState === "MERGE_OR_VERIFY") return { label: "Merge", tone: "review", icon: "info" };
+  if (incident.operationalState === "QUEUED_ACTION") return { label: "Queued", tone: "neutral", icon: "flag" };
+  return { label: "Urgent", tone: "urgent", icon: "alert" };
+}
+
+function renderSafetySummary(incident) {
+  const dispatch = dispatchPresentation(incident);
+  const stateLabel = statusLabels[incident.operationalState] || normalizeLabel(incident.operationalState);
+  const blockers = safetyBlockers(incident);
+  const blockerSummary = blockers.length ? blockers.slice(0, 2).join(" · ") : "None blocking";
+  const dispatchLabel = dispatch.status === "passed"
+    ? "AVAILABLE"
+    : dispatch.status === "review"
+      ? "REVIEW REQUIRED"
+      : "LOCKED";
+  const summaryCopy = dispatch.status === "passed"
+    ? "System safety checks indicate this case may proceed to human approval."
+    : "System safety checks prevent dispatch at this time.";
+  const summaryDetail = dispatch.status === "passed"
+    ? "The coordinator must still review details and explicitly record the decision."
+    : "Key information is still missing. Review the details below and choose an allowed human action.";
+
+  return `
+    <section class="safety-summary-panel">
+      <div class="safety-section-heading">
+        <span class="safety-section-icon" aria-hidden="true">${safetyIcon("shield")}</span>
+        <div>
+          <h2>Safety Summary</h2>
+          <strong>${escapeHtml(summaryCopy)}</strong>
+          <p>${escapeHtml(summaryDetail)}</p>
+        </div>
+      </div>
+      <div class="safety-summary-grid">
+        ${renderSafetySummaryCard("Current State", stateLabel, safetyStateSummary(incident), "state")}
+        ${renderSafetySummaryCard("Dispatch Status", dispatchLabel, dispatch.requirement, dispatch.status)}
+        ${renderSafetySummaryCard("Key Blockers", blockerSummary, blockers.length ? "Resolve these before dispatch approval can be considered." : "All key safety prerequisites appear available.", blockers.length ? "blocked" : "passed")}
+      </div>
+    </section>
+  `;
+}
+
+function renderSafetySummaryCard(label, value, detail, tone) {
+  return `
+    <article class="safety-summary-card ${escapeHtml(tone)}">
+      <span aria-hidden="true">${safetyIcon(summaryIconType(label, tone))}</span>
+      <div>
+        <h3>${escapeHtml(label)}</h3>
+        <strong>${escapeHtml(value)}</strong>
+        <p>${escapeHtml(detail)}</p>
+      </div>
+    </article>
+  `;
+}
+
+function summaryIconType(label, tone) {
+  if (label === "Current State") return "people";
+  if (label === "Key Blockers") return tone === "passed" ? "check" : "info";
+  return tone === "locked" ? "lock" : tone === "review" ? "alert" : "check";
 }
 
 function renderDecisionPath(incident) {
@@ -1285,31 +2061,35 @@ function renderDecisionPath(incident) {
   const contact = getGate(incident, "G_CONTACT");
   const dispatch = dispatchPresentation(incident);
   const steps = [
-    { label: "REPORT RECEIVED", status: "passed", detail: "" },
-    { label: `URGENCY: ${incident.scores.urgency}`, status: medical?.status || "passed", detail: medical?.detail || "" },
-    { label: "LOCATION", status: location?.status || "passed", detail: location?.detail || "" },
-    { label: "CONTACT", status: contact?.status || "passed", detail: contact?.detail || "" }
+    { label: "Report Received", status: "passed", detail: "Report entered the safety workflow." },
+    { label: "Medical Red Flag", sublabel: `Urgency: ${incident.scores.urgency}`, status: medical?.status || "passed", detail: medical?.detail || "" },
+    { label: "Location", status: location?.status || "passed", detail: location?.detail || "" },
+    { label: "Contact", status: contact?.status || "passed", detail: contact?.detail || "" },
+    { label: "Dispatch", status: dispatch.status, detail: dispatch.requirement, stateText: `Dispatch ${dispatch.label}` }
   ];
 
   return `
     <section class="decision-path">
-      <h2 class="section-kicker">Decision Path</h2>
+      <div class="safety-card-heading">
+        <span aria-hidden="true">${safetyIcon("shield")}</span>
+        <h2>Decision Path</h2>
+      </div>
       <div class="path-steps">
         ${steps
           .map(
             step => `
               <div class="path-step ${step.status}">
-                <span></span>
-                <strong>${escapeHtml(step.label)}</strong>
+                <span aria-hidden="true">${safetyIcon(pathIconType(step.status))}</span>
+                <div>
+                  <strong>${escapeHtml(step.label)}</strong>
+                  ${step.sublabel ? `<small>${escapeHtml(step.sublabel)}</small>` : ""}
+                </div>
+                ${step.stateText ? `<span class="sr-only">${escapeHtml(step.stateText)}</span>` : ""}
                 <p>${escapeHtml(pathDetail(step.status, step.detail))}</p>
               </div>
             `
           )
           .join("")}
-      </div>
-      <div class="dispatch-box ${dispatch.status}">
-        ${escapeHtml(dispatch.label)}<br />
-        <small>${escapeHtml(dispatch.requirement)}</small>
       </div>
       <p class="path-footnote">${escapeHtml(dispatch.countText)} ${escapeHtml(dispatch.detail)}</p>
     </section>
@@ -1320,8 +2100,19 @@ function renderSafetyGateTable(incident) {
   const gateOrder = ["G_MEDICAL", "G_LOCATION", "G_CONTACT", "G_RESOURCE", "G_CONFLICT"];
   return `
     <section class="gate-table-section">
-      <h2 class="section-kicker">Safety Gate Checks</h2>
+      <div class="safety-card-heading">
+        <span aria-hidden="true">${safetyIcon("shield")}</span>
+        <div>
+          <h2>Safety Gate Checks</h2>
+          <p>The following gates must be passed before volunteer dispatch can be considered.</p>
+        </div>
+      </div>
       <div class="gate-table">
+        <div class="gate-table-row gate-table-head">
+          <strong>Check</strong>
+          <span>Status</span>
+          <p>Details</p>
+        </div>
         ${gateOrder
           .map(id => {
             const gate = getGate(incident, id);
@@ -1337,6 +2128,40 @@ function renderSafetyGateTable(incident) {
           })
           .join("")}
       </div>
+    </section>
+  `;
+}
+
+function renderDispatchLessonCard(incident) {
+  const dispatch = dispatchPresentation(incident);
+  return `
+    <aside class="dispatch-lesson-card ${escapeHtml(dispatch.status)}">
+      <div class="dispatch-lesson-icon" aria-hidden="true">${safetyIcon("lungs")}</div>
+      <h2>URGENT</h2>
+      <strong>≠</strong>
+      <h2>DISPATCHABLE</h2>
+      <p>High urgency triggers immediate verification priority, not automatic dispatch.</p>
+      <div class="dispatch-lesson-note">
+        <span aria-hidden="true">${safetyIcon("info")}</span>
+        <p>${escapeHtml(dispatchLessonCopy(incident, dispatch))}</p>
+      </div>
+    </aside>
+  `;
+}
+
+function renderNextSafeActions(incident) {
+  return `
+    <section class="next-safe-actions-panel">
+      <div class="safety-card-heading">
+        <span aria-hidden="true">${safetyIcon("flag")}</span>
+        <div>
+          <h2>Next Safe Actions</h2>
+          <p>Recommended actions based on current safety assessment.</p>
+        </div>
+      </div>
+      <ol class="safe-actions">
+        ${(incident.safeNextActions || []).map(action => `<li>${escapeHtml(action)}</li>`).join("")}
+      </ol>
     </section>
   `;
 }
@@ -1359,20 +2184,47 @@ function renderHumanDecisionButtons(incident) {
   const actions = actionsForState(incident.operationalState);
   const busy = ["decision_loading", "brief_loading", "audit_loading"].includes(workflow.phase);
   const liveReady = state.mode !== DATA_MODES.live || liveReadiness(state.health).ready;
+  const requiresReason = ["APPROVE_ACTION", "REJECT_ACTION"].includes(form.action) || conflictReviewRequiredForUi(incident);
   return `
     <form class="decision-form" aria-busy="${busy}">
-      <p class="dispatch-status-note ${dispatch.status}" aria-label="Dispatch status"><strong>${escapeHtml(dispatch.label)}</strong><br />${escapeHtml(dispatch.detail)}</p>
+      <section class="human-dispatch-card ${dispatch.status}" aria-label="Dispatch status">
+        <span aria-hidden="true">${safetyIcon(dispatch.status === "passed" ? "check" : "lock")}</span>
+        <div>
+          <strong>${escapeHtml(dispatch.label)}</strong>
+          <p class="dispatch-status-note ${dispatch.status}">
+            <span class="sr-only">${escapeHtml(`${dispatch.label}. ${dispatch.detail}`)}</span>
+            ${escapeHtml(humanDispatchCopy(incident, dispatch))}
+          </p>
+        </div>
+      </section>
       <div class="decision-context">
         <span>Case ID <strong>${escapeHtml(incident.caseId)}</strong></span>
         <span>State <strong>${escapeHtml(incident.operationalState)}</strong></span>
-        <span>Consensus <strong>${escapeHtml(incident.modelDebate?.consensus || "Not available")}</strong></span>
+        <span>Model Consensus <strong>${escapeHtml(incident.modelDebate?.consensus || "Not available")}</strong></span>
       </div>
-      <label for="human-action">Human Action</label>
-      <select id="human-action" ${busy ? "disabled" : ""}>
-        ${actions.map(action => `<option value="${escapeHtml(action)}" ${form.action === action ? "selected" : ""}>${escapeHtml(actionLabel(action))}</option>`).join("")}
-      </select>
-      <label for="human-reason">Human Reason ${["APPROVE_ACTION", "REJECT_ACTION"].includes(form.action) || conflictReviewRequiredForUi(incident) ? "(minimum 8 characters)" : "(optional)"}</label>
-      <textarea id="human-reason" maxlength="500" placeholder="Enter the operator's own reason. CrisisRoute AI will not fill this for you." ${busy ? "disabled" : ""}>${escapeHtml(form.reason)}</textarea>
+      <section class="human-form-section">
+        <div class="human-field-heading">
+          <span aria-hidden="true">${safetyIcon("human")}</span>
+          <div>
+            <label for="human-action">Select Human Action</label>
+            <p>Choose the most appropriate next step.</p>
+          </div>
+        </div>
+        <select id="human-action" ${busy ? "disabled" : ""}>
+          ${actions.map(action => `<option value="${escapeHtml(action)}" ${form.action === action ? "selected" : ""}>${escapeHtml(actionLabel(action))}</option>`).join("")}
+        </select>
+      </section>
+      <section class="human-form-section">
+        <div class="human-field-heading">
+          <span aria-hidden="true">${safetyIcon("document")}</span>
+          <div>
+            <label for="human-reason">Reason ${requiresReason ? "(Required)" : "(Optional)"}</label>
+            <p>Enter the operator's own reason.</p>
+          </div>
+        </div>
+        <textarea id="human-reason" maxlength="500" placeholder="Exact location and verified contact are missing. Request verification before dispatch." ${busy ? "disabled" : ""}>${escapeHtml(form.reason)}</textarea>
+        <small class="reason-count">${escapeHtml(String(form.reason.length))} / 500</small>
+      </section>
       <fieldset class="acknowledgement-list">
         <legend>Human Acknowledgements</legend>
         ${acknowledgementControl("acknowledgeHumanDecision", "I confirm this is a human decision.", form, requirements, busy)}
@@ -1382,10 +2234,8 @@ function renderHumanDecisionButtons(incident) {
           : ""}
       </fieldset>
       <div class="gate-summary" aria-label="Safety Gate summary">
-        ${(incident.safetyGates || []).filter(gate => ["G_LOCATION", "G_CONTACT", "G_RESOURCE", "G_CONFLICT"].includes(gate.id))
-          .map(gate => `<span>${escapeHtml(gate.id.replace("G_", ""))}: <strong>${escapeHtml(gate.status || (gate.passed ? "passed" : "blocked"))}</strong></span>`).join("")}
+        ${renderGateStatusStrip(incident)}
       </div>
-      <p class="demo-auth-notice">Demo local operator — no production identity authentication.</p>
       ${!liveReady ? `<p class="form-error" role="alert">LIVE workflow unavailable: ${escapeHtml(liveReadiness(state.health).missing.join(", "))}</p>` : ""}
       ${form.errors?.length ? `<ul class="form-errors" role="alert">${form.errors.map(error => `<li>${escapeHtml(error)}</li>`).join("")}</ul>` : ""}
       ${workflow.error ? `<p class="form-error" role="alert">${escapeHtml(workflow.error)}</p>` : ""}
@@ -1394,12 +2244,24 @@ function renderHumanDecisionButtons(incident) {
       </p>
       ${workflow.decisionStatus === "RECORDED" ? `<p class="recorded-status">RECORDED — NOT EXECUTED</p>` : ""}
       <div class="decision-form-actions">
-        <button type="button" class="primary-action" data-action="decision-submit" ${busy || !liveReady || workflow.decisionStatus === "RECORDED" ? "disabled" : ""}>${busy ? "Recording…" : "Submit Decision"}</button>
+        <button type="button" class="primary-action" data-action="decision-submit" ${busy || !liveReady || workflow.decisionStatus === "RECORDED" ? "disabled" : ""}>${busy ? "Recording…" : "Submit Decision →"}</button>
         <button type="button" class="secondary-action" data-action="decision-reset" ${busy ? "disabled" : ""}>Cancel / Reset</button>
         ${workflow.canRetryBrief ? `<button type="button" class="secondary-action" data-action="retry-brief">Retry Brief — Decision remains recorded</button>` : ""}
       </div>
+      <p class="human-principle-note">AI assists. Humans decide.</p>
+      <p class="demo-auth-notice">Demo local operator — no production identity authentication.</p>
     </form>
   `;
+}
+
+function renderGateStatusStrip(incident) {
+  return (incident.safetyGates || [])
+    .filter(gate => ["G_LOCATION", "G_CONTACT", "G_RESOURCE", "G_CONFLICT"].includes(gate.id))
+    .map(gate => {
+      const status = gate.status || (gate.passed ? "passed" : "blocked");
+      return `<span class="gate-strip ${escapeHtml(status)}">${escapeHtml(gate.id.replace("G_", ""))}: <strong>${escapeHtml(status)}</strong></span>`;
+    })
+    .join("");
 }
 
 function acknowledgementControl(field, label, form, requirements, disabled = false) {
@@ -1428,66 +2290,132 @@ function conflictReviewRequiredForUi(incident) {
   return incident.safetyGates?.some(gate => gate.id === "G_CONFLICT" && gate.status === "review") === true;
 }
 
+function safetyBlockers(incident) {
+  return (incident.safetyGates || [])
+    .filter(gate => ["G_LOCATION", "G_CONTACT", "G_RESOURCE", "G_CONFLICT"].includes(gate.id))
+    .filter(gate => ["blocked", "locked", "review"].includes(gate.status))
+    .map(gate => {
+      if (gate.id === "G_LOCATION") return "Exact location";
+      if (gate.id === "G_CONTACT") return "Verified contact";
+      if (gate.id === "G_CONFLICT") return "Model conflict";
+      if (gate.id === "G_RESOURCE") return "Resource availability";
+      return gate.label;
+    });
+}
+
+function safetyStateSummary(incident) {
+  if (incident.operationalState === "DISPATCH_CANDIDATE") return "Candidate for bounded action after human review.";
+  if (incident.operationalState === "URGENT_VERIFICATION") return "High urgency, needs more information.";
+  if (incident.operationalState === "NEEDS_HUMAN_REVIEW") return "Coordinator review required before action.";
+  if (incident.operationalState === "MERGE_OR_VERIFY") return "Possible duplicate source requires review.";
+  if (incident.operationalState === "QUEUED_ACTION") return "Can wait behind higher-risk cases.";
+  return incident.recommendedAction || "Coordinator review required.";
+}
+
+function pathIconType(status) {
+  if (status === "passed") return "check";
+  if (status === "triggered") return "alert";
+  if (status === "blocked") return "lock";
+  if (status === "review") return "alert";
+  return "lock";
+}
+
+function dispatchLessonCopy(incident, dispatch) {
+  if (dispatch.status === "passed") {
+    return "Safety checks support eligibility, but only a human coordinator can record the decision.";
+  }
+  if (dispatch.status === "review") {
+    return "Model disagreement must be reviewed before this case can move forward.";
+  }
+  const blockers = safetyBlockers(incident);
+  return blockers.length
+    ? `Once ${blockers.slice(0, 2).join(" and ").toLowerCase()} are verified, the case can be reassessed for dispatch eligibility.`
+    : "Once missing safety information is verified, this case can be reassessed for dispatch eligibility.";
+}
+
+function humanDispatchCopy(incident, dispatch) {
+  if (dispatch.status === "passed") {
+    return "Safety prerequisites appear available. A human decision is still required before any brief is generated.";
+  }
+  if (dispatch.status === "review") {
+    return "Model conflict or review requirements remain. Dispatch approval is not automatic.";
+  }
+  const blockers = safetyBlockers(incident);
+  if (blockers.length) {
+    return `${blockers.slice(0, 2).join(" and ")} ${blockers.length === 1 ? "is" : "are"} still missing. Approval cannot be submitted yet.`;
+  }
+  return "Required gates or dispatch eligibility are not confirmed. Approval cannot be submitted yet.";
+}
+
+function safetyIcon(type) {
+  const icons = {
+    alert: '<svg viewBox="0 0 24 24" role="img" focusable="false"><path d="M12 3.8 21 19H3L12 3.8Z" /><path d="M12 9v4.5" /><path d="M12 17h.01" /></svg>',
+    check: '<svg viewBox="0 0 24 24" role="img" focusable="false"><path d="m5.5 12.5 4.1 4.1 8.9-9.2" /></svg>',
+    document: '<svg viewBox="0 0 24 24" role="img" focusable="false"><path d="M7 3.5h7l3 3V20H7z" /><path d="M14 3.5V7h3" /><path d="M9.5 11h5" /><path d="M9.5 14.5h5" /></svg>',
+    flag: '<svg viewBox="0 0 24 24" role="img" focusable="false"><path d="M6 4v16" /><path d="M6 5h11l-1.5 3L17 11H6" /></svg>',
+    human: '<svg viewBox="0 0 24 24" role="img" focusable="false"><circle cx="12" cy="8" r="3.4" /><path d="M5.5 20c.9-4.1 3.3-6 6.5-6s5.6 1.9 6.5 6" /></svg>',
+    info: '<svg viewBox="0 0 24 24" role="img" focusable="false"><circle cx="12" cy="12" r="8.5" /><path d="M12 10.8v5.2" /><path d="M12 8h.01" /></svg>',
+    lock: '<svg viewBox="0 0 24 24" role="img" focusable="false"><rect x="5.5" y="10" width="13" height="9" rx="2" /><path d="M8.5 10V7.8a3.5 3.5 0 0 1 7 0V10" /></svg>',
+    lungs: '<svg viewBox="0 0 24 24" role="img" focusable="false"><path d="M12 4v7" /><path d="M12 11c-2.4-.4-4.4-2.1-5.2-4.3C4.7 9 4.4 13.8 5.9 17.8c.5 1.3 2.2 1.6 3.1.5 1.6-2 2.6-4.4 3-7.3Z" /><path d="M12 11c2.4-.4 4.4-2.1 5.2-4.3 2.1 2.3 2.4 7.1.9 11.1-.5 1.3-2.2 1.6-3.1.5-1.6-2-2.6-4.4-3-7.3Z" /></svg>',
+    people: '<svg viewBox="0 0 24 24" role="img" focusable="false"><circle cx="9" cy="8" r="3" /><path d="M3.8 18.5c.8-3.6 2.7-5.1 5.2-5.1s4.4 1.5 5.2 5.1" /><circle cx="16.5" cy="9.5" r="2.2" /><path d="M15 14.2c2.1.2 3.8 1.5 4.6 4.3" /></svg>',
+    shield: '<svg viewBox="0 0 24 24" role="img" focusable="false"><path d="M12 3.5 19 6.6v5.1c0 4.4-2.9 7.3-7 8.8-4.1-1.5-7-4.4-7-8.8V6.6z" /></svg>'
+  };
+  return icons[type] || icons.info;
+}
+
 function renderActionBriefView(incident) {
   const workflow = getDecisionWorkflow(incident);
   const brief = workflow.brief || incident.operationalBrief;
   const proof = workflow.proofCapsule || incident.proofCapsule;
   if (!workflow.decision || !brief) return renderActionBriefLocked(incident, workflow);
   const rules = displayRules(workflow);
-  const liveProof = state.mode === DATA_MODES.live && proof;
+  const decision = workflow.decision;
+  const nextSteps = actionNextSteps(incident, brief);
+  const actionLabelText = titleCaseLabel(actionLabel(decision.action || brief.decisionAction));
 
   return `
     <main class="page-canvas action-page">
-      <section class="approval-strip recorded">RECORDED — NOT EXECUTED · ${escapeHtml(workflow.decision.action)} · ${escapeHtml(incident.caseId)}</section>
-      <section class="action-layout">
-        <section class="action-brief-main">
-          <h1>Deterministic Operational Brief</h1>
-          <p class="action-subtitle">${escapeHtml(incident.caseId)} · ${escapeHtml(incident.title)}</p>
-          <div class="brief-meta-grid">
-            ${briefMeta("Human Action", workflow.decision.action)}
-            ${briefMeta("Priority", brief.priority || "Not available", "red")}
-            ${briefMeta("Recorded", formatTime(workflow.decision.recordedAt))}
-          </div>
-          <div class="brief-section">
-            <h2 class="section-kicker">Human Reason</h2>
-            <p>${escapeHtml(workflow.decision.reason || "No additional reason supplied for this action.")}</p>
-          </div>
-          <div class="brief-section instructions">
-            <h2 class="section-kicker">Brief Summary</h2>
-            <p>${escapeHtml(brief.summary)}</p>
-          </div>
-          <div class="brief-section">
-            <h2 class="section-kicker">Safe Next Actions</h2>
-            <ol class="safe-actions">${listItems(brief.nextSteps || [])}</ol>
-          </div>
-          <div class="brief-section">
-            <h2 class="section-kicker">Verification Items & Constraints</h2>
-            <ul class="constraint-list">${listItems(brief.safetyConstraints || [])}</ul>
-          </div>
-          <div class="execution-contract">
-            <strong>${escapeHtml(brief.recordStatus || "RECORDED")} — ${escapeHtml(brief.executionStatus || "NOT_EXECUTED")}</strong>
-            <p>External execution remains outside CrisisRoute AI.</p>
-          </div>
-        </section>
-        <aside class="proof-column">
-          <div class="proof-heading">
-            <div>
-              <h2 class="section-kicker">Proof Capsule</h2>
-              <p>${liveProof ? "Server-issued local payload receipt" : "DEMO ONLY — no server-issued capsule"}</p>
-            </div>
-            <div class="proof-actions">
-              <button type="button" class="secondary-action" data-action="verify-proof" ${!rules.proofVerificationEnabled ? "disabled" : ""}>Verify Local Proof</button>
-              <button type="button" class="secondary-action" data-action="export-receipt" ${!liveProof || !workflow.audit ? "disabled" : ""}>Export Receipt JSON</button>
-            </div>
-          </div>
-          <div class="proof-verification ${escapeHtml(workflow.proofStatus.toLowerCase())}" role="status" aria-live="polite">
-            ${escapeHtml(proofStatusLabel(workflow))}
-          </div>
-          ${liveProof ? renderServerProof(brief, proof) : renderDemoProofNotice()}
+      <button class="text-action back-link" data-action="view" data-view="safety">← Back to Safety</button>
+      <section class="action-page-heading">
+        <div>
+          <span class="section-kicker">Action Brief</span>
+          <h1>Action Brief</h1>
+          <p>Human-approved next steps and decision record.</p>
+          <small>Generated from the recorded human decision and current safety state.</small>
+        </div>
+        <aside class="action-principle-card">
+          <p>"From decision to action, with accountability."</p>
+          <strong>AI assists. Humans decide.</strong>
         </aside>
       </section>
-      ${renderServerAudit(workflow.audit)}
-      ${renderIntegrityNotice()}
+      ${renderActionCaseHeader(incident)}
+      <section class="action-layout">
+        <section class="action-main-column">
+          <section class="decision-record-card">
+            <span class="decision-record-icon" aria-hidden="true">${safetyIcon("check")}</span>
+            <div class="decision-record-copy">
+              <span class="section-kicker">Decision Recorded</span>
+              <h2>${escapeHtml(actionLabelText)}</h2>
+              <p>${escapeHtml(decisionOutcomeCopy(incident, brief, decision))}</p>
+            </div>
+            <div class="decision-record-meta">
+              ${actionMetric("Priority", brief.priority || "Not available", priorityTone(brief.priority), "alert")}
+              ${actionMetric("Execution", normalizeLabel(brief.executionStatus || decision.executionStatus || "NOT_EXECUTED").toUpperCase(), "neutral", "info")}
+              ${actionMetric("Recorded", formatTime(decision.recordedAt || brief.generatedAt), "neutral", "document")}
+            </div>
+          </section>
+          <section class="action-content-grid">
+            ${renderDecisionSummaryCard(incident, brief, decision)}
+            ${renderWhatHappensNext(nextSteps)}
+          </section>
+          ${renderExecutionNote(brief)}
+        </section>
+        <aside class="action-side-column">
+          ${renderProofCapsulePanel(workflow, brief, proof, rules)}
+          ${renderServerAudit(workflow.audit)}
+          ${renderModeProvenanceCard()}
+        </aside>
+      </section>
     </main>
   `;
 }
@@ -1496,9 +2424,11 @@ function renderActionBriefLocked(incident, workflow = getDecisionWorkflow(incide
   const decisionRecorded = workflow?.decisionStatus === "RECORDED";
   return `
     <main class="page-canvas action-page">
+      <button class="text-action back-link" data-action="view" data-view="safety">← Back to Safety</button>
       <section class="action-locked-state">
         <span class="section-kicker">Action Brief</span>
-        <h1>${escapeHtml(incident.title)}</h1>
+        <h1>Action Brief</h1>
+        <p class="action-subtitle">${escapeHtml(incident.caseId)} · ${escapeHtml(incident.title)}</p>
         ${decisionRecorded
           ? `<p><strong>Decision status: RECORDED</strong><br />Brief status: UNAVAILABLE<br />Execution status: NOT_EXECUTED</p>
              <p>The Human Decision remains recorded. Retrying the Brief will not resubmit the Decision.</p>`
@@ -1513,6 +2443,116 @@ function renderActionBriefLocked(incident, workflow = getDecisionWorkflow(incide
   `;
 }
 
+function renderActionCaseHeader(incident) {
+  const pill = safetyHeaderPill(incident);
+  return `
+    <section class="action-case-header">
+      <div>
+        <span class="section-kicker">Case ${escapeHtml(incident.label || "")}</span>
+        <h2>${escapeHtml(incident.title)}</h2>
+        <p>${escapeHtml(incident.caseId)} · ${escapeHtml(incident.location || "Location unavailable")} · ${escapeHtml(scoreText(incident))}</p>
+      </div>
+      <span class="safety-urgency-pill ${escapeHtml(pill.tone)}" aria-label="${escapeHtml(statusLabels[incident.operationalState] || normalizeLabel(incident.operationalState))}">
+        ${safetyIcon(pill.icon)}
+        ${escapeHtml(statusLabels[incident.operationalState] || normalizeLabel(incident.operationalState))}
+      </span>
+    </section>
+  `;
+}
+
+function renderDecisionSummaryCard(incident, brief, decision) {
+  return `
+    <section class="action-info-card decision-summary-card">
+      <div class="action-card-heading">
+        <span aria-hidden="true">${safetyIcon("document")}</span>
+        <h2>Decision Summary</h2>
+      </div>
+      <div class="decision-summary-list">
+        ${summaryRow("Human Action", titleCaseLabel(actionLabel(decision.action || brief.decisionAction)))}
+        ${summaryRow("Human Reason", decision.reason || brief.humanReason || "No additional reason supplied.")}
+        ${summaryRow("Case State", incident.operationalState || brief.operationalState || "Not available")}
+        ${summaryRow("Model Consensus", incident.modelDebate?.consensus || "Not available")}
+        ${summaryRow("Why this action?", decisionRationale(incident, brief))}
+      </div>
+    </section>
+  `;
+}
+
+function renderWhatHappensNext(nextSteps) {
+  return `
+    <section class="action-info-card next-actions-card">
+      <div class="action-card-heading">
+        <span aria-hidden="true">${safetyIcon("flag")}</span>
+        <div>
+          <h2>What Happens Next</h2>
+          <p>Recommended safe next actions based on the current decision.</p>
+        </div>
+      </div>
+      <ol class="action-step-list">
+        ${nextSteps.map(step => `<li><span>${escapeHtml(step)}</span></li>`).join("")}
+      </ol>
+    </section>
+  `;
+}
+
+function renderExecutionNote(brief) {
+  const recordStatus = brief.recordStatus || "RECORDED";
+  const executionStatus = brief.executionStatus || "NOT_EXECUTED";
+  return `
+    <section class="execution-note" aria-label="Execution status">
+      <span aria-hidden="true">${safetyIcon("info")}</span>
+      <div>
+        <strong>${escapeHtml(normalizeLabel(recordStatus))}, ${escapeHtml(normalizeLabel(executionStatus).toLowerCase())}</strong>
+        <p>CrisisRoute records the human decision and recommended next steps. Real-world execution remains outside the platform.</p>
+      </div>
+    </section>
+  `;
+}
+
+function renderProofCapsulePanel(workflow, brief, proof, rules) {
+  const liveProof = state.mode === DATA_MODES.live && proof;
+  return `
+    <section class="action-side-card proof-capsule-panel">
+      <div class="proof-title-row">
+        <div class="action-card-heading">
+          <span aria-hidden="true">${safetyIcon("shield")}</span>
+          <div>
+            <h2>Proof Capsule</h2>
+            <p>${liveProof ? "Server-issued local payload receipt." : "No server-issued capsule for this case."}</p>
+          </div>
+        </div>
+        <span class="mode-proof-badge">${escapeHtml(proofModeBadge(workflow))}</span>
+      </div>
+      <div class="proof-actions">
+        <button type="button" class="secondary-action" data-action="verify-proof" ${!rules.proofVerificationEnabled ? "disabled" : ""}>Verify Local Proof</button>
+        <button type="button" class="secondary-action" data-action="export-receipt" ${!liveProof || !workflow.audit ? "disabled" : ""}>Export Receipt JSON</button>
+      </div>
+      ${liveProof ? renderLiveProofNotice(workflow) : renderDemoProofNotice()}
+      <div class="proof-status-table">
+        ${summaryRow("Status", rules.proofStatus || "UNAVAILABLE")}
+        ${summaryRow("Type", proofTypeLabel(liveProof))}
+        ${summaryRow("Verification", proofVerificationLabel(workflow, liveProof))}
+        ${summaryRow("Server Capsule", liveProof ? "Issued" : "Not Issued")}
+      </div>
+      ${liveProof ? `
+        <details class="proof-detail-panel">
+          <summary>View Capsule Details →</summary>
+          ${renderServerProof(brief, proof)}
+        </details>
+      ` : `<p class="proof-footnote">This view does not prove the report is true or that real-world action occurred.</p>`}
+    </section>
+  `;
+}
+
+function renderLiveProofNotice(workflow) {
+  return `
+    <article class="proof-receipt demo-proof live-proof-status">
+      <strong>${escapeHtml(workflow.proofStatus || "UNVERIFIED")}</strong>
+      <p>Live proof represents local payload integrity only. It is not evidence of real-world execution.</p>
+    </article>
+  `;
+}
+
 function proofStatusLabel(workflow) {
   if (state.mode !== DATA_MODES.live || !workflow.proofCapsule) return "UNAVAILABLE — not a server-issued live capsule";
   if (workflow.proofStatus === "VALID") return "VALID — unchanged local payload";
@@ -1524,6 +2564,7 @@ function proofStatusLabel(workflow) {
 function renderServerProof(brief, proof) {
   return `
     <article class="proof-receipt server-proof">
+      <h3>Server Capsule</h3>
       ${receiptRow("Brief ID", brief.briefId)}
       ${hashReceiptRow("Brief Hash", proof.briefHash)}
       ${receiptRow("Capsule ID", proof.capsuleId)}
@@ -1539,10 +2580,14 @@ function renderServerProof(brief, proof) {
 }
 
 function renderDemoProofNotice() {
+  const label = state.mode === DATA_MODES.replay ? "REPLAY ONLY" : "DEMO ONLY";
+  const copy = state.mode === DATA_MODES.replay
+    ? "Sanitized Replay data cannot be marked Proof Valid and does not imply a new live inference."
+    : "Mock and Replay data cannot be marked Proof Valid and cannot use server Proof verification.";
   return `
     <article class="proof-receipt demo-proof">
-      <strong>DEMO ONLY</strong>
-      <p>Mock and Replay data cannot be marked Proof Valid and cannot use server Proof verification.</p>
+      <strong>${escapeHtml(label)}</strong>
+      <p>${escapeHtml(copy)}</p>
     </article>
   `;
 }
@@ -1560,25 +2605,67 @@ function hashReceiptRow(label, value) {
 }
 
 function renderServerAudit(audit) {
-  if (!audit) return `<section class="audit-chain"><h2 class="section-kicker">Local Audit Chain</h2><p>Audit unavailable.</p></section>`;
+  if (!audit) {
+    return `
+      <section class="action-side-card audit-chain">
+        <div class="action-card-heading">
+          <span aria-hidden="true">${safetyIcon("document")}</span>
+          <h2>Audit Trail</h2>
+        </div>
+        <p>Audit unavailable.</p>
+      </section>
+    `;
+  }
+  const entries = audit.entries || [];
   return `
-    <section class="audit-chain">
+    <section class="action-side-card audit-chain">
       <div class="audit-heading">
-        <div><h2 class="section-kicker">Local Audit Chain</h2><p>Current-process, temporary audit history.</p></div>
-        <strong>Chain: ${audit.chainValid === true ? "VALID" : audit.demoOnly ? "DEMO ONLY" : "INVALID"}</strong>
+        <div class="action-card-heading">
+          <span aria-hidden="true">${safetyIcon("document")}</span>
+          <div>
+            <h2>Audit Trail</h2>
+            <p>${escapeHtml(`${audit.entryCount || entries.length} recorded ${Number(audit.entryCount || entries.length) === 1 ? "event" : "events"} in this session.`)}</p>
+          </div>
+        </div>
+        <strong>Chain: ${escapeHtml(auditChainLabel(audit))}</strong>
       </div>
-      <div class="audit-entry-list">
-        ${(audit.entries || []).map(entry => `
-          <article class="audit-entry">
-            <span>Sequence ${escapeHtml(entry.sequence)}</span>
-            <strong>${escapeHtml(entry.action)}</strong>
-            <time>${escapeHtml(formatDateTime(entry.recordedAt))}</time>
-            ${hashReceiptRow("Previous Hash", entry.previousHash === null ? "GENESIS: null" : entry.previousHash)}
-            ${hashReceiptRow("Entry Hash", entry.entryHash)}
-          </article>
-        `).join("")}
+      <details class="audit-detail-panel">
+        <summary>View Audit Details →</summary>
+        <div class="audit-entry-list">
+          ${entries.map(entry => `
+            <article class="audit-entry">
+              <span>Sequence ${escapeHtml(entry.sequence)}</span>
+              <strong>${escapeHtml(actionLabel(entry.action))}</strong>
+              <time>${escapeHtml(formatDateTime(entry.recordedAt))}</time>
+              ${hashReceiptRow("Previous Hash", entry.previousHash === null ? "GENESIS: null" : entry.previousHash)}
+              ${hashReceiptRow("Entry Hash", entry.entryHash)}
+            </article>
+          `).join("")}
+        </div>
+        <p>Persistence: ${escapeHtml(audit.persistence)} · External anchoring: ${escapeHtml(audit.externalAnchoring)}</p>
+      </details>
+    </section>
+  `;
+}
+
+function renderModeProvenanceCard() {
+  const provenance = modeProvenance(state.mode);
+  const label = state.mode === DATA_MODES.live ? "Live Provenance" : state.mode === DATA_MODES.replay ? "Replay Provenance" : "Demo Provenance";
+  return `
+    <section class="action-side-card mode-provenance-card">
+      <div class="action-card-heading">
+        <span aria-hidden="true">${safetyIcon("info")}</span>
+        <div>
+          <h2>${escapeHtml(label)}</h2>
+          <p>${escapeHtml(provenance.title)}</p>
+        </div>
       </div>
-      <p>Persistence: ${escapeHtml(audit.persistence)} · External anchoring: ${escapeHtml(audit.externalAnchoring)}</p>
+      <p>This view records a decision handoff. It does not prove the report is true or that real-world action occurred.</p>
+      <details class="provenance-detail-panel">
+        <summary>View Details →</summary>
+        <ul>${provenance.lines.map(line => `<li>${escapeHtml(line)}</li>`).join("")}</ul>
+        <p>Local payload integrity only. No blockchain or external anchoring is claimed unless a live backend explicitly provides it.</p>
+      </details>
     </section>
   `;
 }
@@ -1602,6 +2689,79 @@ function briefMeta(label, value, tone = "") {
       <strong class="${tone}">${escapeHtml(value || "Not available")}</strong>
     </div>
   `;
+}
+
+function actionMetric(label, value, tone, icon) {
+  return `
+    <article class="action-metric ${escapeHtml(tone || "neutral")}">
+      <span aria-hidden="true">${safetyIcon(icon)}</span>
+      <div>
+        <small>${escapeHtml(label)}</small>
+        <strong>${escapeHtml(value || "Not available")}</strong>
+      </div>
+    </article>
+  `;
+}
+
+function summaryRow(label, value) {
+  return `
+    <div class="summary-row">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value || "Not available")}</strong>
+    </div>
+  `;
+}
+
+function actionNextSteps(incident, brief) {
+  const briefSteps = Array.isArray(brief?.nextSteps) ? brief.nextSteps : [];
+  const incidentSteps = Array.isArray(incident.safeNextActions) ? incident.safeNextActions : [];
+  return (briefSteps.length ? briefSteps : incidentSteps).filter(Boolean).slice(0, 8);
+}
+
+function titleCaseLabel(value) {
+  return String(value || "Not available")
+    .toLowerCase()
+    .replace(/\b[a-z]/g, char => char.toUpperCase());
+}
+
+function decisionOutcomeCopy(incident, brief, decision) {
+  if (brief.summary) return brief.summary;
+  if (decision.reason) return decision.reason;
+  return incident.recommendedAction || "A human decision was recorded for this case.";
+}
+
+function decisionRationale(incident, brief) {
+  if (brief.summary) return brief.summary;
+  if (incident.recommendedAction) return incident.recommendedAction;
+  return dispatchPresentation(incident).detail;
+}
+
+function priorityTone(priority) {
+  return ["CRITICAL", "HIGH"].includes(String(priority || "").toUpperCase()) ? "critical" : "neutral";
+}
+
+function proofModeBadge(workflow) {
+  if (state.mode === DATA_MODES.live && workflow.proofCapsule) return "LIVE CAPSULE";
+  if (state.mode === DATA_MODES.live) return "LIVE";
+  if (state.mode === DATA_MODES.replay) return "REPLAY ONLY";
+  return "DEMO ONLY";
+}
+
+function proofTypeLabel(liveProof) {
+  if (liveProof) return "Server-issued local payload integrity";
+  if (state.mode === DATA_MODES.replay) return "Sanitized Replay";
+  return "Local Snapshot (Demo)";
+}
+
+function proofVerificationLabel(workflow, liveProof) {
+  if (!liveProof) return "Not Applicable";
+  return normalizeLabel(workflow.proofStatus || "UNVERIFIED");
+}
+
+function auditChainLabel(audit) {
+  if (audit.chainValid === true) return state.mode === DATA_MODES.live ? "LIVE" : "VALID";
+  if (audit.demoOnly) return state.mode === DATA_MODES.replay ? "REPLAY ONLY" : "DEMO ONLY";
+  return "INVALID";
 }
 
 function languageButton(lang, label) {
@@ -1741,6 +2901,10 @@ function getSelectedIncident() {
   return state.incidents.find(item => item.caseId === state.selectedCaseId) || state.incidents[0] || null;
 }
 
+function getStrictSelectedIncident() {
+  return state.incidents.find(item => item.caseId === state.selectedCaseId) || null;
+}
+
 function getSelectedEvidence(incident) {
   return incident.evidence.find(item => item.id === state.selectedEvidenceId) || incident.evidence[0] || null;
 }
@@ -1833,7 +2997,7 @@ function stateClass(stateName) {
 function modeLabel(mode) {
   if (mode === DATA_MODES.replay) return "REPLAY";
   if (mode === DATA_MODES.live) return "LIVE";
-  return "DEMO";
+  return "DEMO SNAPSHOT";
 }
 
 function shortModeLabel(mode) {
@@ -1844,7 +3008,7 @@ function shortModeLabel(mode) {
 
 function gonkaLabel() {
   if (state.mode === DATA_MODES.mock) return "DEMO DATA";
-  if (state.mode === DATA_MODES.replay) return "SANITIZED REPLAY";
+  if (state.mode === DATA_MODES.replay) return "RECORDED RESPONSE";
   return isLiveConnected() ? "CONNECTED" : "UNAVAILABLE";
 }
 
@@ -1867,6 +3031,18 @@ function isLiveConnected() {
   return state.mode === DATA_MODES.live && liveReadiness(state.health).ready;
 }
 
+function compactProvenanceLabel() {
+  if (state.mode === DATA_MODES.mock) return "Demo · Synthetic Data";
+  if (state.mode === DATA_MODES.replay) return "Replay · Recorded Response";
+  return isLiveConnected() ? "Live · Gonka Connected" : "Live · Backend Unavailable";
+}
+
+function progressStageCopy(stage) {
+  if (!state.liveProgress || state.liveProgress.requestKind === "fixed") return stage;
+  if (state.liveProgress.requestKind === "url") return stage.replace("five fixed reports", "public URL report");
+  return stage.replace("five fixed reports", "pasted crisis report");
+}
+
 function listItems(items) {
   return items.map(item => `<li>${escapeHtml(item)}</li>`).join("");
 }
@@ -1875,6 +3051,12 @@ function normalizeLabel(value) {
   return String(value || "")
     .replaceAll("_", " ")
     .replace(/\b\w/g, char => char.toUpperCase());
+}
+
+function sentenceCase(value) {
+  const text = String(value || "").trim();
+  if (!text) return "None";
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 function formatPeople(value) {

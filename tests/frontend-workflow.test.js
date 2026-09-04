@@ -223,6 +223,32 @@ test("client uses GET for audit and POST for brief and proof verification", asyn
   ]);
 });
 
+test("client sends Public URL analysis through the centralized adapter", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return response(200, { ok: true, incidents: [] });
+  };
+  const client = clientModule.createCrisisRouteClient({ fetchImpl, baseUrl: "http://127.0.0.1:4173" });
+  await client.analyzePublicUrl("https://example.org/haze-report");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "http://127.0.0.1:4173/api/public-source/analyze");
+  assert.equal(calls[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].options.body), { url: "https://example.org/haze-report" });
+});
+
+test("Command Center starts empty and Live custom input is not replaced by the fixed scenario", () => {
+  const main = fs.readFileSync(path.join(projectRoot, "src/main.js"), "utf8");
+  assert.match(main, /intakeValue:\s*""/);
+  assert.match(main, /urlValue:\s*""/);
+  assert.match(main, /selectedCaseId:\s*null/);
+  assert.doesNotMatch(main, /state\.intakeValue\s*=\s*\[/);
+  assert.match(main, /Paste a crisis report or load demo cases to begin analysis\./);
+  assert.match(main, /currentIntakeRequest\(\)/);
+  assert.match(main, /await runLiveAnalyze\(requestSpec\)/);
+  assert.doesNotMatch(main, /await runLiveAnalyze\(\{\s*kind:\s*"fixed",\s*messages:\s*\[\]\s*\}\);\s*return;\s*\}\s*state\.error = null;\s*await withLoading/);
+});
+
 test("decision failure prevents the orchestration from requesting a brief", async () => {
   const calls = [];
   const client = clientModule.createCrisisRouteClient({
@@ -320,7 +346,7 @@ async function renderers() {
     .replace(/import\s+\{[\s\S]*?\}\s+from\s+["'][^"']+["'];\s*/g, "")
     .replace(/\binit\(\);\s*$/, "");
   const reliability = await importSource("src/ui/demoReliability.js");
-  return vm.runInNewContext(`${source}\n({ renderDecisionPath, renderDispatchLockPanel, renderSafetyAssessment, renderHumanDecisionButtons, renderAuditTimeline, auditEvents });`, {
+  return vm.runInNewContext(`${source}\n({ state, setDecisionWorkflow, renderCommandReadinessPanel, renderSafetyView, renderActionBriefView, renderDecisionPath, renderDispatchLockPanel, renderSafetyAssessment, renderHumanDecisionButtons, renderAuditTimeline, auditEvents });`, {
     ...workflow,
     ...reliability,
     DATA_MODES: { mock: "mock", replay: "replay", live: "live" },
@@ -328,6 +354,114 @@ async function renderers() {
     fetch: () => { throw new Error("Rendering must not access the network."); }
   });
 }
+
+test("Command Center result summarizes Decision Readiness before Human Decision", async () => {
+  const demo = (await importSource("src/data/hazeScenario.mock.js")).cloneScenario();
+  const ui = await renderers();
+  const case01 = demo.incidents.find(item => item.label === "01");
+  const case03 = demo.incidents.find(item => item.label === "03");
+  const case04 = demo.incidents.find(item => item.label === "04");
+
+  const case01Html = ui.renderCommandReadinessPanel(case01);
+  assert.match(case01Html, /Decision Readiness/);
+  assert.match(case01Html, /DISPATCH CANDIDATE/);
+  assert.match(case01Html, /3 \/ 4 checks ready/);
+  assert.match(case01Html, /Review Case Intelligence →/);
+  assert.doesNotMatch(case01Html, /Open Human Decision/);
+  assert.doesNotMatch(case01Html, /<h2>Safety Gates<\/h2>/);
+  assert.doesNotMatch(case01Html, /Volunteer Dispatch/);
+
+  const case03Html = ui.renderCommandReadinessPanel(case03);
+  assert.match(case03Html, /URGENT VERIFICATION/);
+  assert.match(case03Html, /Exact location and verified contact missing/);
+  assert.match(case03Html, /Review Case Intelligence →/);
+
+  const case04Html = ui.renderCommandReadinessPanel(case04);
+  assert.match(case04Html, /NEEDS HUMAN REVIEW/);
+  assert.match(case04Html, /Model disagreement requires review/);
+  assert.match(case04Html, /Review Case Intelligence →/);
+});
+
+test("Safety page keeps Evidence back-navigation and adaptive human actions", async () => {
+  const demo = (await importSource("src/data/hazeScenario.mock.js")).cloneScenario();
+  const ui = await renderers();
+  const case03 = demo.incidents.find(item => item.label === "03");
+  const case01 = demo.incidents.find(item => item.label === "01");
+
+  const safetyHtml = ui.renderSafetyView(case03);
+  assert.match(safetyHtml, /← Back to Evidence/);
+  assert.match(safetyHtml, /data-view="evidence"/);
+  assert.match(safetyHtml, /Safety Summary/);
+  assert.match(safetyHtml, /URGENT/);
+  assert.match(safetyHtml, /≠/);
+  assert.match(safetyHtml, /DISPATCHABLE/);
+  assert.match(safetyHtml, /Human Decision/);
+  assert.match(safetyHtml, /DISPATCH LOCKED/);
+  assert.doesNotMatch(ui.renderHumanDecisionButtons(case03), /APPROVE_ACTION/);
+  assert.match(ui.renderHumanDecisionButtons(case03), /REQUEST_VERIFICATION/);
+  assert.match(ui.renderHumanDecisionButtons(case01), /APPROVE_ACTION/);
+});
+
+test("Action Brief renders recorded decision handoff with compact proof and audit hierarchy", async () => {
+  const demo = (await importSource("src/data/hazeScenario.mock.js")).cloneScenario();
+  const ui = await renderers();
+  const case03 = demo.incidents.find(item => item.label === "03");
+  const decision = {
+    caseId: case03.caseId,
+    action: "REQUEST_VERIFICATION",
+    reason: "",
+    recordedAt: "2026-09-04T13:48:00.000Z",
+    recordStatus: "RECORDED",
+    executionStatus: "NOT_EXECUTED"
+  };
+  const brief = {
+    caseId: case03.caseId,
+    decisionAction: decision.action,
+    priority: "CRITICAL",
+    summary: "Urgent verification was requested. Low verification does not reduce medical urgency.",
+    nextSteps: [...case03.safeNextActions],
+    safetyConstraints: ["No real-world action is executed by this demo."],
+    recordStatus: "RECORDED",
+    executionStatus: "NOT_EXECUTED"
+  };
+  ui.state.mode = "mock";
+  ui.setDecisionWorkflow(case03.caseId, {
+    ...workflow.createWorkflowState(case03, "mock"),
+    decision,
+    brief,
+    proofCapsule: null,
+    audit: {
+      demoOnly: true,
+      entryCount: 1,
+      entries: [{ sequence: 1, action: decision.action, recordedAt: decision.recordedAt, previousHash: null, entryHash: "DEMO_ONLY_NOT_SERVER_ISSUED" }],
+      chainValid: null,
+      persistence: "demo_only",
+      externalAnchoring: "none"
+    },
+    decisionStatus: "RECORDED",
+    briefStatus: "READY",
+    auditStatus: "VALID",
+    proofStatus: "UNAVAILABLE"
+  });
+
+  const html = ui.renderActionBriefView(case03);
+  assert.match(html, /← Back to Safety/);
+  assert.match(html, /data-view="safety"/);
+  assert.match(html, /<h1>Action Brief<\/h1>/);
+  assert.doesNotMatch(html, /Deterministic Operational Brief/);
+  assert.match(html, /Decision Recorded/);
+  assert.match(html, /Request Urgent Verification/);
+  assert.match(html, /CRITICAL/);
+  assert.match(html, /NOT EXECUTED/);
+  assert.match(html, /What Happens Next/);
+  assert.match(html, /Contact reporter immediately via WhatsApp/);
+  assert.match(html, /class="execution-note"/);
+  assert.match(html, /Proof Capsule/);
+  assert.match(html, /DEMO ONLY/);
+  assert.match(html, /Audit Trail/);
+  assert.match(html, /View Audit Details →/);
+  assert.match(html, /Demo Provenance/);
+});
 
 test("dispatch passed presentation requires explicit human approval and zero blocked/review counts", () => {
   const result = workflow.dispatchPresentation(dispatchIncident());
@@ -465,7 +599,7 @@ test("passed candidate actual UI output consistently says available only after e
   assert.equal(ui.auditEvents(case01).find(item => item.label === "Action").detail, "Pending");
 });
 
-test("missing dispatch gate renders locked in every dispatch surface, including Command Center", async () => {
+test("missing dispatch gate renders locked in every detailed dispatch surface", async () => {
   const case01 = (await replayFixture()).incidents.find(item => item.label === "01");
   case01.safetyGates = case01.safetyGates.filter(gate => gate.id !== "G_DISPATCH");
   const ui = await renderers();

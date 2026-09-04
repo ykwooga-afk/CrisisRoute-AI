@@ -19,6 +19,10 @@ const {
   BriefServiceError,
   createBriefService
 } = require("./backend/briefService");
+const {
+  PublicSourceError,
+  extractPublicSource
+} = require("./backend/publicSourceExtractor");
 
 const root = __dirname;
 const srcRoot = path.resolve(root, "src");
@@ -272,6 +276,15 @@ function applySecurityHeaders(req, res, { isProduction }) {
 }
 
 function mapApiError(error) {
+  if (error instanceof PublicSourceError) {
+    return {
+      status: error.status,
+      code: error.code,
+      message: error.message,
+      retryable: error.retryable
+    };
+  }
+
   if (error instanceof BriefServiceError) {
     const statusByCode = {
       INVALID_PROOF_REQUEST: 400,
@@ -444,9 +457,52 @@ function parseCaseRoute(requestTarget) {
   return { caseId, kind: exactMatch[2] };
 }
 
+function decoratePublicSourceResult(result, publicSource) {
+  let hostname = "public source";
+  try {
+    hostname = new URL(publicSource.finalUrl).hostname;
+  } catch {}
+  const sourceMeta = {
+    originalUrl: publicSource.originalUrl,
+    finalUrl: publicSource.finalUrl,
+    title: publicSource.title || "",
+    contentType: publicSource.contentType,
+    bytesRead: publicSource.bytesRead,
+    redirected: publicSource.redirected === true
+  };
+  return {
+    ...result,
+    rawReports: [publicSource.analysisText],
+    meta: {
+      ...(result.meta || {}),
+      publicSource: sourceMeta
+    },
+    incidents: Array.isArray(result.incidents)
+      ? result.incidents.map((incident, index) => index === 0
+        ? {
+          ...incident,
+          source: `Public URL: ${hostname}`,
+          publicSource: sourceMeta,
+          evidence: Array.isArray(incident.evidence)
+            ? incident.evidence.map((item, itemIndex) => itemIndex === 0
+              ? {
+                ...item,
+                type: "public_url_extract",
+                summary: item.summary || `Readable text extracted from ${hostname}.`,
+                sourceUrl: publicSource.finalUrl
+              }
+              : item)
+            : incident.evidence
+        }
+        : incident)
+      : result.incidents
+  };
+}
+
 async function handleApi(req, res, {
   gonkaClientFactory,
   analyzeIncidentsFn,
+  publicSourceExtractor,
   decisionLedger,
   briefService,
   env,
@@ -551,6 +607,69 @@ async function handleApi(req, res, {
       const result = await analyzeIncidentsFn({ payload, client });
       decisionLedger.registerAnalysisResult(result);
       return sendJson(res, 200, result);
+    } catch (error) {
+      return sendApiError(res, error);
+    } finally {
+      lease.release();
+    }
+  }
+
+  if (req.url === "/api/public-source/analyze") {
+    if (req.method !== "POST") {
+      res.setHeader("Allow", "POST");
+      return sendJson(res, 405, {
+        ok: false,
+        error: {
+          code: "METHOD_NOT_ALLOWED",
+          message: "Method not allowed for this API route.",
+          retryable: false
+        }
+      });
+    }
+
+    if (isProduction) {
+      const readiness = runtimeReadiness({
+        env,
+        isProduction,
+        gonkaClientFactory,
+        shuttingDown: analysisProtection.isShuttingDown()
+      });
+      if (!readiness.ready) {
+        const code = readiness.errorCode === "LIVE_ANALYSIS_DISABLED"
+          ? "LIVE_ANALYSIS_DISABLED"
+          : "LIVE_CONFIGURATION_INCOMPLETE";
+        return sendFixedApiError(
+          res,
+          503,
+          code,
+          code === "LIVE_ANALYSIS_DISABLED"
+            ? "Live analysis is disabled for this deployment."
+            : "Live analysis configuration is incomplete."
+        );
+      }
+    }
+
+    const lease = analysisProtection.acquire();
+    if (lease.code) {
+      const message = lease.code === "ANALYSIS_BUSY"
+        ? "Another analysis is currently running."
+        : lease.code === "ANALYSIS_LIMIT_REACHED"
+          ? "This process has reached its analysis submission limit."
+          : "The service is shutting down.";
+      return sendFixedApiError(res, lease.status, lease.code, message, lease.code === "ANALYSIS_BUSY");
+    }
+
+    try {
+      const payload = await parseJsonBody(req);
+      const publicSource = await publicSourceExtractor(payload?.url);
+      const client = analyzeIncidentsFn === analyzeIncidents ? gonkaClientFactory() : undefined;
+      const result = await analyzeIncidentsFn({
+        payload: { messages: [publicSource.analysisText] },
+        client
+      });
+      const decorated = decoratePublicSourceResult(result, publicSource);
+      decisionLedger.registerAnalysisResult(decorated);
+      return sendJson(res, 200, decorated);
     } catch (error) {
       return sendApiError(res, error);
     } finally {
@@ -755,6 +874,7 @@ async function serveStatic(req, res) {
 function createServer({
   gonkaClientFactory = createGonkaClientFromEnv,
   analyzeIncidentsFn = analyzeIncidents,
+  publicSourceExtractor = extractPublicSource,
   decisionLedger = createDecisionLedger(),
   briefService = createBriefService({ decisionLedger }),
   env = process.env,
@@ -777,6 +897,7 @@ function createServer({
         await handleApi(req, res, {
           gonkaClientFactory,
           analyzeIncidentsFn,
+          publicSourceExtractor,
           decisionLedger,
           briefService,
           env,

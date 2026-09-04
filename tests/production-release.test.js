@@ -300,8 +300,9 @@ test("Render config, lockfile, README, and UI meet the Production release contra
   assert.match(readme, /Proof Capsule has no blockchain or external anchoring/i);
   assert.match(readme, /ephemeral/i);
   assert.match(readme, /Public URL retrieval/i);
-  assert.match(frontend, /Public URL content retrieval is not included in this demo\./);
-  assert.doesNotMatch(frontend, /Paste a crisis report or source URL/);
+  assert.match(frontend, /Paste a crisis report or public source URL/);
+  assert.match(frontend, /Publicly accessible HTTP\/HTTPS pages only/);
+  assert.doesNotMatch(frontend, /Public URL content retrieval is not included in this demo\./);
 });
 
 test("Render Blueprint pins one free Singapore web service with a manual secret", () => {

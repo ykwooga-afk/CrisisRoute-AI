@@ -1,5 +1,8 @@
 const crypto = require("node:crypto");
-const { DEFAULT_MODELS } = require("./gonkaClient");
+const {
+  DEFAULT_MODELS,
+  recordGonkaModelDataDiagnostic
+} = require("./gonkaClient");
 const {
   SCENARIO_ID,
   CASE_LABELS,
@@ -1162,6 +1165,16 @@ function safeRoleFailure(settledResults) {
         Array.isArray(item.result.reason?.issues) && item.result.reason.issues.length
           ? item.result.reason.issues
           : ["payload:no_contract_candidate"]);
+      recordGonkaModelDataDiagnostic({
+        role: failedRole,
+        model: failedRole === "analyst"
+          ? DEFAULT_MODELS.analyst
+          : failedRole === "reviewer"
+            ? DEFAULT_MODELS.reviewer
+            : "multiple",
+        sourceCode: classified[0]?.result.reason?.code || "INVALID_MODEL_DATA",
+        issues
+      });
       throw invalidModelData(failedRole, issues);
     }
     const message = code === "TIMEOUT"
@@ -1203,10 +1216,12 @@ function validateFulfilledRoleData({
   analystData,
   analystCandidates,
   analystSelector,
+  analystModel = DEFAULT_MODELS.analyst,
   reviewerValidator,
   reviewerData,
   reviewerCandidates,
-  reviewerSelector
+  reviewerSelector,
+  reviewerModel = DEFAULT_MODELS.reviewer
 }) {
   const outcomes = [
     {
@@ -1240,6 +1255,16 @@ function validateFulfilledRoleData({
       Array.isArray(outcome.error?.issues) && outcome.error.issues.length
         ? outcome.error.issues
         : ["payload:not_object"]);
+    recordGonkaModelDataDiagnostic({
+      role,
+      model: role === "analyst"
+        ? analystModel
+        : role === "reviewer"
+          ? reviewerModel
+          : "multiple",
+      sourceCode: "INVALID_MODEL_DATA",
+      issues
+    });
     throw invalidModelData(role, issues);
   }
   return {
@@ -1292,10 +1317,12 @@ async function analyzeCase01({ payload, client, now = new Date() }) {
     analystData: analystResult.data,
     analystCandidates: analystResult.candidates,
     analystSelector: selectAnalystCandidate,
+    analystModel: analystRequest.model,
     reviewerValidator: normalizeReviewerData,
     reviewerData: reviewerResult.data,
     reviewerCandidates: reviewerResult.candidates,
-    reviewerSelector: selectReviewerCandidate
+    reviewerSelector: selectReviewerCandidate,
+    reviewerModel: reviewerRequest.model
   });
   const incident = buildIncident({
     request,
@@ -1364,10 +1391,12 @@ async function analyzeFullHazeScenario({ payload, client, now = new Date() }) {
     analystData: analystResult.data,
     analystCandidates: analystResult.candidates,
     analystSelector: selectBatchAnalystCandidate,
+    analystModel: analystRequest.model,
     reviewerValidator: normalizeBatchReviewerData,
     reviewerData: reviewerResult.data,
     reviewerCandidates: reviewerResult.candidates,
-    reviewerSelector: selectBatchReviewerCandidate
+    reviewerSelector: selectBatchReviewerCandidate,
+    reviewerModel: reviewerRequest.model
   });
   const normalizedNow = now instanceof Date ? now : new Date(now);
   const incidents = request.cases.map((caseDefinition, index) => buildFullScenarioIncident({

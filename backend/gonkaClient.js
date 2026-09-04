@@ -300,7 +300,7 @@ function isRetryableHttpStatus(status) {
 }
 
 function safeDiagnosticRole(value) {
-  return value === "analyst" || value === "reviewer" ? value : "unknown";
+  return value === "analyst" || value === "reviewer" || value === "both" ? value : "unknown";
 }
 
 function safeDiagnosticString(value, maxLength = MAX_ERROR_DIAGNOSTIC_CHARS, sensitiveValues = []) {
@@ -490,6 +490,108 @@ function getLastGonkaFailureDiagnostic() {
   return lastGonkaFailureDiagnostic
     ? { ...lastGonkaFailureDiagnostic }
     : null;
+}
+
+function splitSafeIssue(issue) {
+  const safeIssue = safeDiagnosticCode(issue, "").slice(0, 120);
+  const separator = safeIssue.lastIndexOf(":");
+  if (separator < 1) return { field: safeIssue, reason: "" };
+  return {
+    field: safeIssue.slice(0, separator),
+    reason: safeIssue.slice(separator + 1)
+  };
+}
+
+function uniqueDiagnosticItems(items) {
+  return [...new Set(items.filter(item => typeof item === "string" && item.trim()))].slice(0, 8);
+}
+
+function classifyModelDataIssues(issues) {
+  const parsed = Array.isArray(issues) ? issues.map(splitSafeIssue) : [];
+  const missingFields = [];
+  const invalidFields = [];
+  const unexpectedFieldTypes = [];
+  let parseError = "";
+
+  for (const issue of parsed) {
+    if (!issue.field) continue;
+    if (issue.reason === "missing") {
+      missingFields.push(issue.field);
+      continue;
+    }
+    if (["not_object", "not_array", "not_numeric", "invalid_boolean"].includes(issue.reason)) {
+      unexpectedFieldTypes.push(issue.field);
+      continue;
+    }
+    if (
+      issue.field === "payload" ||
+      [
+        "no_contract_candidate",
+        "ambiguous_candidates",
+        "direct_array_wrong_length",
+        "string_unwrap_failed",
+        "candidate_limit_exceeded",
+        "nesting_limit_exceeded"
+      ].includes(issue.reason)
+    ) {
+      parseError = parseError || `${issue.field}:${issue.reason || "invalid"}`;
+      continue;
+    }
+    invalidFields.push(issue.field);
+  }
+
+  return {
+    missingFields: uniqueDiagnosticItems(missingFields),
+    invalidFields: uniqueDiagnosticItems(invalidFields),
+    unexpectedFieldTypes: uniqueDiagnosticItems(unexpectedFieldTypes),
+    parseError: parseError ? safeDiagnosticMessage(parseError) : ""
+  };
+}
+
+function modelFailureStage({ sourceCode, issues }) {
+  if (sourceCode === "INVALID_JSON") return "parse";
+  const parsed = Array.isArray(issues) ? issues.map(splitSafeIssue) : [];
+  if (parsed.some(issue =>
+    issue.field === "payload" ||
+    [
+      "no_contract_candidate",
+      "ambiguous_candidates",
+      "direct_array_wrong_length",
+      "string_unwrap_failed",
+      "candidate_limit_exceeded",
+      "nesting_limit_exceeded"
+    ].includes(issue.reason))) {
+    return "parse";
+  }
+  if (parsed.some(issue => ["missing", "not_object", "not_array", "not_numeric", "out_of_range"].includes(issue.reason))) {
+    return "schema_validation";
+  }
+  return "normalization";
+}
+
+function recordGonkaModelDataDiagnostic({ role, model, sourceCode = "INVALID_MODEL_DATA", issues = [] } = {}) {
+  const classified = classifyModelDataIssues(issues);
+  lastGonkaFailureDiagnostic = {
+    timestamp: new Date().toISOString(),
+    role: safeDiagnosticRole(role),
+    model: safeDiagnosticString(model, 160),
+    failureStage: modelFailureStage({ sourceCode, issues }),
+    sanitizedErrorCode: safeDiagnosticCode(sourceCode, "INVALID_MODEL_DATA"),
+    sanitizedErrorMessage: safeDiagnosticMessage(`${safeDiagnosticRole(role)} model data failed validation.`),
+    invalidFields: classified.invalidFields,
+    missingFields: classified.missingFields,
+    unexpectedFieldTypes: classified.unexpectedFieldTypes,
+    parseError: classified.parseError
+  };
+  for (const key of Object.keys(lastGonkaFailureDiagnostic)) {
+    if (
+      lastGonkaFailureDiagnostic[key] === undefined ||
+      lastGonkaFailureDiagnostic[key] === "" ||
+      (Array.isArray(lastGonkaFailureDiagnostic[key]) && lastGonkaFailureDiagnostic[key].length === 0)
+    ) {
+      delete lastGonkaFailureDiagnostic[key];
+    }
+  }
 }
 
 class GonkaClient {
@@ -720,6 +822,7 @@ module.exports = {
   GonkaClientError,
   createGonkaClientFromEnv,
   getLastGonkaFailureDiagnostic,
+  recordGonkaModelDataDiagnostic,
   extractStructuredJson,
   extractStructuredJsonCandidates,
   DEFAULT_GONKA_BASE_URL,

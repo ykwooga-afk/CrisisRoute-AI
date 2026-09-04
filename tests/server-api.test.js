@@ -218,6 +218,71 @@ test("temporary Gonka diagnostic endpoint exposes only the latest sanitized upst
   );
 });
 
+test("temporary Gonka diagnostic endpoint reports reviewer schema-validation failures safely", async t => {
+  const client = configuredFakeClient(async request => {
+    const role = request.model === DEFAULT_MODELS.analyst ? "analyst" : "reviewer";
+    const data = batchRoleData(role);
+    if (role === "reviewer") delete data.cases[0].scores.urgency;
+    return roleResult(request, data, "RAW_MODEL_CONTENT_MUST_NOT_LEAK");
+  });
+  const baseUrl = await startServer(t, createServer({ gonkaClientFactory: () => client }));
+  const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(scenarioPayload())
+  });
+  assert.equal(response.status, 502);
+
+  const diagnosticResponse = await fetch(`${baseUrl}/api/diagnostics/last-gonka-failure`);
+  const body = await diagnosticResponse.json();
+  assert.equal(diagnosticResponse.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.diagnostic.role, "reviewer");
+  assert.equal(body.diagnostic.model, DEFAULT_MODELS.reviewer);
+  assert.equal(body.diagnostic.failureStage, "schema_validation");
+  assert.equal(body.diagnostic.sanitizedErrorCode, "INVALID_MODEL_DATA");
+  assert.deepEqual(body.diagnostic.missingFields, ["cases.01.scores.urgency"]);
+  assert.ok(!Object.hasOwn(body.diagnostic, "parseError"));
+  assert.doesNotMatch(
+    JSON.stringify(body),
+    /RAW_MODEL_CONTENT|messages|system|user|counterEvidence|unknowns|prompt/i
+  );
+});
+
+test("temporary Gonka diagnostic endpoint reports reviewer parse failures safely", async t => {
+  const client = configuredFakeClient(async request => {
+    const role = request.model === DEFAULT_MODELS.analyst ? "analyst" : "reviewer";
+    if (role === "reviewer") {
+      throw new GonkaClientError("INVALID_JSON", {
+        issues: ["payload:no_contract_candidate"],
+        candidateCount: 0,
+        candidateKinds: []
+      });
+    }
+    return roleResult(request, batchRoleData(role), "RAW_MODEL_CONTENT_MUST_NOT_LEAK");
+  });
+  const baseUrl = await startServer(t, createServer({ gonkaClientFactory: () => client }));
+  const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(scenarioPayload())
+  });
+  assert.equal(response.status, 502);
+
+  const diagnosticResponse = await fetch(`${baseUrl}/api/diagnostics/last-gonka-failure`);
+  const body = await diagnosticResponse.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.diagnostic.role, "reviewer");
+  assert.equal(body.diagnostic.model, DEFAULT_MODELS.reviewer);
+  assert.equal(body.diagnostic.failureStage, "parse");
+  assert.equal(body.diagnostic.sanitizedErrorCode, "INVALID_JSON");
+  assert.equal(body.diagnostic.parseError, "payload:no_contract_candidate");
+  assert.doesNotMatch(
+    JSON.stringify(body),
+    /RAW_MODEL_CONTENT|messages|system|user|prompt/i
+  );
+});
+
 test("POST analyze returns a UI-compatible CASE 01 response through local Mock Gonka", async t => {
   const mock = await startMockGonka(t);
   const client = new GonkaClient({

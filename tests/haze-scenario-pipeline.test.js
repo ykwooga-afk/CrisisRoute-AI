@@ -26,7 +26,11 @@ const {
   analyzeCase01,
   analyzeFullHazeScenario
 } = require("../backend/incidentPipeline");
-const { DEFAULT_MODELS, extractStructuredJsonCandidates } = require("../backend/gonkaClient");
+const {
+  DEFAULT_MODELS,
+  GonkaClientError,
+  extractStructuredJsonCandidates
+} = require("../backend/gonkaClient");
 const incidentSchema = require("../src/types/incident.schema.json");
 const {
   CANONICAL_HAZE_MESSAGES,
@@ -97,6 +101,13 @@ function reviewerDirectArray() {
     label: String(index + 1).padStart(2, "0"),
     scores: structuredClone(item.scores),
     ignoredReviewerField: "DROP_REVIEWER_FIELD"
+  }));
+}
+
+function minimaxReviewerDirectArray() {
+  return reviewerBatch().cases.map(item => ({
+    caseLabel: item.caseLabel,
+    scores: structuredClone(item.scores)
   }));
 }
 
@@ -371,6 +382,96 @@ for (const roleCase of [
     assert.equal({}.polluted, undefined);
   });
 }
+
+for (const variant of [
+  {
+    name: "plain valid Reviewer JSON",
+    content: value => JSON.stringify({ cases: value })
+  },
+  {
+    name: "valid Reviewer JSON inside markdown fences",
+    content: value => `\`\`\`json\n${JSON.stringify({ cases: value })}\n\`\`\``
+  },
+  {
+    name: "prose before valid Reviewer JSON",
+    content: value => `Reviewer payload follows:\n${JSON.stringify({ cases: value })}`
+  },
+  {
+    name: "prose after valid Reviewer JSON",
+    content: value => `${JSON.stringify({ cases: value })}\nNo real-world action executed.`
+  },
+  {
+    name: "direct array with numeric case labels",
+    content: value => JSON.stringify(value)
+  },
+  {
+    name: "nested presentation wrapper",
+    content: value => JSON.stringify({ result: { cases: value } })
+  },
+  {
+    name: "escaped JSON string presentation wrapper",
+    content: value => JSON.stringify({ output_text: JSON.stringify({ cases: value }) })
+  },
+  {
+    name: "multiple JSON candidates where only one satisfies Reviewer contract",
+    content: value => `${JSON.stringify({ note: "metadata" })}\n${JSON.stringify({ answer: { cases: value } })}`
+  }
+]) {
+  test(`Reviewer selector accepts MiniMax-compatible ${variant.name}`, () => {
+    const selected = selectBatchReviewerCandidate(candidatesFrom(variant.content(minimaxReviewerDirectArray())));
+    assert.deepEqual(selected.cases.map(item => item.label), ["01", "02", "03", "04", "05"]);
+    assert.deepEqual(Object.keys(selected.cases[0]), ["label", "scores"]);
+  });
+}
+
+test("Reviewer selector rejects malformed MiniMax JSON safely", () => {
+  assert.throws(
+    () => candidatesFrom("```json\n[{broken]\n```"),
+    error => error.code === "INVALID_JSON" &&
+      error.issues.includes("payload:no_contract_candidate") &&
+      !JSON.stringify(error).includes("broken")
+  );
+});
+
+test("Reviewer selector rejects valid JSON that does not satisfy Reviewer schema", () => {
+  assert.throws(
+    () => selectBatchReviewerCandidate(candidatesFrom(JSON.stringify({
+      result: {
+        cases: [
+          { label: "01", scores: { verification: 10, actionability: 30 } }
+        ]
+      }
+    }))),
+    error => error.code === "INVALID_MODEL_DATA" &&
+      error.role === "reviewer" &&
+      error.issues.includes("payload:no_contract_candidate")
+  );
+});
+
+test("full scenario maps malformed Reviewer JSON to INVALID_MODEL_DATA without partial output", async () => {
+  const client = {
+    async completeJson(request) {
+      if (request.model === DEFAULT_MODELS.reviewer) {
+        throw new GonkaClientError("INVALID_JSON", {
+          issues: ["payload:no_contract_candidate"],
+          candidateCount: 0,
+          candidateKinds: []
+        });
+      }
+      return {
+        candidates: candidatesFrom(JSON.stringify(analystBatch())),
+        trace: trace(request.model, "analyst")
+      };
+    }
+  };
+
+  await assert.rejects(
+    () => analyzeFullHazeScenario({ payload: payload(), client }),
+    error => error.code === "INVALID_MODEL_DATA" &&
+      error.role === "reviewer" &&
+      error.issues.includes("payload:no_contract_candidate")
+  );
+});
 
 test("CASE 01 role selectors retain Object-only contracts", () => {
   const analyst = analystBatch().cases[0];

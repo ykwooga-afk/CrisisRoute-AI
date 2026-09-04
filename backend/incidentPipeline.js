@@ -1,6 +1,8 @@
 const crypto = require("node:crypto");
 const {
   DEFAULT_MODELS,
+  MAX_JSON_CANDIDATES,
+  extractStructuredJsonCandidates,
   recordGonkaModelDataDiagnostic
 } = require("./gonkaClient");
 const {
@@ -417,6 +419,125 @@ function normalizeBatchReviewerData(value) {
   return normalizeBatchData(value, "reviewer");
 }
 
+const PRESENTATION_WRAPPER_KEYS = new Set([
+  "answer",
+  "assessment",
+  "content",
+  "data",
+  "final",
+  "finalAnswer",
+  "final_answer",
+  "json",
+  "message",
+  "output",
+  "output_text",
+  "payload",
+  "response",
+  "result",
+  "results",
+  "review",
+  "reviewer",
+  "structured",
+  "structured_output",
+  "text"
+]);
+const MAX_PRESENTATION_WRAPPER_DEPTH = 4;
+
+function normalizeCandidateBatchLabel(item) {
+  if (!isObject(item)) return null;
+  const value = Object.hasOwn(item, "label")
+    ? item.label
+    : Object.hasOwn(item, "caseLabel")
+      ? item.caseLabel
+      : item.case_label;
+  return normalizeCaseLabel(value);
+}
+
+function looksLikeDirectBatchArray(value) {
+  return Array.isArray(value) &&
+    value.length === CASE_LABELS.length &&
+    value.every(item => normalizeCandidateBatchLabel(item) !== null);
+}
+
+function stripOuterMarkdownFence(value) {
+  const match = value.match(/^```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*?)\r?\n?```$/);
+  return match ? match[1].trim() : "";
+}
+
+function parsePresentationText(value) {
+  const texts = [value];
+  const stripped = stripOuterMarkdownFence(value.trim());
+  if (stripped) texts.push(stripped);
+
+  const parsed = [];
+  for (const text of texts) {
+    try {
+      const extracted = extractStructuredJsonCandidates(text);
+      for (const candidate of extracted.candidates) {
+        if (candidate.kind === "object" || candidate.kind === "array") {
+          parsed.push(candidate.value);
+        }
+      }
+    } catch {
+      // Presentation wrapper text is optional; invalid text remains non-diagnostic.
+    }
+  }
+  return parsed;
+}
+
+function wrapperKeysFor(value) {
+  const keys = Object.keys(value);
+  const wrappers = keys.filter(key => PRESENTATION_WRAPPER_KEYS.has(key));
+  if (wrappers.length) return wrappers;
+  if (keys.length === 1 && !Object.hasOwn(value, "cases") && !Object.hasOwn(value, "scores")) {
+    return keys;
+  }
+  return [];
+}
+
+function expandPresentationWrappedValues(root, { allowDirectBatchArray = false } = {}) {
+  const expanded = [];
+  const seen = new Set();
+  const queue = [{ value: root, depth: 0 }];
+
+  while (queue.length && expanded.length < MAX_JSON_CANDIDATES) {
+    const { value, depth } = queue.shift();
+    if (isObject(value) || Array.isArray(value)) {
+      const identity = JSON.stringify(value);
+      if (!seen.has(identity)) {
+        seen.add(identity);
+        expanded.push(value);
+      }
+      if (depth >= MAX_PRESENTATION_WRAPPER_DEPTH) continue;
+
+      if (Array.isArray(value)) {
+        if (!allowDirectBatchArray) continue;
+        if (looksLikeDirectBatchArray(value) || value.length > MAX_JSON_CANDIDATES) continue;
+        for (const item of value) {
+          if (isObject(item) || typeof item === "string") queue.push({ value: item, depth: depth + 1 });
+        }
+        continue;
+      }
+
+      for (const key of wrapperKeysFor(value)) {
+        const nested = value[key];
+        if (isObject(nested) || Array.isArray(nested) || typeof nested === "string") {
+          queue.push({ value: nested, depth: depth + 1 });
+        }
+      }
+      continue;
+    }
+
+    if (typeof value === "string" && depth < MAX_PRESENTATION_WRAPPER_DEPTH) {
+      for (const parsed of parsePresentationText(value)) {
+        queue.push({ value: parsed, depth: depth + 1 });
+      }
+    }
+  }
+
+  return expanded;
+}
+
 function selectContractCandidate(extracted, { role, validator, allowDirectBatchArray = false }) {
   const candidates = Array.isArray(extracted?.candidates) ? extracted.candidates : [];
   const diagnostics = Array.isArray(extracted?.issues) ? [...extracted.issues] : [];
@@ -424,31 +545,33 @@ function selectContractCandidate(extracted, { role, validator, allowDirectBatchA
 
   for (const candidate of candidates) {
     if (!candidate || !["object", "array"].includes(candidate.kind)) continue;
-    let value = candidate.value;
-    if (candidate.kind === "array") {
-      if (!allowDirectBatchArray) continue;
-      if (value.length !== CASE_LABELS.length) {
-        diagnostics.push("payload:direct_array_wrong_length");
-        continue;
+    for (const candidateValue of expandPresentationWrappedValues(candidate.value, { allowDirectBatchArray })) {
+      let value = candidateValue;
+      if (Array.isArray(value)) {
+        if (!allowDirectBatchArray) continue;
+        if (value.length !== CASE_LABELS.length) {
+          diagnostics.push("payload:direct_array_wrong_length");
+          continue;
+        }
+        const directLabels = value.map(normalizeCandidateBatchLabel);
+        if (
+          directLabels.some(label => !CASE_LABELS.includes(label)) ||
+          new Set(directLabels).size !== CASE_LABELS.length ||
+          CASE_LABELS.some(label => !directLabels.includes(label))
+        ) {
+          continue;
+        }
+        value = { cases: value };
       }
-      const directLabels = value.map(item => isObject(item) ? item.label : null);
-      if (
-        directLabels.some(label => typeof label !== "string" || !CASE_LABELS.includes(label)) ||
-        new Set(directLabels).size !== CASE_LABELS.length ||
-        CASE_LABELS.some(label => !directLabels.includes(label))
-      ) {
-        continue;
-      }
-      value = { cases: value };
-    }
 
-    try {
-      const normalized = validator(value);
-      const identity = JSON.stringify(normalized);
-      if (!distinct.has(identity)) distinct.set(identity, normalized);
-    } catch (error) {
-      if (!(error instanceof IncidentPipelineError) || error.code !== "INVALID_MODEL_DATA") {
-        throw error;
+      try {
+        const normalized = validator(value);
+        const identity = JSON.stringify(normalized);
+        if (!distinct.has(identity)) distinct.set(identity, normalized);
+      } catch (error) {
+        if (!(error instanceof IncidentPipelineError) || error.code !== "INVALID_MODEL_DATA") {
+          throw error;
+        }
       }
     }
   }

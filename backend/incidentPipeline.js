@@ -84,7 +84,7 @@ function sanitizeRoleErrors(roleErrors) {
 }
 
 class IncidentPipelineError extends Error {
-  constructor(code, message, { retryable = false, role, issues = [], roleErrors } = {}) {
+  constructor(code, message, { retryable = false, role, issues = [], roleErrors, modelDataDiagnostics } = {}) {
     super(message);
     this.name = "IncidentPipelineError";
     this.code = code;
@@ -94,6 +94,9 @@ class IncidentPipelineError extends Error {
     if (safeIssues.length) this.issues = safeIssues;
     const safeRoleErrors = sanitizeRoleErrors(roleErrors);
     if (safeRoleErrors) this.roleErrors = safeRoleErrors;
+    if (modelDataDiagnostics && typeof modelDataDiagnostics === "object" && !Array.isArray(modelDataDiagnostics)) {
+      this.modelDataDiagnostics = modelDataDiagnostics;
+    }
   }
 
   toPublicError() {
@@ -173,12 +176,12 @@ function invalidScenarioInput() {
   );
 }
 
-function invalidModelData(role, issues) {
+function invalidModelData(role, issues, { modelDataDiagnostics } = {}) {
   const displayRole = role === "analyst" ? "Analyst" : role === "reviewer" ? "Reviewer" : "One or more";
   return new IncidentPipelineError(
     "INVALID_MODEL_DATA",
     `${displayRole} model data was invalid.`,
-    { role, issues }
+    { role, issues, modelDataDiagnostics }
   );
 }
 
@@ -419,6 +422,22 @@ function normalizeBatchReviewerData(value) {
   return normalizeBatchData(value, "reviewer");
 }
 
+function mergeModelDataDiagnostics(...items) {
+  const merged = {};
+  for (const item of items) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    for (const [key, value] of Object.entries(item)) {
+      if (Array.isArray(value)) {
+        const existing = Array.isArray(merged[key]) ? merged[key] : [];
+        merged[key] = [...new Set([...existing, ...value].filter(entry => typeof entry === "string"))].slice(0, 12);
+      } else if (value !== undefined) {
+        merged[key] = value;
+      }
+    }
+  }
+  return merged;
+}
+
 const PRESENTATION_WRAPPER_KEYS = new Set([
   "answer",
   "assessment",
@@ -485,6 +504,29 @@ function parsePresentationText(value) {
   return parsed;
 }
 
+function diagnosticTopLevelKey(value) {
+  if (Array.isArray(value)) return "array";
+  if (!isObject(value)) return "wrong_root_type";
+  const keys = Object.keys(value)
+    .map(key => key.replace(/[^\w:./-]+/g, "_").slice(0, 80))
+    .filter(Boolean)
+    .slice(0, 6);
+  return keys.length ? `object:${keys.join(",")}` : "object";
+}
+
+function addDiagnosticReason(reasons, reason) {
+  const safe = sanitizeIssues([reason]);
+  if (safe.length && !reasons.includes(safe[0]) && reasons.length < 12) reasons.push(safe[0]);
+}
+
+function addDiagnosticReasons(reasons, issues, fallback = "payload:not_object") {
+  const safe = sanitizeIssues(Array.isArray(issues) && issues.length ? issues : [fallback]);
+  for (const issue of safe) {
+    if (!reasons.includes(issue)) reasons.push(issue);
+    if (reasons.length === 12) break;
+  }
+}
+
 function wrapperKeysFor(value) {
   const keys = Object.keys(value);
   const wrappers = keys.filter(key => PRESENTATION_WRAPPER_KEYS.has(key));
@@ -542,15 +584,28 @@ function selectContractCandidate(extracted, { role, validator, allowDirectBatchA
   const candidates = Array.isArray(extracted?.candidates) ? extracted.candidates : [];
   const diagnostics = Array.isArray(extracted?.issues) ? [...extracted.issues] : [];
   const distinct = new Map();
+  const candidateTopLevelKeys = [];
+  const candidateRejectionReasons = [];
 
   for (const candidate of candidates) {
-    if (!candidate || !["object", "array"].includes(candidate.kind)) continue;
+    if (!candidate || !["object", "array"].includes(candidate.kind)) {
+      addDiagnosticReason(candidateRejectionReasons, "payload:not_object");
+      continue;
+    }
     for (const candidateValue of expandPresentationWrappedValues(candidate.value, { allowDirectBatchArray })) {
       let value = candidateValue;
+      const topLevelKey = diagnosticTopLevelKey(value);
+      if (!candidateTopLevelKeys.includes(topLevelKey) && candidateTopLevelKeys.length < 8) {
+        candidateTopLevelKeys.push(topLevelKey);
+      }
       if (Array.isArray(value)) {
-        if (!allowDirectBatchArray) continue;
+        if (!allowDirectBatchArray) {
+          addDiagnosticReason(candidateRejectionReasons, "payload:not_object");
+          continue;
+        }
         if (value.length !== CASE_LABELS.length) {
           diagnostics.push("payload:direct_array_wrong_length");
+          addDiagnosticReason(candidateRejectionReasons, "payload:direct_array_wrong_length");
           continue;
         }
         const directLabels = value.map(normalizeCandidateBatchLabel);
@@ -559,6 +614,7 @@ function selectContractCandidate(extracted, { role, validator, allowDirectBatchA
           new Set(directLabels).size !== CASE_LABELS.length ||
           CASE_LABELS.some(label => !directLabels.includes(label))
         ) {
+          addDiagnosticReason(candidateRejectionReasons, "cases:unknown_label");
           continue;
         }
         value = { cases: value };
@@ -572,6 +628,7 @@ function selectContractCandidate(extracted, { role, validator, allowDirectBatchA
         if (!(error instanceof IncidentPipelineError) || error.code !== "INVALID_MODEL_DATA") {
           throw error;
         }
+        addDiagnosticReasons(candidateRejectionReasons, error.issues);
       }
     }
   }
@@ -584,7 +641,14 @@ function selectContractCandidate(extracted, { role, validator, allowDirectBatchA
         "payload:no_contract_candidate",
         ...diagnostics.filter(issue => typeof issue === "string" && issue.startsWith("payload:"))
       ];
-  throw invalidModelData(role, issues);
+  throw invalidModelData(role, issues, {
+    modelDataDiagnostics: {
+      extractedJsonCandidateCount: candidates.length,
+      contractCandidateCount: distinct.size,
+      candidateTopLevelKeys,
+      candidateRejectionReasons
+    }
+  });
 }
 
 function selectAnalystCandidate(extracted) {
@@ -1296,7 +1360,10 @@ function safeRoleFailure(settledResults) {
             ? DEFAULT_MODELS.reviewer
             : "multiple",
         sourceCode: classified[0]?.result.reason?.code || "INVALID_MODEL_DATA",
-        issues
+        issues,
+        shapeDiagnostics: mergeModelDataDiagnostics(
+          ...classified.map(item => item.result.reason?.shapeDiagnostics)
+        )
       });
       throw invalidModelData(failedRole, issues);
     }
@@ -1340,11 +1407,13 @@ function validateFulfilledRoleData({
   analystCandidates,
   analystSelector,
   analystModel = DEFAULT_MODELS.analyst,
+  analystDiagnostics,
   reviewerValidator,
   reviewerData,
   reviewerCandidates,
   reviewerSelector,
-  reviewerModel = DEFAULT_MODELS.reviewer
+  reviewerModel = DEFAULT_MODELS.reviewer,
+  reviewerDiagnostics
 }) {
   const outcomes = [
     {
@@ -1352,14 +1421,16 @@ function validateFulfilledRoleData({
       validator: analystValidator,
       data: analystData,
       candidates: analystCandidates,
-      selector: analystSelector
+      selector: analystSelector,
+      diagnostics: analystDiagnostics
     },
     {
       role: "reviewer",
       validator: reviewerValidator,
       data: reviewerData,
       candidates: reviewerCandidates,
-      selector: reviewerSelector
+      selector: reviewerSelector,
+      diagnostics: reviewerDiagnostics
     }
   ].map(item => {
     try {
@@ -1368,7 +1439,11 @@ function validateFulfilledRoleData({
         : validateRoleData(item.role, item.validator, item.data);
       return { role: item.role, value };
     } catch (error) {
-      return { role: item.role, error };
+      return {
+        role: item.role,
+        error,
+        diagnostics: mergeModelDataDiagnostics(item.diagnostics, error?.modelDataDiagnostics)
+      };
     }
   });
   const failures = outcomes.filter(outcome => outcome.error);
@@ -1386,7 +1461,8 @@ function validateFulfilledRoleData({
           ? reviewerModel
           : "multiple",
       sourceCode: "INVALID_MODEL_DATA",
-      issues
+      issues,
+      shapeDiagnostics: mergeModelDataDiagnostics(...failures.map(outcome => outcome.diagnostics))
     });
     throw invalidModelData(role, issues);
   }
@@ -1441,11 +1517,13 @@ async function analyzeCase01({ payload, client, now = new Date() }) {
     analystCandidates: analystResult.candidates,
     analystSelector: selectAnalystCandidate,
     analystModel: analystRequest.model,
+    analystDiagnostics: analystResult.diagnostics,
     reviewerValidator: normalizeReviewerData,
     reviewerData: reviewerResult.data,
     reviewerCandidates: reviewerResult.candidates,
     reviewerSelector: selectReviewerCandidate,
-    reviewerModel: reviewerRequest.model
+    reviewerModel: reviewerRequest.model,
+    reviewerDiagnostics: reviewerResult.diagnostics
   });
   const incident = buildIncident({
     request,
@@ -1515,11 +1593,13 @@ async function analyzeFullHazeScenario({ payload, client, now = new Date() }) {
     analystCandidates: analystResult.candidates,
     analystSelector: selectBatchAnalystCandidate,
     analystModel: analystRequest.model,
+    analystDiagnostics: analystResult.diagnostics,
     reviewerValidator: normalizeBatchReviewerData,
     reviewerData: reviewerResult.data,
     reviewerCandidates: reviewerResult.candidates,
     reviewerSelector: selectBatchReviewerCandidate,
-    reviewerModel: reviewerRequest.model
+    reviewerModel: reviewerRequest.model,
+    reviewerDiagnostics: reviewerResult.diagnostics
   });
   const normalizedNow = now instanceof Date ? now : new Date(now);
   const incidents = request.cases.map((caseDefinition, index) => buildFullScenarioIncident({

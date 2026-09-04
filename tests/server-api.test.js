@@ -283,6 +283,83 @@ test("temporary Gonka diagnostic endpoint reports reviewer parse failures safely
   );
 });
 
+test("temporary Gonka diagnostic endpoint reports MiniMax reviewer response shape safely", async t => {
+  const rawSentinel = "RAW_MINIMAX_CONTENT_MUST_NOT_LEAK";
+  const upstream = http.createServer(async (req, res) => {
+    const request = JSON.parse(await readBody(req));
+    const role = request.model === DEFAULT_MODELS.analyst ? "analyst" : "reviewer";
+    const content = role === "analyst"
+      ? JSON.stringify(batchRoleData("analyst"))
+      : JSON.stringify({
+          response: {
+            entries: [
+              { case: "01", value: rawSentinel },
+              { case: "02", value: "not the reviewer contract" }
+            ]
+          }
+        });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: `${role}-shape-id`,
+      model: request.model,
+      choices: [{
+        message: {
+          role: "assistant",
+          content,
+          reasoning_content: "PRIVATE_REASONING_MUST_NOT_LEAK",
+          tool_calls: []
+        },
+        finish_reason: "stop"
+      }],
+      usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 }
+    }));
+  });
+  const upstreamBaseUrl = await startServer(t, upstream);
+  const baseUrl = await startServer(t, createServer({
+    gonkaClientFactory: () => new GonkaClient({
+      apiKey: "server-api-fake-token",
+      baseUrl: `${upstreamBaseUrl}/v1`
+    })
+  }));
+
+  const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(scenarioPayload())
+  });
+  assert.equal(response.status, 502);
+
+  const diagnosticResponse = await fetch(`${baseUrl}/api/diagnostics/last-gonka-failure`);
+  const body = await diagnosticResponse.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.diagnostic.role, "reviewer");
+  assert.equal(body.diagnostic.model, DEFAULT_MODELS.reviewer);
+  assert.equal(body.diagnostic.failureStage, "parse");
+  assert.equal(body.diagnostic.sanitizedErrorCode, "INVALID_MODEL_DATA");
+  assert.equal(body.diagnostic.parseError, "payload:no_contract_candidate");
+  assert.equal(body.diagnostic.choicesCount, 1);
+  assert.ok(body.diagnostic.firstChoiceKeys.includes("message"));
+  assert.equal(body.diagnostic.messagePresent, true);
+  assert.ok(body.diagnostic.messageKeys.includes("content"));
+  assert.equal(body.diagnostic.messageContentType, "string");
+  assert.ok(body.diagnostic.messageContentLength > 0);
+  assert.equal(body.diagnostic.reasoningContentPresent, true);
+  assert.equal(body.diagnostic.reasoningContentType, "string");
+  assert.equal(body.diagnostic.toolCallsPresent, true);
+  assert.equal(body.diagnostic.toolCallsCount, 0);
+  assert.equal(body.diagnostic.functionCallPresent, false);
+  assert.equal(body.diagnostic.parsedPayloadType, "object");
+  assert.deepEqual(body.diagnostic.parsedTopLevelKeys, ["response"]);
+  assert.equal(body.diagnostic.extractedJsonCandidateCount, 1);
+  assert.equal(body.diagnostic.contractCandidateCount, 0);
+  assert.ok(body.diagnostic.candidateTopLevelKeys.includes("object:response"));
+  assert.ok(body.diagnostic.candidateRejectionReasons.includes("cases:not_array"));
+  assert.doesNotMatch(
+    JSON.stringify(body),
+    /RAW_MINIMAX_CONTENT|PRIVATE_REASONING|messages|system|user|prompt|authorization|Bearer/i
+  );
+});
+
 test("POST analyze returns a UI-compatible CASE 01 response through local Mock Gonka", async t => {
   const mock = await startMockGonka(t);
   const client = new GonkaClient({

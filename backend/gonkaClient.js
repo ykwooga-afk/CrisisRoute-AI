@@ -48,7 +48,8 @@ class GonkaClientError extends Error {
     issues,
     candidateCount,
     candidateKinds,
-    upstream
+    upstream,
+    shapeDiagnostics
   } = {}) {
     super(ERROR_MESSAGES[code] || "Gonka client error.");
     this.name = "GonkaClientError";
@@ -72,6 +73,9 @@ class GonkaClientError extends Error {
     if (safeKinds.length) this.candidateKinds = safeKinds;
     if (upstream && typeof upstream === "object" && !Array.isArray(upstream)) {
       this.upstream = sanitizeUpstreamDiagnostics(upstream);
+    }
+    if (shapeDiagnostics && typeof shapeDiagnostics === "object" && !Array.isArray(shapeDiagnostics)) {
+      this.shapeDiagnostics = sanitizeShapeDiagnostics(shapeDiagnostics);
     }
   }
 
@@ -344,6 +348,168 @@ function safeDiagnosticMessage(value) {
   );
 }
 
+function safeDiagnosticKeys(value, maxItems = 12) {
+  if (!isJsonObject(value)) return [];
+  return Object.keys(value)
+    .map(key => safeDiagnosticCode(key))
+    .filter(Boolean)
+    .slice(0, maxItems);
+}
+
+function safeDiagnosticList(value, maxItems = 8) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value
+    .filter(item => typeof item === "string")
+    .map(item => safeDiagnosticCode(item, "unknown"))
+    .filter(Boolean))]
+    .slice(0, maxItems);
+}
+
+function safeDiagnosticInteger(value, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+  return Number.isInteger(value) && value >= min
+    ? Math.min(value, max)
+    : undefined;
+}
+
+function safeDiagnosticBoolean(value) {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function safeDiagnosticValueType(value) {
+  const kind = jsonValueKind(value);
+  return SAFE_CANDIDATE_KINDS.has(kind) ? kind : "unknown";
+}
+
+function safeDiagnosticLength(value) {
+  if (typeof value === "string" || Array.isArray(value)) return Math.min(value.length, MAX_RESPONSE_BYTES);
+  return undefined;
+}
+
+function candidateTopLevelKey(value) {
+  if (Array.isArray(value)) return "array";
+  if (isJsonObject(value)) {
+    const keys = safeDiagnosticKeys(value, 6);
+    return keys.length ? `object:${keys.join(",")}` : "object";
+  }
+  return safeDiagnosticValueType(value);
+}
+
+function contentParseShape(content) {
+  if (typeof content !== "string") {
+    return {
+      parsedPayloadType: safeDiagnosticValueType(content),
+      parsedTopLevelKeys: isJsonObject(content) ? safeDiagnosticKeys(content) : []
+    };
+  }
+  try {
+    const parsed = JSON.parse(content.trim());
+    return {
+      parsedPayloadType: safeDiagnosticValueType(parsed),
+      parsedTopLevelKeys: isJsonObject(parsed) ? safeDiagnosticKeys(parsed) : []
+    };
+  } catch {
+    return {
+      parsedPayloadType: "unparseable_text",
+      parsedTopLevelKeys: []
+    };
+  }
+}
+
+function pickReasoningContent(choice, message) {
+  for (const source of [message, choice]) {
+    if (!isJsonObject(source)) continue;
+    for (const key of ["reasoning_content", "reasoningContent"]) {
+      if (Object.hasOwn(source, key)) return source[key];
+    }
+  }
+  return undefined;
+}
+
+function buildGonkaResponseShapeDiagnostics({ payload, choice, extracted } = {}) {
+  const safeChoice = isJsonObject(choice) ? choice : {};
+  const message = isJsonObject(safeChoice.message) ? safeChoice.message : null;
+  const content = message ? message.content : undefined;
+  const reasoningContent = pickReasoningContent(safeChoice, message);
+  const toolCalls = message && (Array.isArray(message.tool_calls) ? message.tool_calls : message.toolCalls);
+  const functionCall = message && (message.function_call || message.functionCall);
+  const parseShape = contentParseShape(content);
+  const candidates = Array.isArray(extracted?.candidates) ? extracted.candidates : [];
+
+  return {
+    choicesCount: Array.isArray(payload?.choices) ? payload.choices.length : undefined,
+    firstChoiceKeys: safeDiagnosticKeys(safeChoice),
+    messagePresent: message !== null,
+    messageKeys: safeDiagnosticKeys(message),
+    messageContentType: content === undefined ? "missing" : safeDiagnosticValueType(content),
+    messageContentLength: safeDiagnosticLength(content),
+    reasoningContentPresent: reasoningContent !== undefined,
+    reasoningContentType: reasoningContent === undefined ? undefined : safeDiagnosticValueType(reasoningContent),
+    reasoningContentLength: safeDiagnosticLength(reasoningContent),
+    toolCallsPresent: Array.isArray(toolCalls),
+    toolCallsCount: Array.isArray(toolCalls) ? toolCalls.length : undefined,
+    functionCallPresent: functionCall !== undefined,
+    parsedPayloadType: parseShape.parsedPayloadType,
+    parsedTopLevelKeys: parseShape.parsedTopLevelKeys,
+    extractedJsonCandidateCount: Number.isInteger(extracted?.candidateCount)
+      ? extracted.candidateCount
+      : candidates.length,
+    candidateTopLevelKeys: candidates.map(candidate => candidateTopLevelKey(candidate.value))
+  };
+}
+
+function sanitizeShapeDiagnostics(value) {
+  const safe = {};
+  const integerFields = new Set([
+    "choicesCount",
+    "messageContentLength",
+    "reasoningContentLength",
+    "toolCallsCount",
+    "extractedJsonCandidateCount",
+    "contractCandidateCount"
+  ]);
+  const booleanFields = new Set([
+    "messagePresent",
+    "reasoningContentPresent",
+    "toolCallsPresent",
+    "functionCallPresent"
+  ]);
+  const listFields = new Set([
+    "firstChoiceKeys",
+    "messageKeys",
+    "parsedTopLevelKeys",
+    "candidateTopLevelKeys",
+    "candidateRejectionReasons"
+  ]);
+  const stringFields = new Set([
+    "messageContentType",
+    "reasoningContentType",
+    "parsedPayloadType"
+  ]);
+
+  for (const [key, diagnosticValue] of Object.entries(value || {})) {
+    if (integerFields.has(key)) {
+      const integer = safeDiagnosticInteger(diagnosticValue);
+      if (integer !== undefined) safe[key] = integer;
+      continue;
+    }
+    if (booleanFields.has(key)) {
+      const bool = safeDiagnosticBoolean(diagnosticValue);
+      if (bool !== undefined) safe[key] = bool;
+      continue;
+    }
+    if (listFields.has(key)) {
+      const list = safeDiagnosticList(diagnosticValue, key === "candidateRejectionReasons" ? 12 : 8);
+      if (list.length) safe[key] = list;
+      continue;
+    }
+    if (stringFields.has(key)) {
+      const text = safeDiagnosticCode(diagnosticValue, "unknown");
+      if (text) safe[key] = text;
+    }
+  }
+  return safe;
+}
+
 function firstSafeField(source, fields) {
   if (!isJsonObject(source)) return "";
   for (const field of fields) {
@@ -569,7 +735,7 @@ function modelFailureStage({ sourceCode, issues }) {
   return "normalization";
 }
 
-function recordGonkaModelDataDiagnostic({ role, model, sourceCode = "INVALID_MODEL_DATA", issues = [] } = {}) {
+function recordGonkaModelDataDiagnostic({ role, model, sourceCode = "INVALID_MODEL_DATA", issues = [], shapeDiagnostics } = {}) {
   const classified = classifyModelDataIssues(issues);
   lastGonkaFailureDiagnostic = {
     timestamp: new Date().toISOString(),
@@ -581,7 +747,8 @@ function recordGonkaModelDataDiagnostic({ role, model, sourceCode = "INVALID_MOD
     invalidFields: classified.invalidFields,
     missingFields: classified.missingFields,
     unexpectedFieldTypes: classified.unexpectedFieldTypes,
-    parseError: classified.parseError
+    parseError: classified.parseError,
+    ...sanitizeShapeDiagnostics(shapeDiagnostics)
   };
   for (const key of Object.keys(lastGonkaFailureDiagnostic)) {
     if (
@@ -754,7 +921,19 @@ class GonkaClient {
         });
       }
 
-      const extracted = extractStructuredJsonCandidates(choice.message.content);
+      let extracted;
+      try {
+        extracted = extractStructuredJsonCandidates(choice.message.content);
+      } catch (error) {
+        if (error instanceof GonkaClientError && error.code === "INVALID_JSON") {
+          error.shapeDiagnostics = buildGonkaResponseShapeDiagnostics({ payload, choice, extracted: {
+            candidateCount: error.candidateCount,
+            candidates: [],
+            candidateKinds: error.candidateKinds || []
+          } });
+        }
+        throw error;
+      }
       const data = returnCandidates ? undefined : selectLegacyObject(extracted);
       const trace = {
         responseId: payload.id,
@@ -769,7 +948,7 @@ class GonkaClient {
       };
 
       return returnCandidates
-        ? { candidates: extracted, trace }
+        ? { candidates: extracted, trace, diagnostics: buildGonkaResponseShapeDiagnostics({ payload, choice, extracted }) }
         : { data, trace };
     } catch (error) {
       if (controller.signal.aborted) {

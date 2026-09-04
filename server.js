@@ -4,6 +4,7 @@ const path = require("path");
 const {
   GonkaClientError,
   createGonkaClientFromEnv,
+  getLastGonkaFailureDiagnostic,
   DEFAULT_GONKA_BASE_URL,
   DEFAULT_MODELS
 } = require("./backend/gonkaClient");
@@ -509,6 +510,13 @@ async function handleApi(req, res, {
   isProduction,
   analysisProtection
 }) {
+  if (req.method === "GET" && req.url === "/api/diagnostics/last-gonka-failure") {
+    return sendJson(res, 200, {
+      ok: true,
+      diagnostic: getLastGonkaFailureDiagnostic()
+    });
+  }
+
   if (req.method === "GET" && req.url === "/api/health/ready") {
     const readiness = runtimeReadiness({
       env,

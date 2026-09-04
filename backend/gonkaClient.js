@@ -10,9 +10,11 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_ERROR_DIAGNOSTIC_BYTES = 8 * 1024;
 const MAX_ERROR_DIAGNOSTIC_CHARS = 700;
+const MAX_PUBLIC_DIAGNOSTIC_MESSAGE_CHARS = 200;
 const MAX_JSON_CANDIDATES = 8;
 const MAX_JSON_NESTING_DEPTH = 64;
 const clientSecrets = new WeakMap();
+let lastGonkaFailureDiagnostic = null;
 
 const ERROR_MESSAGES = Object.freeze({
   MISSING_API_KEY: "Gonka API key is not configured.",
@@ -330,6 +332,75 @@ function sanitizeUpstreamDiagnostics(value) {
   return upstream;
 }
 
+function safeDiagnosticCode(value, fallback = "") {
+  const code = safeDiagnosticString(String(value || fallback), 80);
+  return code.replace(/[^\w:./-]+/g, "_").slice(0, 80);
+}
+
+function safeDiagnosticMessage(value) {
+  return safeDiagnosticString(
+    typeof value === "string" ? value : "",
+    MAX_PUBLIC_DIAGNOSTIC_MESSAGE_CHARS
+  );
+}
+
+function firstSafeField(source, fields) {
+  if (!isJsonObject(source)) return "";
+  for (const field of fields) {
+    const value = source[field];
+    if (typeof value === "string" || typeof value === "number") return String(value);
+  }
+  return "";
+}
+
+function extractKnownSafeErrorFields(errorExcerpt) {
+  const fallback = { code: "", message: safeDiagnosticMessage(errorExcerpt) };
+  if (!errorExcerpt) return fallback;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(errorExcerpt);
+  } catch {
+    return fallback;
+  }
+
+  const candidates = [
+    parsed,
+    parsed?.error,
+    parsed?.error?.error,
+    Array.isArray(parsed?.errors) ? parsed.errors[0] : null
+  ].filter(isJsonObject);
+  for (const candidate of candidates) {
+    const code = firstSafeField(candidate, [
+      "code",
+      "errorCode",
+      "error_code",
+      "type",
+      "errorType",
+      "error_type",
+      "reason"
+    ]);
+    const message = firstSafeField(candidate, [
+      "message",
+      "errorMessage",
+      "error_message",
+      "detail",
+      "description"
+    ]);
+    if (code || message) {
+      return {
+        code: safeDiagnosticCode(code),
+        message: safeDiagnosticMessage(message)
+      };
+    }
+  }
+
+  if (typeof parsed?.error === "string") {
+    return { code: "", message: safeDiagnosticMessage(parsed.error) };
+  }
+  return { code: "", message: "" };
+}
+
 async function readBoundedErrorText(response, sensitiveValues = []) {
   if (!response?.body || typeof response.body.getReader !== "function") {
     try {
@@ -381,7 +452,6 @@ function shouldLogGonkaDiagnostics() {
 }
 
 function logGonkaDiagnostic(event) {
-  if (!shouldLogGonkaDiagnostics()) return;
   const safe = {
     event: "gonka_upstream_diagnostic",
     role: safeDiagnosticRole(event.role),
@@ -397,7 +467,29 @@ function logGonkaDiagnostic(event) {
   for (const key of Object.keys(safe)) {
     if (safe[key] === undefined || safe[key] === "") delete safe[key];
   }
-  console.error(JSON.stringify(safe));
+  const upstreamError = extractKnownSafeErrorFields(safe.errorExcerpt || "");
+  lastGonkaFailureDiagnostic = {
+    timestamp: new Date().toISOString(),
+    role: safe.role,
+    model: safe.model,
+    upstreamStatus: safe.status,
+    durationMs: safe.durationMs,
+    upstreamRequestId: safe.requestId,
+    sanitizedErrorCode: safeDiagnosticCode(upstreamError.code, safe.classification),
+    sanitizedErrorMessage: upstreamError.message || safeDiagnosticMessage(safe.classification)
+  };
+  for (const key of Object.keys(lastGonkaFailureDiagnostic)) {
+    if (lastGonkaFailureDiagnostic[key] === undefined || lastGonkaFailureDiagnostic[key] === "") {
+      delete lastGonkaFailureDiagnostic[key];
+    }
+  }
+  if (shouldLogGonkaDiagnostics()) console.error(JSON.stringify(safe));
+}
+
+function getLastGonkaFailureDiagnostic() {
+  return lastGonkaFailureDiagnostic
+    ? { ...lastGonkaFailureDiagnostic }
+    : null;
 }
 
 class GonkaClient {
@@ -627,6 +719,7 @@ module.exports = {
   GonkaClient,
   GonkaClientError,
   createGonkaClientFromEnv,
+  getLastGonkaFailureDiagnostic,
   extractStructuredJson,
   extractStructuredJsonCandidates,
   DEFAULT_GONKA_BASE_URL,

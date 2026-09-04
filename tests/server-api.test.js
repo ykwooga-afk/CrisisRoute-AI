@@ -140,6 +140,84 @@ function assertSafeErrorBody(body) {
   );
 }
 
+test("temporary Gonka diagnostic endpoint exposes only the latest sanitized upstream failure", async t => {
+  const fakeApiKey = "unit-test-token-not-a-real-secret";
+  const upstream = http.createServer(async (req, res) => {
+    const request = JSON.parse(await readBody(req));
+    if (request.model === DEFAULT_MODELS.analyst) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: "mock-api-analyst",
+        model: request.model,
+        choices: [{
+          message: { role: "assistant", content: JSON.stringify(batchRoleData("analyst")) },
+          finish_reason: "stop"
+        }]
+      }));
+      return;
+    }
+    res.writeHead(503, {
+      "Content-Type": "application/json",
+      "x-request-id": "req_reviewer_503"
+    });
+    res.end(JSON.stringify({
+      error: {
+        code: "provider_unavailable",
+        message: "Upstream provider temporarily unavailable",
+        raw: `RAW_UPSTREAM_BODY_MUST_NOT_LEAK ${fakeApiKey}`
+      },
+      prompt: "PROMPT_MUST_NOT_LEAK",
+      authorization: `Bearer ${fakeApiKey}`
+    }));
+  });
+  const upstreamBaseUrl = await startServer(t, upstream);
+  const appBaseUrl = await startServer(t, createServer({
+    gonkaClientFactory: () => new GonkaClient({
+      apiKey: fakeApiKey,
+      baseUrl: `${upstreamBaseUrl}/v1`
+    })
+  }));
+
+  const initialResponse = await fetch(`${appBaseUrl}/api/diagnostics/last-gonka-failure`);
+  const initialBody = await initialResponse.json();
+  assert.equal(initialResponse.status, 200);
+  assert.deepEqual(initialBody, { ok: true, diagnostic: null });
+
+  const response = await fetch(`${appBaseUrl}/api/incidents/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(scenarioPayload())
+  });
+  assert.equal(response.status, 502);
+
+  const diagnosticResponse = await fetch(`${appBaseUrl}/api/diagnostics/last-gonka-failure`);
+  const body = await diagnosticResponse.json();
+  assert.equal(diagnosticResponse.status, 200);
+  assert.equal(body.ok, true);
+  assert.deepEqual(Object.keys(body.diagnostic).sort(), [
+    "durationMs",
+    "model",
+    "role",
+    "sanitizedErrorCode",
+    "sanitizedErrorMessage",
+    "timestamp",
+    "upstreamRequestId",
+    "upstreamStatus"
+  ]);
+  assert.equal(body.diagnostic.role, "reviewer");
+  assert.equal(body.diagnostic.model, DEFAULT_MODELS.reviewer);
+  assert.equal(body.diagnostic.upstreamStatus, 503);
+  assert.equal(body.diagnostic.upstreamRequestId, "req_reviewer_503");
+  assert.equal(body.diagnostic.sanitizedErrorCode, "provider_unavailable");
+  assert.equal(body.diagnostic.sanitizedErrorMessage, "Upstream provider temporarily unavailable");
+  assert.ok(Number.isInteger(body.diagnostic.durationMs));
+  assert.ok(body.diagnostic.sanitizedErrorMessage.length <= 200);
+  assert.doesNotMatch(
+    JSON.stringify(body),
+    /RAW_UPSTREAM_BODY|unit-test-token|PROMPT_MUST_NOT_LEAK|authorization|Bearer|messages|system|user/i
+  );
+});
+
 test("POST analyze returns a UI-compatible CASE 01 response through local Mock Gonka", async t => {
   const mock = await startMockGonka(t);
   const client = new GonkaClient({

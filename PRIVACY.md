@@ -4,7 +4,7 @@ CrisisRoute AI is a hackathon demo, not a production emergency, medical, or iden
 
 ## Data Processing
 
-- In **Live mode**, user-supplied report text and the fixed five-case evidence prompt are sent through GonkaRouter for processing by the configured DeepSeek Analyst and Kimi Blind Reviewer.
+- In **Live mode**, user-supplied report text and the fixed five-case evidence prompt are sent through Gonka Router for processing by the configured DeepSeek Analyst and MiniMax Blind Reviewer.
 - In **Replay mode**, the browser loads a sanitized deterministic record and sends no current model request.
 - In **Demo mode**, synthetic local data is used and no model inference is requested.
 - Human Decision, Audit, Brief, and Proof records exist only in server memory. They disappear when the process restarts.

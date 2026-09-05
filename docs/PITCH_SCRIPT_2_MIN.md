@@ -20,7 +20,7 @@ Main narration target: approximately 115–120 seconds. Speak calmly; do not rus
 
 **[Screen: Analyst and Reviewer panel]**
 
-“Through GonkaRouter, DeepSeek acts as the Analyst while Kimi performs an independent blind review. Both receive the same original evidence, but Kimi never sees DeepSeek’s answer. Their structured scores are validated, then deterministic code calculates consensus and conflict.”
+“Through Gonka Router, DeepSeek acts as the Analyst while MiniMax performs an independent blind review. Both receive the same original evidence, but MiniMax never sees DeepSeek’s answer. Their structured scores are validated, then deterministic code calculates consensus and conflict.”
 
 ### 0:50–1:10 — CASE 03
 

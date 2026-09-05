@@ -4,7 +4,6 @@ const path = require("path");
 const {
   GonkaClientError,
   createGonkaClientFromEnv,
-  getLastGonkaFailureDiagnostic,
   DEFAULT_GONKA_BASE_URL,
   DEFAULT_MODELS
 } = require("./backend/gonkaClient");
@@ -22,9 +21,7 @@ const {
 } = require("./backend/briefService");
 const {
   PublicSourceError,
-  extractPublicSource,
-  getLastPublicUrlFailureDiagnostic,
-  recordPublicUrlFailureDiagnostic
+  extractPublicSource
 } = require("./backend/publicSourceExtractor");
 
 const root = __dirname;
@@ -513,20 +510,6 @@ async function handleApi(req, res, {
   isProduction,
   analysisProtection
 }) {
-  if (req.method === "GET" && req.url === "/api/diagnostics/last-gonka-failure") {
-    return sendJson(res, 200, {
-      ok: true,
-      diagnostic: getLastGonkaFailureDiagnostic()
-    });
-  }
-
-  if (req.method === "GET" && req.url === "/api/diagnostics/last-public-url-failure") {
-    return sendJson(res, 200, {
-      ok: true,
-      diagnostic: getLastPublicUrlFailureDiagnostic()
-    });
-  }
-
   if (req.method === "GET" && req.url === "/api/health/ready") {
     const readiness = runtimeReadiness({
       env,
@@ -689,7 +672,6 @@ async function handleApi(req, res, {
       decisionLedger.registerAnalysisResult(decorated);
       return sendJson(res, 200, decorated);
     } catch (error) {
-      if (error instanceof PublicSourceError) recordPublicUrlFailureDiagnostic(error);
       return sendApiError(res, error);
     } finally {
       lease.release();

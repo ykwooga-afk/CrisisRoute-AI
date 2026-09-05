@@ -1,88 +1,213 @@
 # CrisisRoute AI
 
-Evidence-backed crisis triage support that separates verification, urgency, and actionability before a human makes the operational decision.
+CrisisRoute AI turns unverified crisis reports into evidence-backed, multi-model-reviewed, human-approved action.
 
-> **LOW VERIFICATION ≠ LOW URGENCY. AI assists. Humans decide.**
+- Live Demo: [https://crisisroute-ai.onrender.com/](https://crisisroute-ai.onrender.com/)
+- 2-Minute Demo Video: [https://youtu.be/WN-6PgRrbKs](https://youtu.be/WN-6PgRrbKs)
+- Track: Gonka Router / AI for Society
+
+CrisisRoute AI is not an emergency service, not an autonomous dispatcher, and not a generic chatbot. It is crisis-triage decision support: uncertainty stays visible, AI assists, and humans decide.
 
 ## Problem
 
-Crisis reports arrive as incomplete messages, duplicate forwards, conflicting observations, and urgent claims without enough location or contact detail. A binary true/false label can hide a dangerous report simply because its evidence is weak. CrisisRoute AI keeps uncertainty visible while independently evaluating how urgent the harm would be if the report were true and whether a safe, human-approved response is actionable.
+Crisis reports arrive as incomplete texts, public URLs, duplicated forwards, conflicting observations, and urgent claims without enough location or contact detail. A binary true/false label can hide a dangerous report simply because its evidence is weak.
 
-This hackathon demo does not replace 999, hospitals, police, fire and rescue services, NADMA, DOE, or any other official emergency authority.
+CrisisRoute AI separates verification from urgency and actionability so operators can see what is known, what is missing, and what action is currently safe.
+
+Core principles:
+
+- LOW VERIFICATION ≠ LOW URGENCY
+- URGENT ≠ DISPATCHABLE
+- AI ASSISTS. HUMANS DECIDE.
+
+Urgency determines how fast we respond. Verification and actionability determine what response is safe.
 
 ## Product Workflow
 
-1. Receive user-provided report text or the fixed five-case haze scenario.
-2. Send the same original evidence to a DeepSeek Analyst and a blind Kimi Reviewer through GonkaRouter.
-3. Validate both structured responses and score three independent axes.
-4. Compute deterministic consensus, disagreement, operational state, and safety gates.
-5. Require an explicit human decision; no real-world action is automatically executed.
-6. Generate a deterministic operational brief, append a local audit event, and verify a local Proof Capsule.
+VERIFY -> CHALLENGE -> PRIORITIZE -> ACT
+
+1. Accept pasted report text or Public URL retrieval from a safe public HTTP/HTTPS page.
+2. Extract concise claims and source context.
+3. Send the same evidence to two Gonka-hosted models for blind review.
+4. Validate structured model responses.
+5. Compare Truth / Verification, Urgency, and Actionability scores deterministically.
+6. Apply safety gates before any operational next step.
+7. Require an explicit Human Decision from the allowed action set.
+8. Generate an Action Brief, local Proof Capsule, and Audit Trail.
+
+The approved app flow is:
+
+Command Center -> Case Intelligence -> Evidence -> Safety -> Human Decision inside Safety -> Action Brief
 
 ## Why Gonka Is Essential
 
-Live mode uses GonkaRouter as the server-side inference gateway. A complete five-case Analyze makes exactly two model calls: one to `deepseek-ai/DeepSeek-V4-Flash-0731` and one to `MiniMaxAI/MiniMax-M2.7`. The Reviewer receives the same original reports but never the Analyst output, reducing anchoring and allowing meaningful disagreement.
+All Live AI reasoning goes through Gonka Router using the OpenAI-compatible endpoint:
 
-Gonka Response IDs are retained as observability references. They are not blockchain records, evidence that a report is true, or proof that an action occurred.
+`https://api.gonkarouter.io/v1/chat/completions`
+
+Current Live model roles:
+
+- Incident Analyst: `deepseek-ai/DeepSeek-V4-Flash-0731`
+- Skeptical Reviewer: `MiniMaxAI/MiniMax-M2.7`
+
+Blind Dual-Model Review:
+
+- Both models receive the same evidence independently.
+- Neither model sees the other model's answer.
+- Outputs are validated and compared deterministically afterward.
+
+Two models citing the same source is not independent corroboration.
+
+The Transparency UI displays model identifiers, Gonka request ID when exposed by the gateway, response/request trace identifiers, prompt version, latency, model reasoning, and model conclusions. The app does not claim a Gonka Request ID exists when the gateway does not expose one.
 
 ## Three-Axis Scoring
 
-- **Verification** — strength and independence of supporting evidence.
-- **Urgency** — severity and time sensitivity of harm if the claim is true.
-- **Actionability** — whether location, contact, resources, and a safe next step are sufficiently complete for human approval.
+Truth / Verification:
 
-Scores are validated from 0–100. Missing, nonnumeric, infinite, or out-of-range values are rejected rather than guessed or clamped.
+- Measures how strongly available evidence supports the report.
+- It is not the probability that the incident is true.
+
+Urgency:
+
+- Measures how dangerous or time-sensitive the situation would be if true.
+- Low verification does not reduce urgency.
+
+Actionability:
+
+- Measures whether enough information exists for safe human-approved action.
+- Missing location, contact, resources, or unresolved conflict can keep action blocked.
+
+Scores are validated from 0-100. Missing, nonnumeric, infinite, or out-of-range values are rejected rather than guessed or clamped.
 
 ## Deterministic Consensus
 
-The application averages each axis in code and measures the Analyst/Reviewer gap. A maximum gap up to 15 is agreement, 16–30 is disagreement, and above 30 is critical conflict. Model prose does not control the final state.
+The application averages each axis in code and measures the Analyst/Reviewer gap. Model prose does not control the final operational state.
+
+- Gap <= 15: `AGREEMENT`
+- Gap 16-30: `DISAGREEMENT` / evidence review
+- Gap > 30 or material factual conflict: `CRITICAL_CONFLICT` / human review
 
 ## Safety Gates
 
-Deterministic gates cover medical risk, exact location, contact path, resource availability, model conflict, and dispatch eligibility. Weak verification never lowers urgency automatically. Critical conflict, missing operational details, or failed gates keep dispatch locked for human review.
+CrisisRoute AI uses deterministic safety gates after model analysis. These gates do not change model scores; they constrain what action is safe.
+
+Safety gates cover:
+
+- Medical red flags that may trigger urgent verification or official emergency escalation guidance
+- Missing exact actionable location, which can block volunteer dispatch
+- Missing verified contact, which can block dispatch
+- Resource conflicts, which can block dispatch
+- Large model disagreement, which requires human review
+
+AI never automatically executes real-world action. Human operators can only choose from currently allowed actions for the case state.
+
+Haze is our validated demo scenario, not the limit of the platform. The same architecture can support floods, fires, landslides, medical emergencies, and other crisis domains.
 
 ## Human Decision
 
-Allowed actions depend on the deterministic operational state. Decisions require the relevant acknowledgements and are recorded in an in-memory append-only audit chain. `RECORDED` means the decision was saved locally; execution remains `NOT_EXECUTED`.
+The Human Decision form records an operator's selected allowed action and optional reason. It does not approve arbitrary dispatch and does not execute action.
+
+Examples of allowed decision categories include requesting urgent verification, requesting missing information, holding for review, queueing bounded action, or approving bounded assistance only when existing safety gates allow it.
+
+`RECORDED` means the decision was saved in the app's local server process. `NOT_EXECUTED` means real-world action remains outside CrisisRoute AI.
 
 ## Deterministic Brief
 
-After a valid decision, server-side code produces a bounded operational brief from validated analysis and decision context. The brief does not claim that contact, dispatch, treatment, delivery, or rescue occurred.
+After a valid decision, server-side code produces the Action Brief from validated analysis, safety state, audit context, and the recorded Human Decision.
+
+The brief summarizes:
+
+- What the human decided
+- Why the action is allowed or constrained
+- What happens next
+- Whether anything was executed
+- How the decision was recorded
+
+The brief does not claim that contact, dispatch, treatment, delivery, or rescue occurred.
 
 ## Local Proof Capsule
 
-The Proof Capsule hashes the local analysis/decision/brief payload and verifies tampering within the running process. It provides local payload-integrity evidence only. There is no blockchain anchoring, external timestamp authority, persistent database, or proof that the underlying report is true.
+The Proof Capsule is a server-issued local decision receipt. It is SHA-256 based and tamper-evident for local payload integrity.
+
+It links:
+
+- Analysis snapshot hash
+- Human decision hash
+- Action Brief hash
+- Local audit hash
+
+Proof Capsule has no blockchain or external anchoring. It provides local payload-integrity evidence only. It is not proof that the incident is true, not proof that a volunteer was dispatched, and not proof that real-world execution occurred.
+
+Persistence is currently ephemeral. External anchoring is none.
 
 ## Data Modes
 
-| Mode | Meaning |
-|---|---|
-| Live | Real DeepSeek and Kimi inference through GonkaRouter. Upstream availability and timeouts apply. |
-| Replay | Sanitized deterministic replay of an earlier accepted Live run. The current replay load makes no network request. |
-| Demo | Synthetic local data for UI and workflow demonstration. |
+Demo:
 
-An upstream failure never becomes a fabricated Live result. Safe timeouts, failed-role reporting, manual retry, and an explicitly labelled Replay fallback are provided. Structured rationale fields are bounded output fields; they are not hidden chain-of-thought.
+- Synthetic curated scenario
+- Designed for fast judge walkthroughs
+- Clearly labelled as demo data
+
+Replay:
+
+- Sanitized recorded prior accepted run
+- The current Replay load makes no model or network inference
+- Never presented as Live
+
+Live:
+
+- Current Gonka inference
+- Uses server-side credentials only
+- Safe failures remain explicit and never silently become Demo or Replay
 
 ## Architecture
 
-```mermaid
-flowchart LR
-  UI[Vanilla browser UI] -->|report text| API[Node HTTP API]
-  API -->|same evidence| A[DeepSeek Analyst via Gonka]
-  API -->|blind same evidence| R[Kimi Reviewer via Gonka]
-  A --> V[Strict JSON validation]
-  R --> V
-  V --> C[Deterministic consensus and safety gates]
-  C --> H[Human decision]
-  H --> B[Deterministic brief]
-  B --> P[Local audit and Proof Capsule]
-  REPLAY[Sanitized replay] --> UI
+Frontend:
+
+- HTML
+- CSS
+- Vanilla JavaScript ES modules
+
+Backend:
+
+- Node.js
+
+```text
+User Text / URL
+|
+v
+Input + Claim Extraction
+|
+v
+Gonka Router
+|          |
+Analyst    Reviewer
+|          |
++----Blind Review----+
+|
+v
+Deterministic Comparator
+|
+v
+Truth / Urgency / Actionability
+|
+v
+Safety Gates
+|
+v
+Human Decision
+|
+v
+Action Brief
+|
+v
+Proof Capsule + Audit Trail
 ```
 
 ## Repository Structure
 
 ```text
-backend/    Gonka client, analysis pipeline, decision ledger, brief service
+backend/    Gonka client, incident pipeline, decision ledger, brief service, public URL extractor
 src/        Browser UI, client adapter, demo and replay data
 scripts/    Offline smokes, live rehearsal, release audit
 tests/      Node test suite
@@ -91,88 +216,118 @@ server.js   Static allowlist and API server
 render.yaml Render Web Service configuration
 ```
 
+Important modules:
+
+- `src/main.js`
+- `src/services/crisisRouteClient.js`
+- `backend/gonkaClient.js`
+- `backend/incidentPipeline.js`
+- `backend/decisionLedger.js`
+- `backend/briefService.js`
+- `backend/publicSourceExtractor.js`
+
 ## Local Setup
 
-Requirements: Node.js 24 and npm.
+Requirements: Node.js and npm.
 
 ```powershell
-Copy-Item .env.example .env.local
-npm ci --omit=dev
-npm run dev
+npm install
+npm start
 ```
 
-Open `http://localhost:4173`. Never commit `.env.local` or put the key in browser code.
+Open `http://localhost:4173`.
 
-### `.env.local`
+Live mode requires a server-side Gonka API key. Do not expose secrets in frontend code.
+
+Example environment:
 
 ```text
-GONKA_API_KEY=<server-side secret>
+GONKA_API_KEY=your_key_here
 GONKA_BASE_URL=https://api.gonkarouter.io/v1
 GONKA_ANALYST_MODEL=deepseek-ai/DeepSeek-V4-Flash-0731
 GONKA_REVIEWER_MODEL=MiniMaxAI/MiniMax-M2.7
+GONKA_LIVE_ENABLED=true
 ```
 
-Development keeps the existing key-based local workflow. Production additionally requires `GONKA_LIVE_ENABLED=true` and uses `GONKA_MAX_ANALYSES_PER_PROCESS` for the single-process demo budget.
+For local development, `.env.local` may be used and must not be committed.
 
 ## Available Commands
 
 | Command | Purpose |
 |---|---|
-| `npm run dev` | Start local server with optional `.env.local` loading |
 | `npm start` | Start the server using process environment variables |
 | `npm test` | Run all offline tests |
-| `npm run smoke:decision` | Offline human-decision smoke |
-| `npm run smoke:brief` | Offline brief/proof smoke |
 | `npm run smoke:frontend` | Offline frontend workflow smoke |
 | `npm run smoke:judge` | Offline judge-demo smoke |
+| `npm run smoke:decision` | Offline human-decision smoke |
+| `npm run smoke:brief` | Offline brief/proof smoke |
 | `npm run audit:release` | Offline release package audit |
 | `npm run rehearse:live` | Explicitly authorized Live rehearsal; consumes model requests |
 
 ## API Routes
 
-- `GET /api/health/ready` — deployment readiness without contacting Gonka.
-- `GET /api/health/gonka` — safe configured-capability status without inference.
-- `POST /api/incidents/analyze` — CASE 01 or fixed five-case analysis.
-- `POST /api/incidents/:id/decision` — record a bounded human decision.
-- `GET /api/incidents/:id/audit` — retrieve the in-memory audit chain.
-- `POST /api/incidents/:id/brief` — generate deterministic brief and capsule.
-- `POST /api/proof/verify` — verify local payload integrity.
+- `GET /api/health/ready` - deployment readiness without contacting Gonka
+- `GET /api/health/gonka` - safe configured-capability status without inference
+- `POST /api/incidents/analyze` - Live text analysis or fixed demo scenario analysis
+- `POST /api/public-source/analyze` - safe public URL extraction followed by Live analysis
+- `POST /api/incidents/:id/decision` - record a bounded human decision
+- `GET /api/incidents/:id/audit` - retrieve the in-memory audit chain
+- `POST /api/incidents/:id/brief` - generate deterministic Action Brief and Proof Capsule
+- `POST /api/proof/verify` - verify local payload integrity
 
 ## Render Deployment
 
-`render.yaml` defines a Node Web Service using `npm ci --omit=dev`, `npm start`, and `/api/health/ready`. Add `GONKA_API_KEY` only in Render's secret environment UI. Render supplies `PORT`; no persistent disk is configured. Decision, audit, brief, and proof records are ephemeral and disappear when the instance restarts.
+`render.yaml` defines the Render Web Service using `npm ci --omit=dev`, `npm start`, and `/api/health/ready`.
 
-Deployment is prepared but not published in B12-A. See the [Demo Runbook](docs/DEMO_RUNBOOK.md) before presenting.
+Production secrets belong in Render's server-side environment settings. Render supplies `PORT`; no persistent disk is configured.
+
+Decision records, audit entries, briefs, and proof records are ephemeral and reset when the server process restarts.
 
 ## Testing
 
-The suite covers strict role contracts, blind-review isolation, safe errors, timeouts, response limits, consensus, gates, human decisions, audit integrity, proof tampering, replay provenance, production readiness, cost protection, HTTP headers, graceful shutdown, and release packaging. Standard tests and release audits are offline; Live scripts must be invoked separately and intentionally.
+```powershell
+npm test
+npm run smoke:frontend
+npm run smoke:judge
+```
+
+The test suite covers strict model contracts, blind-review isolation, Public URL retrieval and SSRF protections, safe errors, timeouts, response limits, consensus thresholds, safety gates, human decisions, audit integrity, Proof Capsule tampering, Replay provenance, production readiness, and offline judge workflows.
 
 ## Security and Privacy
 
-The API key remains server-side. Static files use an explicit allowlist, API responses use `Cache-Control: no-store`, and responses include CSP, clickjacking, MIME-sniffing, referrer, and permissions protections. Production Analyze permits one concurrent request and defaults to 12 submissions per process. This is demo cost protection, not a distributed production quota or abuse-prevention system.
+- Gonka secrets remain server-side.
+- Public URL fetching blocks localhost, private IP ranges, link-local targets, and unsafe redirects.
+- Static files are served from an explicit allowlist.
+- API responses use safe error messages and do not expose prompts, API keys, raw model output, or crisis report payloads.
+- Security headers include CSP, clickjacking protection, MIME sniffing protection, referrer policy, and permissions policy.
 
-See the [Security Policy](SECURITY.md) and [Privacy Notice](PRIVACY.md).
+See [SECURITY.md](SECURITY.md) and [PRIVACY.md](PRIVACY.md).
 
 ## Known Limitations
 
-- No formal user authentication or authorization.
-- No persistent database; decisions and audit records are ephemeral.
-- No automatic public URL retrieval, web search, or private/login-page access. Intake processes text supplied by the user.
-- No automatic rescue dispatch or integration with official emergency services.
-- Live inference depends on GonkaRouter and upstream model availability.
-- Replay is a sanitized fallback and must never be presented as a fresh Live run.
+- CrisisRoute AI is not an emergency service.
+- No automatic real-world dispatch or emergency-service integration.
+- No formal production identity/authentication layer.
+- No persistent database; server records are ephemeral.
 - Proof Capsule has no blockchain or external anchoring.
-- Single-process concurrency and budget controls reset when the server restarts.
+- Live inference depends on Gonka Router and upstream model availability.
+- Replay is sanitized recorded data from an earlier accepted Live run, not a fresh Live run.
 
 ## Demo and Submission
 
-- [Demo Runbook](docs/DEMO_RUNBOOK.md)
-- [Gonka Integration](docs/GONKA_INTEGRATION.md)
-- [Two-Minute Pitch](docs/PITCH_SCRIPT_2_MIN.md)
-- [Submission Checklist](docs/SUBMISSION_CHECKLIST.md)
+Recommended Live demo text:
 
-The submission package prepares placeholders for the required Live Demo URL, public GitHub repository, and two-minute pitch video. External publication is intentionally deferred.
+```text
+An elderly man in Shah Alam is having severe breathing difficulty during heavy haze. His daughter says he is conscious but getting worse. Exact apartment number is still unknown, but she can be contacted by phone.
+```
+
+This demonstrates incomplete verification, high urgency, incomplete actionability, a medical red flag, the exact-location safety gate, blind dual-model verification, human decision, Action Brief, and Proof Capsule.
+
+Submission links:
+
+- Live Demo: [https://crisisroute-ai.onrender.com/](https://crisisroute-ai.onrender.com/)
+- 2-Minute Demo Video: [https://youtu.be/WN-6PgRrbKs](https://youtu.be/WN-6PgRrbKs)
+- GitHub Repository: [https://github.com/ykwooga-afk/CrisisRoute-AI](https://github.com/ykwooga-afk/CrisisRoute-AI)
 
 ## License
 

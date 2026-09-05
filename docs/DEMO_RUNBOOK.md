@@ -27,7 +27,7 @@
 ## Optional Live Route
 
 - Try Live only when readiness is green and the Analyze budget is available.
-- State that one Analyze calls DeepSeek and Kimi independently through GonkaRouter.
+- State that one Analyze calls DeepSeek and MiniMax independently through Gonka Router.
 - Click Analyze once and wait up to 60 seconds.
 - Do not double-click, automatically retry, switch models, or imply that a timed-out call succeeded.
 - If Live fails, show the safe error, choose **Open Sanitized Replay**, and explicitly say Replay is not the just-failed Live response.

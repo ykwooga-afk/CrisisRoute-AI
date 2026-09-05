@@ -66,7 +66,6 @@ const BOILERPLATE_LINE_PATTERNS = [
   /^this page was last edited/i,
   /^text is available under/i
 ];
-let lastPublicUrlFailureDiagnostic = null;
 
 class PublicSourceError extends Error {
   constructor(code, message, { status = 400, retryable = false, diagnostic } = {}) {
@@ -182,24 +181,6 @@ function attachDiagnostic(error, context, values = {}) {
     sanitizedMessage: values.sanitizedMessage || error.diagnostic?.sanitizedMessage || error.message
   });
   return error;
-}
-
-function recordPublicUrlFailureDiagnostic(error) {
-  if (!(error instanceof PublicSourceError)) return;
-  lastPublicUrlFailureDiagnostic = {
-    timestamp: new Date().toISOString(),
-    ...sanitizeDiagnostic({
-      ...error.diagnostic,
-      failureCode: error.code,
-      sanitizedMessage: error.diagnostic?.sanitizedMessage || error.message
-    })
-  };
-}
-
-function getLastPublicUrlFailureDiagnostic() {
-  return lastPublicUrlFailureDiagnostic
-    ? { ...lastPublicUrlFailureDiagnostic }
-    : null;
 }
 
 async function extractPublicSource(rawUrl, {
@@ -858,9 +839,7 @@ function trimToAnalysisLimit(value, limit = MAX_ANALYSIS_TEXT) {
 module.exports = {
   PublicSourceError,
   extractPublicSource,
-  getLastPublicUrlFailureDiagnostic,
   parsePublicUrl,
-  recordPublicUrlFailureDiagnostic,
   isPrivateAddress,
   extractReadableContent
 };

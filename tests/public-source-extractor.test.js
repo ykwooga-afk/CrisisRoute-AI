@@ -304,21 +304,7 @@ test("Public URL API returns a safe public extraction error without analyzing", 
   assert.equal(analyzeCalls, 0);
 });
 
-test("Public URL diagnostic endpoint exposes only sanitized latest failure metadata", async t => {
-  const allowedKeys = new Set([
-    "timestamp",
-    "hostname",
-    "failureStage",
-    "failureCode",
-    "sanitizedMessage",
-    "httpStatus",
-    "contentType",
-    "redirectCount",
-    "durationMs",
-    "dnsResolved",
-    "addressClassification",
-    "timeout"
-  ]);
+test("Public URL failures keep extractor diagnostics internal", async t => {
   const app = createServer({
     env: { NODE_ENV: "development" },
     publicSourceExtractor: async () => {
@@ -360,25 +346,9 @@ test("Public URL diagnostic endpoint exposes only sanitized latest failure metad
 
   const diagnosticResponse = await fetch(`${baseUrl}/api/diagnostics/last-public-url-failure`);
   const diagnosticBody = await diagnosticResponse.json();
-  const diagnostic = diagnosticBody.diagnostic;
 
-  assert.equal(diagnosticResponse.status, 200);
-  assert.equal(diagnosticBody.ok, true);
-  assert.match(diagnostic.timestamp, /^\d{4}-\d{2}-\d{2}T/);
-  for (const key of Object.keys(diagnostic)) {
-    assert.equal(allowedKeys.has(key), true, `unexpected diagnostic key: ${key}`);
-  }
-  assert.equal(diagnostic.hostname, "en.wikipedia.org");
-  assert.equal(diagnostic.failureStage, "request");
-  assert.equal(diagnostic.failureCode, "PUBLIC_URL_FETCH_FAILED");
-  assert.equal(diagnostic.sanitizedMessage, "Network failure before HTTP response: ECONNRESET.");
-  assert.equal(diagnostic.httpStatus, 502);
-  assert.equal(diagnostic.contentType, "text/html; charset=utf-8");
-  assert.equal(diagnostic.redirectCount, 1);
-  assert.equal(diagnostic.durationMs, 1234);
-  assert.equal(diagnostic.dnsResolved, true);
-  assert.equal(diagnostic.addressClassification, "public");
-  assert.equal(diagnostic.timeout, false);
+  assert.equal(diagnosticResponse.status, 404);
+  assert.deepEqual(diagnosticBody, { ok: false, message: "API route not found" });
   assert.doesNotMatch(JSON.stringify(publicBody), /do-not-leak|wiki\/Haze|ECONNRESET/i);
   assert.doesNotMatch(JSON.stringify(diagnosticBody), /do-not-leak|wiki\/Haze/i);
 });

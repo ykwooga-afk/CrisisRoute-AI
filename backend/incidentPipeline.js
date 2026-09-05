@@ -2,8 +2,7 @@ const crypto = require("node:crypto");
 const {
   DEFAULT_MODELS,
   MAX_JSON_CANDIDATES,
-  extractStructuredJsonCandidates,
-  recordGonkaModelDataDiagnostic
+  extractStructuredJsonCandidates
 } = require("./gonkaClient");
 const {
   SCENARIO_ID,
@@ -1690,19 +1689,6 @@ function safeRoleFailure(settledResults) {
         Array.isArray(item.result.reason?.issues) && item.result.reason.issues.length
           ? item.result.reason.issues
           : ["payload:no_contract_candidate"]);
-      recordGonkaModelDataDiagnostic({
-        role: failedRole,
-        model: failedRole === "analyst"
-          ? DEFAULT_MODELS.analyst
-          : failedRole === "reviewer"
-            ? DEFAULT_MODELS.reviewer
-            : "multiple",
-        sourceCode: classified[0]?.result.reason?.code || "INVALID_MODEL_DATA",
-        issues,
-        shapeDiagnostics: mergeModelDataDiagnostics(
-          ...classified.map(item => item.result.reason?.shapeDiagnostics)
-        )
-      });
       throw invalidModelData(failedRole, issues);
     }
     const message = code === "TIMEOUT"
@@ -1791,17 +1777,6 @@ function validateFulfilledRoleData({
       Array.isArray(outcome.error?.issues) && outcome.error.issues.length
         ? outcome.error.issues
         : ["payload:not_object"]);
-    recordGonkaModelDataDiagnostic({
-      role,
-      model: role === "analyst"
-        ? analystModel
-        : role === "reviewer"
-          ? reviewerModel
-          : "multiple",
-      sourceCode: "INVALID_MODEL_DATA",
-      issues,
-      shapeDiagnostics: mergeModelDataDiagnostics(...failures.map(outcome => outcome.diagnostics))
-    });
     throw invalidModelData(role, issues);
   }
   return {

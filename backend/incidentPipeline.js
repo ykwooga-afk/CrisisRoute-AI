@@ -16,6 +16,7 @@ const {
 const ANALYST_PROMPT_VERSION = "analyst-v1.1-minimal";
 const REVIEWER_PROMPT_VERSION = "reviewer-v1.1-minimal";
 const ANALYST_TIMEOUT_MS = 45_000;
+const SINGLE_CASE_ANALYST_TIMEOUT_MS = 90_000;
 const REVIEWER_TIMEOUT_MS = 90_000;
 const CASE_01_SCENARIO = SCENARIO_ID;
 const MAX_MESSAGE_LENGTH = 4_000;
@@ -1487,7 +1488,7 @@ async function analyzeCase01({ payload, client, now = new Date() }) {
     ],
     temperature: 0,
     maxTokens: 600,
-    timeoutMs: ANALYST_TIMEOUT_MS,
+    timeoutMs: SINGLE_CASE_ANALYST_TIMEOUT_MS,
     returnCandidates: true,
     diagnosticRole: "analyst"
   };
@@ -1645,6 +1646,7 @@ module.exports = {
   ANALYST_PROMPT_VERSION,
   REVIEWER_PROMPT_VERSION,
   ANALYST_TIMEOUT_MS,
+  SINGLE_CASE_ANALYST_TIMEOUT_MS,
   REVIEWER_TIMEOUT_MS,
   ANALYST_BATCH_PROMPT_VERSION,
   REVIEWER_BATCH_PROMPT_VERSION,

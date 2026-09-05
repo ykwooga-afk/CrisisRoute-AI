@@ -5,6 +5,7 @@ const {
   ANALYST_PROMPT_VERSION,
   REVIEWER_PROMPT_VERSION,
   ANALYST_TIMEOUT_MS,
+  SINGLE_CASE_ANALYST_TIMEOUT_MS,
   REVIEWER_TIMEOUT_MS,
   validateAnalyzeRequest,
   normalizeAnalystData,
@@ -261,8 +262,9 @@ test("CASE 01 passes role-specific bounded request settings", async () => {
   const reviewerCall = client.calls.find(call => call.model === DEFAULT_MODELS.reviewer);
 
   assert.equal(ANALYST_TIMEOUT_MS, 45_000);
+  assert.equal(SINGLE_CASE_ANALYST_TIMEOUT_MS, 90_000);
   assert.equal(REVIEWER_TIMEOUT_MS, 90_000);
-  assert.equal(analystCall.timeoutMs, 45_000);
+  assert.equal(analystCall.timeoutMs, 90_000);
   assert.equal(reviewerCall.timeoutMs, 90_000);
   assert.equal(analystCall.maxTokens, 600);
   assert.equal(reviewerCall.maxTokens, 1_200);

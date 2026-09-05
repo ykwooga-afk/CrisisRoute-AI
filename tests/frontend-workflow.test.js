@@ -346,7 +346,7 @@ async function renderers() {
     .replace(/import\s+\{[\s\S]*?\}\s+from\s+["'][^"']+["'];\s*/g, "")
     .replace(/\binit\(\);\s*$/, "");
   const reliability = await importSource("src/ui/demoReliability.js");
-  return vm.runInNewContext(`${source}\n({ state, setDecisionWorkflow, renderCommandReadinessPanel, renderCaseIntelligence, renderEvidenceView, renderSafetyView, renderActionBriefView, renderDecisionPath, renderDispatchLockPanel, renderSafetyAssessment, renderHumanDecisionButtons, renderAuditTimeline, auditEvents, proofVerificationLabel });`, {
+  return vm.runInNewContext(`${source}\n({ state, setDecisionWorkflow, renderSummaryCards, renderCommandReadinessPanel, renderCaseIntelligence, renderEvidenceView, renderSafetyView, renderActionBriefView, renderDecisionPath, renderDispatchLockPanel, renderSafetyAssessment, renderHumanDecisionButtons, renderAuditTimeline, auditEvents, proofVerificationLabel });`, {
     ...workflow,
     ...reliability,
     DATA_MODES: { mock: "mock", replay: "replay", live: "live" },
@@ -539,6 +539,131 @@ test("Evidence page shows explicit verdict and truthful Gonka provenance labels"
   assert.match(html, /Gonka Response ID/);
   assert.match(html, /chatcmpl-live-reviewer/);
   assert.equal((html.match(/current actionable incident report/g) || []).length >= 1, true);
+  assert.match(html, /Reported by/);
+  assert.doesNotMatch(html, />Supports</);
+});
+
+test("Command Center counters exclude reference sources from Active Incidents", async () => {
+  const ui = await renderers();
+  const reference = {
+    ...incident("NEEDS_HUMAN_REVIEW"),
+    caseId: "CR-LIVE-ABCDE12345",
+    inputClassification: {
+      kind: "REFERENCE_SOURCE",
+      label: "REFERENCE SOURCE · NO ACTIVE INCIDENT DETECTED",
+      activeIncident: false
+    }
+  };
+  ui.state.incidents = [reference];
+  const html = ui.renderSummaryCards();
+  assert.match(html, /Active Incidents[\s\S]*<strong>0<\/strong>/);
+  assert.match(html, /Needs Human Review[\s\S]*<strong>1<\/strong>/);
+
+  ui.state.incidents = [{
+    ...reference,
+    inputClassification: { kind: "ACTIVE_REPORT", label: "ACTIVE REPORT", activeIncident: true }
+  }];
+  const activeHtml = ui.renderSummaryCards();
+  assert.match(activeHtml, /Active Incidents[\s\S]*<strong>1<\/strong>/);
+});
+
+test("Evidence page keeps Supports only for corroborating evidence", async () => {
+  const ui = await renderers();
+  const caseValue = {
+    ...incident("DISPATCH_CANDIDATE"),
+    caseId: "CR-LIVE-CORROBORATED",
+    label: "01",
+    title: "Corroborated report",
+    source: "Source Report - User Submitted",
+    receivedAt: "2026-09-05T04:00:00.000Z",
+    location: "Shah Alam",
+    peopleCount: 1,
+    scores: { verification: 82, urgency: 70, actionability: 75 },
+    knownFacts: ["The report has corroborating evidence."],
+    unknownFacts: [],
+    missingFields: [],
+    modelDebate: { agreement: ["Independent source confirms report"], disagreement: [], counterEvidence: [], consensus: "AGREEMENT" },
+    gonka: {
+      analyst: { model: "demo-analyst-model", responseId: "demo-response-analyst", promptVersion: "analyst-v1", latencyMs: 1200 },
+      reviewer: { model: "demo-reviewer-model", responseId: "demo-response-reviewer", promptVersion: "reviewer-v1", latencyMs: 1400 }
+    },
+    inputClassification: { kind: "ACTIVE_REPORT", label: "ACTIVE REPORT", activeIncident: true },
+    claims: [{ id: "C-01", text: "The report has corroborating evidence.", status: "supported", evidenceIds: ["E-01"] }],
+    evidence: [
+      {
+        id: "E-01",
+        type: "Independent Site Report",
+        reliability: "Independent corroboration",
+        summary: "Independent source confirms the reported condition.",
+        retrievedAt: "2026-09-05T04:00:00.000Z"
+      }
+    ]
+  };
+  ui.state.incidents = [caseValue];
+  ui.state.selectedCaseId = caseValue.caseId;
+  ui.state.selectedEvidenceId = "E-01";
+  const html = ui.renderEvidenceView(caseValue);
+  assert.match(html, /Supports/);
+  assert.doesNotMatch(html, /Reported by/);
+});
+
+test("Case Intelligence presents reference risk flags as background topics", async () => {
+  const ui = await renderers();
+  const reference = {
+    ...incident("NEEDS_HUMAN_REVIEW"),
+    caseId: "CR-LIVE-ABCDE12345",
+    label: "01",
+    title: "Haze - Wikipedia",
+    source: "Public URL: en.wikipedia.org",
+    receivedAt: "2026-09-05T04:00:00.000Z",
+    location: "Unknown location",
+    peopleCount: null,
+    scores: { verification: 42, urgency: 30, actionability: 20 },
+    knownFacts: ["Haze can reduce visibility."],
+    unknownFacts: ["current actionable incident report"],
+    riskFlags: ["smoke exposure"],
+    inputClassification: {
+      kind: "REFERENCE_SOURCE",
+      label: "REFERENCE SOURCE · NO ACTIVE INCIDENT DETECTED",
+      activeIncident: false,
+      detail: "This source contains background/reference information rather than a current actionable crisis report."
+    },
+    claims: [{ id: "C-01", text: "Haze can reduce visibility.", status: "reported_unverified", kind: "background", evidenceIds: ["E-01"] }],
+    evidence: [{ id: "E-01", type: "Public Source - Retrieved", summary: "Haze can reduce visibility.", retrievedAt: "2026-09-05T04:00:00.000Z" }],
+    missingFields: ["current actionable incident report"]
+  };
+  const html = ui.renderCaseIntelligence(reference);
+  assert.match(html, /Background Topics/);
+  assert.doesNotMatch(html, /<span>6\.<\/span> Risk Flags/);
+  assert.match(html, /smoke exposure/);
+});
+
+test("Case Intelligence keeps active-report risk flags unchanged", async () => {
+  const ui = await renderers();
+  const active = {
+    ...incident("URGENT_VERIFICATION"),
+    label: "01",
+    title: "Crisis report under review",
+    source: "Source Report - User Submitted",
+    receivedAt: "2026-09-05T04:00:00.000Z",
+    location: "Shah Alam · Exact location unknown",
+    peopleCount: 1,
+    scores: { verification: 42, urgency: 91, actionability: 36 },
+    knownFacts: ["A person is reported affected."],
+    unknownFacts: ["exact actionable location"],
+    riskFlags: ["respiratory difficulty"],
+    inputClassification: {
+      kind: "ACTIVE_REPORT",
+      label: "ACTIVE REPORT",
+      activeIncident: true
+    },
+    claims: [{ id: "C-01", text: "A person is reported affected.", status: "reported", kind: "reported", evidenceIds: ["E-01"] }],
+    evidence: [{ id: "E-01", type: "Source Report - User Submitted", summary: "A person is reported affected.", retrievedAt: "2026-09-05T04:00:00.000Z" }],
+    missingFields: ["exact actionable location"]
+  };
+  const html = ui.renderCaseIntelligence(active);
+  assert.match(html, /<span>6\.<\/span> Risk Flags/);
+  assert.doesNotMatch(html, /Background Topics/);
 });
 
 test("Safety reason placeholder follows actual blocked gates without inventing contact gaps", async () => {

@@ -1301,6 +1301,10 @@ blockquote {
   stroke: #1e9b59;
 }
 
+.connection.reported {
+  stroke: #1e9b59;
+}
+
 .connection.partial {
   stroke: var(--orange);
   stroke-dasharray: 7 6;

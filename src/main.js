@@ -1025,7 +1025,7 @@ function renderIntakeWorkflowRail() {
 
 function renderSummaryCards() {
   const items = [
-    ["Active Incidents", state.incidents.length, "green"],
+    ["Active Incidents", activeIncidentCount(), "green"],
     ["Needs Human Review", countByState("NEEDS_HUMAN_REVIEW"), "violet"],
     ["Urgent Verification", countByState("URGENT_VERIFICATION"), "amber"],
     ["Dispatch Candidate", countByState("DISPATCH_CANDIDATE"), "green"],
@@ -1367,7 +1367,7 @@ function renderStatusLine() {
 
   return `
     <section class="status-line" aria-label="Incident summary">
-      <strong>${state.incidents.length} Active Incidents</strong>
+      <strong>${activeIncidentCount()} Active Incidents</strong>
       <span class="divider"></span>
       <span><i class="dot violet"></i>${reviewCount} Needs Human Review</span>
       <span class="divider"></span>
@@ -1640,7 +1640,7 @@ function renderCaseIntelligence(incident) {
         </article>
 
         <article class="analysis-card risk-analysis-card">
-          <h2><span>6.</span> Risk Flags</h2>
+          <h2><span>6.</span> ${escapeHtml(riskSectionTitle(incident))}</h2>
           <div class="risk-chip-list">
             ${(incident.riskFlags || []).map(flag => renderRiskFlagChip(flag)).join("") || `<span class="risk-chip neutral">No risk flags recorded</span>`}
           </div>
@@ -1924,6 +1924,7 @@ function renderEvidenceNetwork(incident) {
   const width = 880;
   const height = Math.max(430, Math.max(claims.length, evidence.length) * 90 + 100);
   const evidenceIndex = new Map(evidence.map((item, index) => [item.id, index]));
+  const connectionKinds = new Set();
 
   const paths = claims
     .flatMap((claim, claimIndex) =>
@@ -1932,6 +1933,7 @@ function renderEvidenceNetwork(incident) {
         if (targetIndex === undefined) return "";
         const active = evidenceId === selectedId;
         const kind = connectionKind(claim, evidence[targetIndex]);
+        connectionKinds.add(kind);
         const y1 = claimY(claimIndex);
         const y2 = evidenceY(targetIndex);
         return `<path class="connection ${kind} ${active ? "active" : "quiet"}" d="M190 ${y1} C360 ${y1}, 520 ${y2}, 690 ${y2}" />`;
@@ -1965,17 +1967,29 @@ function renderEvidenceNetwork(incident) {
           `;
         })
         .join("")}
-      <g class="network-legend" transform="translate(70 ${height - 46})">
-        <line class="connection supports active" x1="0" x2="34" y1="0" y2="0"></line>
-        <text x="48" y="5">Supports</text>
-        <line class="connection partial active" x1="160" x2="194" y1="0" y2="0"></line>
-        <text x="208" y="5">Partial</text>
-        <line class="connection contradiction active" x1="310" x2="344" y1="0" y2="0"></line>
-        <text x="358" y="5">Contradiction</text>
-        <line class="connection none active" x1="510" x2="544" y1="0" y2="0"></line>
-        <text x="558" y="5">No independent source</text>
-      </g>
+      ${renderNetworkLegend(connectionKinds, height)}
     </svg>
+  `;
+}
+
+function renderNetworkLegend(connectionKinds, height) {
+  const legendItems = [
+    ["reported", "Reported by"],
+    ["supports", "Supports"],
+    ["partial", "Partial"],
+    ["contradiction", "Contradiction"],
+    ["none", "No independent source"]
+  ].filter(([kind]) => connectionKinds.has(kind));
+  return `
+    <g class="network-legend" transform="translate(70 ${height - 46})">
+      ${legendItems.map(([kind, label], index) => {
+        const x = index * 156;
+        return `
+          <line class="connection ${kind} active" x1="${x}" x2="${x + 34}" y1="0" y2="0"></line>
+          <text x="${x + 48}" y="5">${escapeSvg(label)}</text>
+        `;
+      }).join("")}
+    </g>
   `;
 }
 
@@ -3158,6 +3172,14 @@ function countByState(operationalState) {
   return state.incidents.filter(incident => incident.operationalState === operationalState).length;
 }
 
+function activeIncidentCount() {
+  return state.incidents.filter(incident => !isReferenceSource(incident)).length;
+}
+
+function riskSectionTitle(incident) {
+  return isReferenceSource(incident) ? "Background Topics" : "Risk Flags";
+}
+
 function queueSubtitle(incident) {
   if (incident.label === "02") return "Hostel B · 3 forwards → 1 source";
   if (incident.label === "04") return "Campus grounds · Models disagree";
@@ -3200,8 +3222,14 @@ function connectionKind(claim, evidence) {
   const status = claim.status || "";
   if (status.includes("contradict")) return "contradiction";
   if ((evidence?.type || "").toLowerCase().includes("no independent")) return "none";
+  if (isPrimarySourceEvidence(evidence)) return "reported";
   if (status.includes("partial") || status.includes("plausible") || status.includes("unverifiable")) return "partial";
   return "supports";
+}
+
+function isPrimarySourceEvidence(evidence) {
+  return /\b(?:primary source|single source|user submitted|retrieved source)\b/i.test(evidence?.reliability || "") ||
+    /^(?:Public Source - Retrieved|Source Report - User Submitted|Hostel Telegram report|Original WhatsApp Message)$/i.test(evidence?.type || "");
 }
 
 function claimStatusClass(status) {

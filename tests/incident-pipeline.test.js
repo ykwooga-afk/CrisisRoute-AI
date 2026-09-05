@@ -389,6 +389,28 @@ test("reference public URL is classified without fabricating an operational inci
   assert.match(incident.safeNextActions.join(" "), /No operational response is recommended/);
 });
 
+test("public URL atomic claims remove source boilerplate and incomplete fragments", () => {
+  const claims = splitAtomicClaims([
+    "Public source URL: https://en.wikipedia.org/wiki/Haze",
+    "Page title: Haze - Wikipedia",
+    "Source hostname: en.wikipedia.org",
+    "Extracted main content:",
+    "Haze 44 languages From Wikipedia, the free encyclopedia.",
+    "Haze is traditionally an atmospheric phenomenon where dust, smoke and dry particulates obscure the clarity of the sky. [1]",
+    "1 ] Sources for particles include farming, traffic, industry and wildfires.",
+    "an approaching airplane) may become difficult to see.",
+    "Severe haze exposure can create respiratory health risk."
+  ].join("\n"));
+
+  assert.deepEqual(claims, [
+    "Haze is traditionally an atmospheric phenomenon where dust, smoke and dry particulates obscure the clarity of the sky",
+    "Sources for particles include farming, traffic, industry and wildfires",
+    "Severe haze exposure can create respiratory health risk"
+  ]);
+  assert.equal(claims.some(claim => /44 languages|From Wikipedia|free encyclopedia|\[[0-9]+\]|1 \]/i.test(claim)), false);
+  assert.equal(claims.some(claim => /^an approaching/i.test(claim)), false);
+});
+
 test("missing-info normalization dedupes equivalent location and contact uncertainty", () => {
   const missing = normalizeMissingFields([
     "Exact apartment number is unknown",

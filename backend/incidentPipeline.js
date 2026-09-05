@@ -1107,21 +1107,33 @@ function claimSourceText(message) {
     .trim();
 }
 
-function compactClaimText(value) {
+function compactClaimText(value, { strictSentenceStart = false } = {}) {
   const text = collapseSpaces(value)
+    .replace(/\b\d+\s+languages\b/gi, "")
+    .replace(/\bfrom wikipedia,\s*the free encyclopedia\b/gi, "")
+    .replace(/\[[0-9]+[a-z]?\]/gi, "")
+    .replace(/\b[0-9]+\s*\]/g, "")
+    .replace(/^\s*(?:\[[0-9]+[a-z]?\]|[0-9]+\s*\])\s*/i, "")
     .replace(/^\W+|\W+$/g, "")
     .trim();
   if (!text || text.length < 24) return null;
+  if (/^(?:jump to content|contents|main page|navigation|languages?|donate|log in|create account|edit|view history)\b/i.test(text)) return null;
+  if (strictSentenceStart) {
+    if (/^[a-z]/.test(text)) return null;
+    if (/^(?:and|or|but|because|which|that|this|these|those|with|without|from|to|for|in|on|of|as)\b/i.test(text)) return null;
+    if (/^(?:an?|the)\s+(?:approaching|following|preceding|above|below)\b/i.test(text)) return null;
+  }
   return text.length > 260 ? `${text.slice(0, 257).trim()}...` : text;
 }
 
 function splitAtomicClaims(text) {
+  const strictSentenceStart = isPublicSourceRequest({ messages: [text] });
   const normalized = claimSourceText(text);
   const chunks = normalized.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [];
   const claims = [];
   const seen = new Set();
   for (const chunk of chunks) {
-    const claim = compactClaimText(chunk);
+    const claim = compactClaimText(chunk, { strictSentenceStart });
     if (!claim) continue;
     if (/^(?:jump to content|contents|main page|navigation|languages?|donate|log in|create account|edit|view history)\b/i.test(claim)) {
       continue;
@@ -1133,7 +1145,7 @@ function splitAtomicClaims(text) {
     if (claims.length === 6) break;
   }
   if (!claims.length) {
-    const fallback = compactClaimText(normalized.slice(0, 260));
+    const fallback = compactClaimText(normalized.slice(0, 260), { strictSentenceStart });
     if (fallback) claims.push(fallback);
   }
   return claims;

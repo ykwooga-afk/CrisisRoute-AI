@@ -2,7 +2,9 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
+const https = require("node:https");
 const path = require("node:path");
 
 const { createServer } = require("../server");
@@ -97,6 +99,72 @@ test("DNS failures attach safe diagnostic metadata without exposing full URLs", 
   assert.equal(caught.diagnostic.timeout, false);
   assert.match(caught.diagnostic.sanitizedMessage, /ENOTFOUND/);
   assert.doesNotMatch(JSON.stringify(caught.diagnostic), /do-not-leak|\/news/i);
+});
+
+test("validated public DNS results are handed to HTTPS lookup in Node-compatible pinned shape", async t => {
+  const originalRequest = https.request;
+  let lookupResult;
+  t.after(() => {
+    https.request = originalRequest;
+  });
+
+  https.request = (url, options, onResponse) => {
+    assert.equal(url.hostname, "example.test");
+    assert.equal(options.servername, "example.test");
+    assert.equal(options.rejectUnauthorized, undefined);
+
+    const request = new EventEmitter();
+    request.destroy = error => {
+      process.nextTick(() => request.emit("error", error));
+    };
+    request.end = () => {
+      options.lookup(url.hostname, { family: undefined, hints: 0, all: true }, (error, addresses, family) => {
+        if (error) {
+          request.emit("error", error);
+          return;
+        }
+        lookupResult = { addresses, family };
+        if (!Array.isArray(addresses)) {
+          const invalidAddressError = new Error("Invalid IP address: undefined");
+          invalidAddressError.code = "ERR_INVALID_IP_ADDRESS";
+          request.emit("error", invalidAddressError);
+          return;
+        }
+
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.headers = { "content-type": "text/html; charset=utf-8" };
+        response.resume = () => {};
+        onResponse(response);
+        process.nextTick(() => {
+          response.emit("data", Buffer.from(`
+            <html>
+              <head><title>Public weather report</title></head>
+              <body>
+                <main>
+                  <p>This public article contains enough readable crisis report text for safe analysis.</p>
+                  <p>Coordinators should verify location and contact details before action.</p>
+                </main>
+              </body>
+            </html>
+          `));
+          response.emit("end");
+        });
+      });
+    };
+    return request;
+  };
+
+  const result = await extractPublicSource("https://example.test/report", {
+    dnsLookup: async () => [{ address: "93.184.216.34", family: 4 }]
+  });
+
+  assert.deepEqual(lookupResult, {
+    addresses: [{ address: "93.184.216.34", family: 4 }],
+    family: undefined
+  });
+  assert.equal(result.finalUrl, "https://example.test/report");
+  assert.match(result.text, /readable crisis report text/);
 });
 
 test("readable HTML extraction strips active chrome and preserves useful article text", () => {

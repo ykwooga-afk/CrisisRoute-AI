@@ -196,8 +196,8 @@ async function fetchReadableText(startUrl, options, redirectCount = 0) {
     options.diagnostics.hostname = startUrl.hostname;
     options.diagnostics.redirectCount = redirectCount;
   }
-  await assertPublicTarget(startUrl, options.dnsLookup, options.diagnostics);
-  const response = await requestOnce(startUrl, options);
+  const validatedAddresses = await assertPublicTarget(startUrl, options.dnsLookup, options.diagnostics);
+  const response = await requestOnce(startUrl, { ...options, validatedAddresses });
   if (response.redirectUrl) {
     if (redirectCount >= options.maxRedirects) {
       throw new PublicSourceError(
@@ -215,7 +215,7 @@ async function fetchReadableText(startUrl, options, redirectCount = 0) {
   return response;
 }
 
-function requestOnce(url, { timeoutMs, maxBytes, dnsLookup, diagnostics }) {
+function requestOnce(url, { timeoutMs, maxBytes, diagnostics, validatedAddresses }) {
   return new Promise((resolve, reject) => {
     const requestModule = url.protocol === "https:" ? https : http;
     let settled = false;
@@ -225,20 +225,20 @@ function requestOnce(url, { timeoutMs, maxBytes, dnsLookup, diagnostics }) {
       fn(value);
     };
 
-    const request = requestModule.request(url, {
+    const requestOptions = {
       method: "GET",
       timeout: timeoutMs,
       headers: {
         Accept: "text/html,text/plain;q=0.9,application/xhtml+xml;q=0.8",
         "User-Agent": "CrisisRouteAI-PublicSourceExtractor/1.0"
       },
-      lookup(hostname, opts, callback) {
-        safeLookup(hostname, opts, dnsLookup, diagnostics).then(
-          result => callback(null, result.address, result.family),
-          error => callback(error)
-        );
-      }
-    }, response => {
+      lookup: createPinnedLookup(validatedAddresses, diagnostics)
+    };
+    if (url.protocol === "https:" && !net.isIP(url.hostname.replace(/^\[|\]$/g, ""))) {
+      requestOptions.servername = url.hostname;
+    }
+
+    const request = requestModule.request(url, requestOptions, response => {
       const location = response.headers.location;
       if (response.statusCode >= 300 && response.statusCode < 400 && location) {
         response.resume();
@@ -387,7 +387,7 @@ async function assertPublicTarget(url, dnsLookup, diagnostics) {
       diagnostics.addressClassification = "public";
       diagnostics.dnsResolved = false;
     }
-    return;
+    return [{ address: hostAddress, family: net.isIP(hostAddress) }];
   }
   if (isBlockedHostname(hostname)) {
     throw new PublicSourceError(
@@ -419,14 +419,42 @@ async function assertPublicTarget(url, dnsLookup, diagnostics) {
     throw privateAddressError(diagnostics);
   }
   if (diagnostics) diagnostics.addressClassification = "public";
+  return addresses;
 }
 
-async function safeLookup(hostname, opts, dnsLookup, diagnostics) {
-  const url = parsePublicUrl(`http://${hostname}`);
-  await assertPublicTarget(url, dnsLookup, diagnostics);
-  const addresses = await lookupAll(hostname, dnsLookup);
+function createPinnedLookup(validatedAddresses, diagnostics) {
+  const pinned = normalizePinnedAddresses(validatedAddresses);
+  return function pinnedLookup(_hostname, opts, callback) {
+    const selected = selectPinnedAddresses(pinned, opts);
+    if (!selected.length) {
+      callback(new PublicSourceError(
+        "PUBLIC_URL_FETCH_FAILED",
+        "This public page could not be fetched safely. Paste the report text instead.",
+        { status: 502, retryable: true, diagnostic: diagnosticSnapshot(diagnostics, {
+          failureStage: "request",
+          sanitizedMessage: "Validated DNS result did not match the requested address family."
+        }) }
+      ));
+      return;
+    }
+    if (opts?.all === true) {
+      callback(null, selected.map(item => ({ address: item.address, family: item.family })));
+      return;
+    }
+    callback(null, selected[0].address, selected[0].family);
+  };
+}
+
+function normalizePinnedAddresses(addresses) {
+  return (Array.isArray(addresses) ? addresses : [])
+    .filter(item => item && typeof item.address === "string")
+    .map(item => ({ address: item.address, family: item.family || net.isIP(item.address) }))
+    .filter(item => (item.family === 4 || item.family === 6) && !isPrivateAddress(item.address));
+}
+
+function selectPinnedAddresses(addresses, opts) {
   const family = opts?.family === 4 || opts?.family === 6 ? opts.family : null;
-  return addresses.find(item => !family || item.family === family) || addresses[0];
+  return family ? addresses.filter(item => item.family === family) : addresses;
 }
 
 function classifyRequestErrorStage(error) {

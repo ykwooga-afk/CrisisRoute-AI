@@ -168,6 +168,17 @@ function safeStringArray(value, { maxItems = 12, maxLength = 240 } = {}) {
   return result;
 }
 
+function safeInputClassification(value) {
+  if (!isPlainObject(value)) return null;
+  const activeIncident = value.activeIncident === true ? true : value.activeIncident === false ? false : null;
+  return {
+    kind: safeString(value.kind, 64),
+    label: safeString(value.label, 120),
+    activeIncident,
+    detail: safeString(value.detail, 240)
+  };
+}
+
 function buildAnalysisSnapshot(incident) {
   if (!isPlainObject(incident)) return null;
   let caseId;
@@ -201,6 +212,7 @@ function buildAnalysisSnapshot(incident) {
     riskFlags: safeStringArray(incident.riskFlags),
     knownFacts: safeStringArray(incident.knownFacts),
     unknownFacts: safeStringArray(incident.unknownFacts),
+    inputClassification: safeInputClassification(incident.inputClassification),
     safeNextActions: safeStringArray(incident.safeNextActions, { maxItems: 10 }),
     recommendedAction: safeString(incident.recommendedAction, 500),
     scores: {

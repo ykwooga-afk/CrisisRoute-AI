@@ -119,6 +119,41 @@ test("priority boundaries are deterministic and do not clamp scores", () => {
   assert.equal(priorityForUrgency(29.99), "LOW");
 });
 
+test("reference-source verification brief does not imply a current medical casualty", () => {
+  const referenceIncident = {
+    ...incident({ operationalState: "URGENT_VERIFICATION", urgency: 34 }),
+    title: "Haze - Wikipedia",
+    location: "Unknown location",
+    peopleCount: null,
+    needs: [],
+    riskFlags: ["smoke exposure"],
+    knownFacts: ["Haze can reduce visibility."],
+    unknownFacts: ["current actionable incident report"],
+    safeNextActions: ["Obtain or verify a current incident report before operational action."],
+    inputClassification: {
+      kind: "REFERENCE_SOURCE",
+      label: "REFERENCE SOURCE · NO ACTIVE INCIDENT DETECTED",
+      activeIncident: false,
+      detail: "This source contains background/reference information rather than a current actionable crisis report."
+    },
+    safetyGates: [
+      { id: "G_LOCATION", status: "blocked", passed: false, detail: "No actionable location." },
+      { id: "G_CONTACT", status: "blocked", passed: false, detail: "No contact path." },
+      { id: "G_RESOURCE", status: "blocked", passed: false, detail: "No operational resource need." },
+      { id: "G_CONFLICT", status: "passed", passed: true, detail: "Agreement." },
+      { id: "G_DISPATCH", status: "locked", passed: false, detail: "Locked." }
+    ]
+  };
+  const value = setup({ incidentValue: referenceIncident, action: "REQUEST_VERIFICATION" });
+  record(value);
+  const { brief } = value.service.generateBrief(value.caseId);
+  const serialized = JSON.stringify(brief);
+  assert.equal(brief.inputClassification.activeIncident, false);
+  assert.match(brief.summary, /reference source/i);
+  assert.match(serialized, /No operational response is recommended/);
+  assert.doesNotMatch(serialized, /breathing difficulty|medical guidance/i);
+});
+
 test("APPROVE brief records approval without claiming automatic execution", () => {
   const value = setup();
   record(value);

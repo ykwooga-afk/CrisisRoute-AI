@@ -14,11 +14,17 @@ const {
   validateReviewerData,
   computeConsensus,
   hasMedicalRedFlag,
+  normalizeLocationCandidate,
   deriveLocation,
   extractPeopleCount,
   extractNeeds,
   extractRiskFlags,
+  contactSemantics,
   buildSafetyGates,
+  normalizeMissingFields,
+  classifyInput,
+  deriveVerificationVerdict,
+  splitAtomicClaims,
   determineOperationalState,
   analyzeCase01
 } = require("../backend/incidentPipeline");
@@ -281,6 +287,124 @@ test("CASE 01 passes role-specific bounded request settings", async () => {
   assert.ok(reviewerCall.messages.reduce((sum, message) => sum + message.content.length, 0) <= 1_300);
   assert.doesNotMatch(analystCall.messages[0].content, /title|location|peopleCount|claims|safeNextActions|operationalState|safetyGates/i);
   assert.doesNotMatch(reviewerCall.messages[0].content, /safetyConcerns|rationale|operationalState|safetyGates/i);
+});
+
+test("live crisis text preserves city while requiring exact location and callback detail", async () => {
+  const client = new FakeGonkaClient({
+    analyst: analystData({
+      scores: { verification: 56, urgency: 92, actionability: 42 },
+      knownFacts: ["Elderly man in Shah Alam", "Breathing difficulty getting worse", "Daughter can be contacted by phone"],
+      unknownFacts: ["Exact apartment number unknown", "Location beyond Shah Alam unspecified", "Verified callback number missing"],
+      riskFlags: ["breathing difficulty"],
+      recommendedAction: "Request urgent verification before dispatch."
+    }),
+    reviewer: reviewerData({
+      scores: { verification: 54, urgency: 94, actionability: 40 },
+      unknowns: ["exact apartment number is unknown", "callback detail unknown"],
+      counterEvidence: ["No independent corroboration"]
+    })
+  });
+  const result = await analyzeCase01({
+    payload: {
+      messages: [
+        "Elderly man in Shah Alam has severe breathing difficulty getting worse. Exact apartment number unknown. Daughter can be contacted by phone. Need medical volunteer."
+      ]
+    },
+    client,
+    now: new Date("2026-09-05T01:00:00Z")
+  });
+  const incident = result.incidents[0];
+  assert.equal(incident.location, "Shah Alam · Exact location unknown");
+  assert.equal(incident.peopleCount, 1);
+  assert.equal(incident.inputClassification.kind, "ACTIVE_REPORT");
+  assert.equal(incident.safetyGates.find(gate => gate.id === "G_LOCATION").status, "blocked");
+  assert.equal(incident.safetyGates.find(gate => gate.id === "G_CONTACT").status, "passed");
+  assert.match(incident.safetyGates.find(gate => gate.id === "G_CONTACT").detail, /contact channel is available/i);
+  assert.ok(incident.missingFields.includes("exact location within Shah Alam"));
+  assert.ok(incident.missingFields.includes("verified callback detail"));
+  assert.equal(incident.missingFields.filter(item => /location/i.test(item)).length, 1);
+  assert.equal(incident.missingFields.includes("contact or callback path"), false);
+  assert.equal(incident.operationalState, "URGENT_VERIFICATION");
+});
+
+test("junk location fragments cannot pass as actionable locations", () => {
+  const request = validateAnalyzeRequest({ messages: ["Smoke may block the view near the corridor."] });
+  const consensus = { level: "AGREEMENT", maxScoreGap: 0, gaps: { verification: 0, urgency: 0, actionability: 0 } };
+  const assessment = { needs: [], riskFlags: [] };
+  assert.equal(normalizeLocationCandidate("block the"), null);
+  assert.equal(normalizeLocationCandidate("the location"), null);
+  assert.equal(normalizeLocationCandidate("near the"), null);
+  assert.equal(normalizeLocationCandidate("Block C"), "Block C");
+  assert.equal(normalizeLocationCandidate("Apartment 12-3, Block C"), "Apartment 12-3, Block C");
+  assert.equal(deriveLocation(request), "Unknown location");
+  const safety = buildSafetyGates({ request, assessment, consensus, location: "block the" });
+  const locationGate = safety.gates.find(gate => gate.id === "G_LOCATION");
+  assert.equal(locationGate.status, "blocked");
+  assert.equal(locationGate.passed, false);
+});
+
+test("reference public URL is classified without fabricating an operational incident", async () => {
+  const client = new FakeGonkaClient({
+    analyst: analystData({
+      scores: { verification: 68, urgency: 34, actionability: 20 },
+      knownFacts: ["Haze contains smoke and particulates", "Haze can reduce visibility"],
+      unknownFacts: ["Current incident report missing", "No affected person identified"],
+      riskFlags: ["smoke exposure"],
+      recommendedAction: "Use as background only unless a current report is supplied."
+    }),
+    reviewer: reviewerData({
+      scores: { verification: 66, urgency: 32, actionability: 22 },
+      unknowns: ["current actionable incident report missing", "No affected population"],
+      conclusion: "This is background content, not a current operational case."
+    })
+  });
+  const result = await analyzeCase01({
+    payload: {
+      messages: [
+        [
+          "Public source URL: https://en.wikipedia.org/wiki/Haze",
+          "Page title: Haze - Wikipedia",
+          "Source hostname: en.wikipedia.org",
+          "Extracted main content:",
+          "Haze is traditionally an atmospheric phenomenon where dust, smoke and dry particulates obscure the clarity of the sky.",
+          "Haze can reduce visibility.",
+          "Severe haze exposure can create respiratory health risk."
+        ].join("\n")
+      ]
+    },
+    client,
+    now: new Date("2026-09-05T01:00:00Z")
+  });
+  const incident = result.incidents[0];
+  assert.equal(incident.inputClassification.kind, "REFERENCE_SOURCE");
+  assert.equal(incident.inputClassification.activeIncident, false);
+  assert.equal(incident.title, "Haze - Wikipedia");
+  assert.equal(incident.location, "Unknown location");
+  assert.equal(incident.peopleCount, null);
+  assert.equal(incident.safetyGates.find(gate => gate.id === "G_LOCATION").passed, false);
+  assert.ok(incident.claims.length >= 3);
+  assert.ok(incident.claims.every(claim => claim.kind === "background"));
+  assert.equal(incident.claims.some(claim => /Public source URL|Page title|Source hostname/.test(claim.text)), false);
+  assert.ok(incident.missingFields.includes("current actionable incident report"));
+  assert.match(incident.safeNextActions.join(" "), /No operational response is recommended/);
+});
+
+test("missing-info normalization dedupes equivalent location and contact uncertainty", () => {
+  const missing = normalizeMissingFields([
+    "Exact apartment number is unknown",
+    "Exact apartment number unknown.",
+    "Location beyond Shah Alam unspecified",
+    "verified callback number",
+    "callback detail unknown"
+  ], { knownArea: "Shah Alam", contactChannelAvailable: true });
+  assert.deepEqual(missing, ["exact location within Shah Alam", "verified callback detail"]);
+});
+
+test("verification verdict is a display-only mapping from existing scores and consensus", () => {
+  assert.equal(deriveVerificationVerdict({ scores: { verification: 85 }, consensus: { level: "AGREEMENT" } }), "SUPPORTED");
+  assert.equal(deriveVerificationVerdict({ scores: { verification: 45 }, consensus: { level: "AGREEMENT" } }), "LIMITED SUPPORT");
+  assert.equal(deriveVerificationVerdict({ scores: { verification: 20 }, consensus: { level: "AGREEMENT" } }), "UNVERIFIED");
+  assert.equal(deriveVerificationVerdict({ scores: { verification: 85 }, consensus: { level: "CRITICAL_CONFLICT" } }), "CONFLICTING");
 });
 
 test("Analyst timeout is safely identified without leaking successful Reviewer content", async () => {

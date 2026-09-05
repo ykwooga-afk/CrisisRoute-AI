@@ -2,7 +2,7 @@ export const MODE_PROVENANCE = Object.freeze({
   live: Object.freeze({
     mode: "LIVE",
     title: "Live Gonka analysis",
-    lines: Object.freeze(["Two model requests", "Human action still required"]),
+    lines: Object.freeze(["Two live Gonka model requests", "Human decision recorded; real-world execution remains external"]),
     live: true,
     proofEligible: true
   }),

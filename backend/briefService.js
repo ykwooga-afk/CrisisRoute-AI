@@ -63,8 +63,28 @@ function formatGate(snapshot, gateId, label) {
   return `${label}: ${status}`;
 }
 
+function isReferenceSnapshot(snapshot) {
+  return snapshot?.inputClassification?.activeIncident === false;
+}
+
 function actionContent(snapshot, decision) {
   const baseConstraint = "This software records and prepares a handoff; it does not execute real-world action.";
+  if (isReferenceSnapshot(snapshot) && decision.action === "REQUEST_VERIFICATION") {
+    return {
+      title: "Reference source verification record",
+      summary: "The human decision was recorded for a reference source. No current operational incident or real-world action is claimed.",
+      safetyConstraints: [
+        snapshot.inputClassification?.label || "Reference source; no active incident detected.",
+        formatGate(snapshot, "G_LOCATION", "Location gate"),
+        formatGate(snapshot, "G_CONTACT", "Contact gate"),
+        baseConstraint
+      ],
+      nextSteps: [
+        "No operational response is recommended from this source alone because it contains general reference information rather than a current incident.",
+        "Obtain or verify a current incident report before operational action."
+      ]
+    };
+  }
   const byAction = {
     APPROVE_ACTION: {
       title: "Approved action handoff",
@@ -301,6 +321,7 @@ function createBriefService({ decisionLedger, clock = () => new Date() } = {}) {
       peopleCount: snapshot.peopleCount,
       requestedResources: clone(snapshot.needs),
       riskFlags: clone(snapshot.riskFlags),
+      inputClassification: clone(snapshot.inputClassification || null),
       safetyConstraints: content.safetyConstraints,
       nextSteps: [...content.nextSteps, ...snapshot.safeNextActions].slice(0, 10),
       humanReason: decision.reason,

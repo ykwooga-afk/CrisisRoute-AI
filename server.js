@@ -490,8 +490,9 @@ function decoratePublicSourceResult(result, publicSource) {
             ? incident.evidence.map((item, itemIndex) => itemIndex === 0
               ? {
                 ...item,
-                type: "public_url_extract",
+                type: "Public Source - Retrieved",
                 summary: item.summary || `Readable text extracted from ${hostname}.`,
+                reliability: item.reliability || "PRIMARY SOURCE - UNVERIFIED. Retrieved source; not independently verified by AI.",
                 sourceUrl: publicSource.finalUrl
               }
               : item)

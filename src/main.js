@@ -113,6 +113,74 @@ const gateStatusLabels = {
   locked: "LOCKED"
 };
 
+function inputClassificationFor(incident) {
+  const supplied = incident?.inputClassification;
+  if (supplied && typeof supplied === "object") {
+    return {
+      kind: supplied.kind || "ACTIVE_REPORT",
+      label: supplied.label || "ACTIVE REPORT",
+      activeIncident: supplied.activeIncident !== false,
+      detail: supplied.detail || "This source contains current incident signals for human review."
+    };
+  }
+  return {
+    kind: "ACTIVE_REPORT",
+    label: "ACTIVE REPORT",
+    activeIncident: true,
+    detail: "This source contains current incident signals for human review."
+  };
+}
+
+function isReferenceSource(incident) {
+  return inputClassificationFor(incident).activeIncident === false;
+}
+
+function normalizeDisplayItem(value) {
+  const text = String(value || "").replace(/\s+/g, " ").trim().replace(/[.;:]+$/g, "");
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  if (/\b(?:apartment|address|gps|location|room|unit|floor|block|lobby)\b/.test(lower)) return "exact actionable location";
+  if (/\b(?:callback|contact|phone|telephone|number|reachable)\b/.test(lower)) return "verified callback detail";
+  if (/\b(?:independent|corroborat|source)\b/.test(lower)) return "independent corroboration";
+  if (/\b(?:resource|mask|n95|water|transport|safe room|clinic)\b/.test(lower)) return "matched available resource";
+  if (/\b(?:medical|clinical|severity|status|condition)\b/.test(lower)) return "current medical status";
+  return text;
+}
+
+function uniqueDisplayList(items) {
+  const output = [];
+  const seen = new Set();
+  for (const item of items || []) {
+    const normalized = normalizeDisplayItem(item);
+    if (!normalized) continue;
+    const key = normalized.toLowerCase();
+    if (!seen.has(key)) {
+      output.push(normalized);
+      seen.add(key);
+    }
+  }
+  return output;
+}
+
+function verificationVerdictFor(incident) {
+  if (incident?.verificationVerdict) return incident.verificationVerdict;
+  if (incident?.modelDebate?.consensus === "CRITICAL_CONFLICT") return "CONFLICTING";
+  const score = Number(incident?.scores?.verification);
+  if (!Number.isFinite(score)) return "UNVERIFIED";
+  if (score >= 60) return "SUPPORTED";
+  if (score >= 30) return "LIMITED SUPPORT";
+  return "UNVERIFIED";
+}
+
+function claimDisplayLabel(incident, claim) {
+  if (claim?.kind === "background" || isReferenceSource(incident)) return "BACKGROUND CLAIM";
+  return claimStatusLabels[claim?.status] || normalizeLabel(claim?.status);
+}
+
+function truthVerificationNote() {
+  return "Truth / Verification measures how strongly the available evidence supports the report. It is not a probability that the incident is true.";
+}
+
 async function init() {
   render();
   await refreshHealth();
@@ -993,8 +1061,9 @@ function renderResultCasePanel(incident) {
         ${incident.aqi ? `<span class="aqi">AQI ${escapeHtml(String(incident.aqi))}</span>` : ""}
         <span>${escapeHtml(incident.source)}</span>
         <span>Received ${escapeHtml(formatTime(incident.receivedAt))}</span>
+        <span class="classification-pill">${escapeHtml(inputClassificationFor(incident).label)}</span>
       </div>
-      <blockquote>${escapeHtml(incident.rawMessage)}</blockquote>
+      <blockquote>${escapeHtml(caseDisplayExcerpt(incident))}</blockquote>
       <div class="knowledge-grid result-knowledge-grid">
         <div>
           <h2>What We Know</h2>
@@ -1005,7 +1074,7 @@ function renderResultCasePanel(incident) {
         <div>
           <h2 class="red-title">What We Don’t Know</h2>
           <ul class="unknown-list">
-            ${listItems((incident.unknownFacts || incident.missingFields || []).slice(0, 3))}
+            ${listItems(uniqueDisplayList(incident.unknownFacts || incident.missingFields || []).slice(0, 3))}
           </ul>
         </div>
       </div>
@@ -1014,9 +1083,9 @@ function renderResultCasePanel(incident) {
         <p>Evidence gaps reduce actionability, but they do not erase possible harm.</p>
       </div>
       <section class="command-metrics">
-        <h2>Verification · Urgency · Actionability</h2>
+        <h2>Truth / Verification · Urgency · Actionability</h2>
         <div class="metric-card-grid command-score-grid">
-          ${renderMetricCard("Verification", incident.scores.verification, metricCaption(incident, "verification"), "verification")}
+          ${renderMetricCard("Truth / Verification", incident.scores.verification, metricCaption(incident, "verification"), "verification")}
           ${renderMetricCard("Urgency", incident.scores.urgency, metricCaption(incident, "urgency"), "urgency")}
           ${renderMetricCard("Actionability", incident.scores.actionability, metricCaption(incident, "actionability"), "actionability")}
         </div>
@@ -1154,6 +1223,9 @@ function readinessTone(incident) {
 }
 
 function readinessStatusCopy(incident) {
+  if (isReferenceSource(incident)) {
+    return "Reference content was retrieved, but no active incident is detected from this source alone.";
+  }
   if (incident.operationalState === "DISPATCH_CANDIDATE") {
     return "This case is a strong candidate for further review and potential action.";
   }
@@ -1174,6 +1246,12 @@ function readinessStatusCopy(incident) {
 
 function readinessConcern(incident, context) {
   const { hasModelDisagreement, medicalGate, blockedRequiredGates } = context;
+  if (isReferenceSource(incident)) {
+    return {
+      concernTitle: "No active incident detected",
+      concernDetail: inputClassificationFor(incident).detail
+    };
+  }
   if (hasModelDisagreement) {
     return {
       concernTitle: "Model disagreement requires review",
@@ -1203,6 +1281,12 @@ function readinessConcern(incident, context) {
 
 function readinessGap(incident, context) {
   const { blockedRequiredGates, missingFields, dispatch } = context;
+  if (isReferenceSource(incident)) {
+    return {
+      gapTitle: "Current actionable report missing",
+      gapDetail: "Use the retrieved source as background until a current incident report is supplied."
+    };
+  }
   const locationBlocked = blockedRequiredGates.some(gate => gate.id === "G_LOCATION");
   const contactBlocked = blockedRequiredGates.some(gate => gate.id === "G_CONTACT");
 
@@ -1246,6 +1330,12 @@ function readinessGap(incident, context) {
 
 function readinessNextStep(incident, context) {
   const { hasModelDisagreement, blockedRequiredGates, dispatch } = context;
+  if (isReferenceSource(incident)) {
+    return {
+      nextTitle: "Obtain or verify a current incident report.",
+      nextDetail: "No operational response is recommended from this source alone."
+    };
+  }
   if (hasModelDisagreement) {
     return {
       nextTitle: "Review case intelligence and evidence before safety approval.",
@@ -1336,9 +1426,10 @@ function renderSelectedCaseSummary(incident) {
         <span>${escapeHtml(incident.location || "Location unknown")}</span>
         ${incident.coordinates ? `<span>${escapeHtml(incident.coordinates)}</span>` : ""}
         ${incident.aqi ? `<span class="aqi">AQI ${escapeHtml(String(incident.aqi))}</span>` : ""}
+        <span class="classification-pill">${escapeHtml(inputClassificationFor(incident).label)}</span>
       </div>
       <p class="source-line">${escapeHtml(incident.source)} · Received ${formatTime(incident.receivedAt)}</p>
-      <blockquote>${escapeHtml(incident.rawMessage)}</blockquote>
+      <blockquote>${escapeHtml(caseDisplayExcerpt(incident))}</blockquote>
       <div class="knowledge-grid">
         <div>
           <h2>What We Know</h2>
@@ -1349,7 +1440,7 @@ function renderSelectedCaseSummary(incident) {
         <div>
           <h2 class="red-title">What We Don't Know</h2>
           <ul class="unknown-list">
-            ${listItems(incident.unknownFacts || incident.missingFields || [])}
+            ${listItems(uniqueDisplayList(incident.unknownFacts || incident.missingFields || []))}
           </ul>
         </div>
       </div>
@@ -1360,7 +1451,7 @@ function renderSelectedCaseSummary(incident) {
 function renderThreeAxisScores(incident, variant = "default") {
   return `
     <section class="three-axis ${variant}">
-      ${renderScoreAxis("Verification", incident.scores.verification, "Limited evidence", "verification")}
+      ${renderScoreAxis("Truth / Verification", incident.scores.verification, "Limited evidence", "verification")}
       ${renderScoreAxis("Urgency", incident.scores.urgency, urgencyCaption(incident), "urgency")}
       ${renderScoreAxis("Actionability", incident.scores.actionability, actionabilityCaption(incident), "actionability")}
     </section>
@@ -1523,8 +1614,9 @@ function renderCaseIntelligence(incident) {
 
       <section class="metrics-section">
         <h2><span>3.</span> Key Metrics</h2>
+        <p class="truth-definition-note">${escapeHtml(truthVerificationNote())}</p>
         <div class="metric-card-grid">
-          ${renderMetricCard("Verification", incident.scores.verification, metricCaption(incident, "verification"), "verification")}
+          ${renderMetricCard("Truth / Verification", incident.scores.verification, metricCaption(incident, "verification"), "verification")}
           ${renderMetricCard("Urgency", incident.scores.urgency, metricCaption(incident, "urgency"), "urgency")}
           ${renderMetricCard("Actionability", incident.scores.actionability, metricCaption(incident, "actionability"), "actionability")}
         </div>
@@ -1539,13 +1631,13 @@ function renderCaseIntelligence(incident) {
               <span>Claim</span>
               <span>Assessment</span>
             </div>
-            ${incident.claims.map(claim => renderIntelligenceClaimRow(claim)).join("")}
+            ${incident.claims.map(claim => renderIntelligenceClaimRow(incident, claim)).join("")}
           </div>
         </article>
 
         <article class="analysis-card missing-analysis-card">
           <h2><span>5.</span> Missing Information</h2>
-          <ul class="missing-analysis-list">${(incident.missingFields || []).map(item => `<li>${escapeHtml(item)}</li>`).join("") || "<li>No missing information recorded.</li>"}</ul>
+          <ul class="missing-analysis-list">${uniqueDisplayList(incident.missingFields || []).map(item => `<li>${escapeHtml(item)}</li>`).join("") || "<li>No missing information recorded.</li>"}</ul>
         </article>
 
         <article class="analysis-card risk-analysis-card">
@@ -1603,12 +1695,22 @@ function renderCompactCaseMetadata(incident) {
     incident.source,
     formatTime(incident.receivedAt),
     incident.aqi ? `AQI ${incident.aqi}` : "",
-    formatPeople(incident.peopleCount)
+    formatPeople(incident.peopleCount),
+    inputClassificationFor(incident).label
   ].filter(Boolean);
   return `<div class="case-analysis-meta">${items.map(item => `<span>${escapeHtml(item)}</span>`).join("")}</div>`;
 }
 
+function caseDisplayExcerpt(incident) {
+  const summary = incident?.evidence?.[0]?.summary || incident?.rawMessage || "";
+  const text = String(summary).replace(/\s+/g, " ").trim();
+  return text.length > 520 ? `${text.slice(0, 517).trim()}...` : text;
+}
+
 function caseOverviewCopy(incident) {
+  if (isReferenceSource(incident)) {
+    return inputClassificationFor(incident).detail;
+  }
   const facts = Array.isArray(incident.knownFacts) ? incident.knownFacts.slice(0, 3) : [];
   const needs = Array.isArray(incident.needs) ? incident.needs.slice(0, 3) : [];
   const gaps = Array.isArray(incident.missingFields) ? incident.missingFields.slice(0, 2) : [];
@@ -1637,9 +1739,15 @@ function caseOverviewCopy(incident) {
 
 function priorityReasons(incident) {
   const reasons = [];
+  if (isReferenceSource(incident)) {
+    return [
+      inputClassificationFor(incident).detail,
+      "Scores reflect evidence support and model review; they do not authorize operational response."
+    ];
+  }
   const risks = (incident.riskFlags || []).map(flag => String(flag).toLowerCase());
   const known = (incident.knownFacts || []).map(fact => String(fact).toLowerCase());
-  const missing = incident.missingFields || [];
+  const missing = uniqueDisplayList(incident.missingFields || []);
 
   if (risks.some(flag => /elderly|high-risk|asthma|medical|respiratory|breath/.test(flag)) ||
       known.some(fact => /elderly|asthma|breath|cough|respiratory/.test(fact))) {
@@ -1649,7 +1757,7 @@ function priorityReasons(incident) {
     reasons.push(`AQI ${incident.aqi} gives the case relevant haze-risk context.`);
   }
   if (incident.scores?.verification < 60 && incident.scores?.urgency >= 80) {
-    reasons.push("Verification is incomplete, but urgency remains high because potential harm is time-sensitive.");
+    reasons.push("Truth / Verification is incomplete, but urgency remains high because potential harm is time-sensitive.");
   }
   if (missing.length) {
     reasons.push(`Missing information keeps actionability constrained: ${missing.slice(0, 2).join(", ")}.`);
@@ -1689,13 +1797,13 @@ function metricCaption(incident, type) {
 }
 
 function metricDefinition(type) {
-  if (type === "verification") return "How well-supported is the report?";
+  if (type === "verification") return "How strongly does the evidence support the report?";
   if (type === "urgency") return "If true, how dangerous or time-sensitive is it?";
   return "Do we have enough information to act safely?";
 }
 
-function renderIntelligenceClaimRow(claim) {
-  const status = claimStatusLabels[claim.status] || normalizeLabel(claim.status);
+function renderIntelligenceClaimRow(incident, claim) {
+  const status = claimDisplayLabel(incident, claim);
   return `
     <article class="intelligence-claim-row">
       <span class="claim-id">${escapeHtml(claim.id)}</span>
@@ -1753,10 +1861,11 @@ function renderEvidenceView(incident) {
         </div>
         <button class="primary-action" data-action="view" data-view="safety">Continue to Safety →</button>
       </section>
+      ${renderVerificationResult(incident)}
       <section class="evidence-layout">
         <aside class="claims-sidebar">
           <h2 class="section-kicker">Claims</h2>
-          ${incident.claims.map(claim => renderEvidenceClaimItem(claim)).join("")}
+          ${incident.claims.map(claim => renderEvidenceClaimItem(incident, claim)).join("")}
         </aside>
         <section class="evidence-network-panel">
           <h2 class="section-kicker">Evidence Connections</h2>
@@ -1772,12 +1881,37 @@ function renderEvidenceView(incident) {
   `;
 }
 
-function renderEvidenceClaimItem(claim) {
+function renderVerificationResult(incident) {
+  const classification = inputClassificationFor(incident);
+  return `
+    <section class="verification-result-panel" aria-label="Verification result">
+      <span class="section-kicker">Verification Result</span>
+      <div class="verification-result-grid">
+        ${verificationResultItem("Verdict", verificationVerdictFor(incident))}
+        ${verificationResultItem("Truth / Verification", `${incident.scores.verification}/100`)}
+        ${verificationResultItem("Urgency", `${incident.scores.urgency}/100`)}
+        ${verificationResultItem("Actionability", `${incident.scores.actionability}/100`)}
+        ${verificationResultItem("Input Classification", classification.label)}
+      </div>
+    </section>
+  `;
+}
+
+function verificationResultItem(label, value) {
+  return `
+    <article>
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+    </article>
+  `;
+}
+
+function renderEvidenceClaimItem(incident, claim) {
   return `
     <article class="evidence-claim-item ${claimStatusClass(claim.status)}">
       <span>${escapeHtml(claim.id)}</span>
       <strong>${escapeHtml(claim.text)}</strong>
-      <b>${escapeHtml(claimStatusLabels[claim.status] || normalizeLabel(claim.status))}</b>
+      <b>${escapeHtml(claimDisplayLabel(incident, claim))}</b>
     </article>
   `;
 }
@@ -1848,6 +1982,7 @@ function renderEvidenceNetwork(incident) {
 
 function renderEvidenceInspector(evidence) {
   if (!evidence) return `<div class="empty-panel">No evidence selected.</div>`;
+  const uncertainties = uniqueDisplayList(evidence.uncertainties || []);
   return `
     <article class="inspector-card">
       <div class="inspector-title">
@@ -1855,9 +1990,10 @@ function renderEvidenceInspector(evidence) {
         <strong>${escapeHtml(evidence.type)}</strong>
       </div>
       ${inspectorRow("Retrieved", formatTime(evidence.retrievedAt))}
+      ${inspectorRow("Source status", sourceEvidenceStatus(evidence))}
       ${inspectorRow("Reliability", evidence.reliability || "Reliability metadata unavailable")}
       ${inspectorRow("Contradictions", evidence.contradictions || "None recorded")}
-      ${inspectorRow("Uncertainties", Array.isArray(evidence.uncertainties) ? evidence.uncertainties.join(" · ") : "Not specified")}
+      ${inspectorRow("Uncertainties", uncertainties.length ? uncertainties.join(" · ") : "Not specified")}
       <hr />
       <p>${escapeHtml(evidence.summary)}</p>
     </article>
@@ -1873,6 +2009,13 @@ function renderEvidenceInspector(evidence) {
         .join("")}
     </div>
   `;
+}
+
+function sourceEvidenceStatus(evidence) {
+  const reliability = String(evidence?.reliability || "").toLowerCase();
+  if (reliability.includes("primary source")) return "PRIMARY SOURCE - UNVERIFIED";
+  if (String(evidence?.type || "").toLowerCase().includes("fixture")) return "DEMO FIXTURE - NOT LIVE EVIDENCE";
+  return "SOURCE STATUS NOT INDEPENDENTLY VERIFIED";
 }
 
 function inspectorRow(label, value) {
@@ -1906,13 +2049,10 @@ function renderBlindModelReview(incident) {
 }
 
 function renderModelReviewCard(title, trace, review, role) {
-  const traceCopy = state.mode === DATA_MODES.replay
-    ? `${trace.model} · Response ID [REDACTED] · Sanitized recorded trace; not this load's latency`
-    : `${trace.model} · ${trace.responseId} · ${trace.promptVersion} · ${String(trace.latencyMs)}ms`;
   return `
     <article class="model-card ${role}">
       <h3>${escapeHtml(title)}</h3>
-      <p class="trace-line">${escapeHtml(traceCopy)}</p>
+      ${renderGonkaTrace(trace)}
       ${modelRow("Conclusion", review.conclusion)}
       ${review.evidenceCited ? modelRow("Evidence cited", review.evidenceCited.join(" · ")) : ""}
       ${review.counterEvidence ? modelRow("Counter-evidence", arrayText(review.counterEvidence)) : ""}
@@ -1921,6 +2061,41 @@ function renderModelReviewCard(title, trace, review, role) {
       ${modelRow("Scores", scoreText({ scores: review.scores || getSelectedIncident().scores }))}
       ${modelRow("Rationale", review.rationale)}
     </article>
+  `;
+}
+
+function renderGonkaTrace(trace = {}) {
+  const requestId = state.mode === DATA_MODES.live
+    ? "Not exposed by gateway"
+    : state.mode === DATA_MODES.replay
+      ? "Replay trace; request ID redacted"
+      : "Demo synthetic trace; no live request";
+  const responseId = state.mode === DATA_MODES.live
+    ? trace.responseId || "Not exposed by gateway"
+    : state.mode === DATA_MODES.replay
+      ? "Replay response ID redacted"
+      : trace.responseId || "Demo synthetic response";
+  const latency = state.mode === DATA_MODES.live
+    ? `${String(trace.latencyMs || "Not available")}ms`
+    : state.mode === DATA_MODES.replay
+      ? "Recorded replay; not this load's latency"
+      : `${String(trace.latencyMs || "0")}ms synthetic`;
+  const rows = [
+    ["Model", trace.model || "Not available"],
+    ["Gonka Request ID", requestId],
+    ["Gonka Response ID", responseId],
+    ["Prompt Version", trace.promptVersion || "Not available"],
+    ["Latency", latency]
+  ];
+  return `
+    <div class="trace-grid" aria-label="Gonka inference provenance">
+      ${rows.map(([label, value]) => `
+        <div>
+          <span>${escapeHtml(label)}</span>
+          <p>${escapeHtml(value)}</p>
+        </div>
+      `).join("")}
+    </div>
   `;
 }
 
@@ -2010,10 +2185,14 @@ function renderSafetySummary(incident) {
     : dispatch.status === "review"
       ? "REVIEW REQUIRED"
       : "LOCKED";
-  const summaryCopy = dispatch.status === "passed"
+  const summaryCopy = isReferenceSource(incident)
+    ? "Reference source does not establish an active dispatchable incident."
+    : dispatch.status === "passed"
     ? "System safety checks indicate this case may proceed to human approval."
     : "System safety checks prevent dispatch at this time.";
-  const summaryDetail = dispatch.status === "passed"
+  const summaryDetail = isReferenceSource(incident)
+    ? "Use this source as background context until a current incident report is supplied."
+    : dispatch.status === "passed"
     ? "The coordinator must still review details and explicitly record the decision."
     : "Key information is still missing. Review the details below and choose an allowed human action.";
 
@@ -2222,7 +2401,7 @@ function renderHumanDecisionButtons(incident) {
             <p>Enter the operator's own reason.</p>
           </div>
         </div>
-        <textarea id="human-reason" maxlength="500" placeholder="Exact location and verified contact are missing. Request verification before dispatch." ${busy ? "disabled" : ""}>${escapeHtml(form.reason)}</textarea>
+        <textarea id="human-reason" maxlength="500" placeholder="${escapeHtml(humanReasonPlaceholder(incident))}" ${busy ? "disabled" : ""}>${escapeHtml(form.reason)}</textarea>
         <small class="reason-count">${escapeHtml(String(form.reason.length))} / 500</small>
       </section>
       <fieldset class="acknowledgement-list">
@@ -2252,6 +2431,24 @@ function renderHumanDecisionButtons(incident) {
       <p class="demo-auth-notice">Demo local operator — no production identity authentication.</p>
     </form>
   `;
+}
+
+function humanReasonPlaceholder(incident) {
+  if (isReferenceSource(incident)) {
+    return "Reference source only. Obtain or verify a current incident report before operational action.";
+  }
+  const blockers = (incident.safetyGates || [])
+    .filter(gate => ["G_LOCATION", "G_CONTACT", "G_RESOURCE", "G_CONFLICT"].includes(gate.id))
+    .filter(gate => ["blocked", "locked", "review"].includes(gate.status));
+  if (!blockers.length) return "Enter the operator's reason based on the current safety assessment.";
+  const labels = blockers.slice(0, 2).map(gate => {
+    if (gate.id === "G_LOCATION") return "exact location";
+    if (gate.id === "G_CONTACT") return "contact/callback detail";
+    if (gate.id === "G_RESOURCE") return "matched resource availability";
+    if (gate.id === "G_CONFLICT") return "model disagreement";
+    return gate.label.toLowerCase();
+  });
+  return `${labels.join(" and ")} ${labels.length === 1 ? "needs" : "need"} review before dispatch.`;
 }
 
 function renderGateStatusStrip(incident) {
@@ -2321,6 +2518,9 @@ function pathIconType(status) {
 }
 
 function dispatchLessonCopy(incident, dispatch) {
+  if (isReferenceSource(incident)) {
+    return "A reference source can inform context, but it does not establish a current dispatchable incident.";
+  }
   if (dispatch.status === "passed") {
     return "Safety checks support eligibility, but only a human coordinator can record the decision.";
   }
@@ -2334,6 +2534,9 @@ function dispatchLessonCopy(incident, dispatch) {
 }
 
 function humanDispatchCopy(incident, dispatch) {
+  if (isReferenceSource(incident)) {
+    return "No active incident is detected from this source alone. Dispatch approval is unavailable.";
+  }
   if (dispatch.status === "passed") {
     return "Safety prerequisites appear available. A human decision is still required before any brief is generated.";
   }
@@ -2511,6 +2714,7 @@ function renderExecutionNote(brief) {
 
 function renderProofCapsulePanel(workflow, brief, proof, rules) {
   const liveProof = state.mode === DATA_MODES.live && proof;
+  const displayStatus = liveProof ? proofStatusLabel(workflow) : rules.proofStatus || "UNAVAILABLE";
   return `
     <section class="action-side-card proof-capsule-panel">
       <div class="proof-title-row">
@@ -2529,9 +2733,9 @@ function renderProofCapsulePanel(workflow, brief, proof, rules) {
       </div>
       ${liveProof ? renderLiveProofNotice(workflow) : renderDemoProofNotice()}
       <div class="proof-status-table">
-        ${summaryRow("Status", rules.proofStatus || "UNAVAILABLE")}
+        ${summaryRow("Status", displayStatus)}
         ${summaryRow("Type", proofTypeLabel(liveProof))}
-        ${summaryRow("Verification", proofVerificationLabel(workflow, liveProof))}
+        ${summaryRow("Integrity Check", proofVerificationLabel(workflow, liveProof))}
         ${summaryRow("Server Capsule", liveProof ? "Issued" : "Not Issued")}
       </div>
       ${liveProof ? `
@@ -2547,7 +2751,7 @@ function renderProofCapsulePanel(workflow, brief, proof, rules) {
 function renderLiveProofNotice(workflow) {
   return `
     <article class="proof-receipt demo-proof live-proof-status">
-      <strong>${escapeHtml(workflow.proofStatus || "UNVERIFIED")}</strong>
+      <strong>${escapeHtml(proofIntegrityLabel(workflow.proofStatus))}</strong>
       <p>Live proof represents local payload integrity only. It is not evidence of real-world execution.</p>
     </article>
   `;
@@ -2555,9 +2759,9 @@ function renderLiveProofNotice(workflow) {
 
 function proofStatusLabel(workflow) {
   if (state.mode !== DATA_MODES.live || !workflow.proofCapsule) return "UNAVAILABLE — not a server-issued live capsule";
-  if (workflow.proofStatus === "VALID") return "VALID — unchanged local payload";
-  if (workflow.proofStatus === "INVALID") return "INVALID — payload or reference changed";
-  if (workflow.proofStatus === "VERIFYING") return "VERIFYING — local integrity check in progress";
+  if (workflow.proofStatus === "VALID") return "LOCAL INTEGRITY VERIFIED — unchanged local payload";
+  if (workflow.proofStatus === "INVALID") return "LOCAL INTEGRITY FAILED — payload or reference changed";
+  if (workflow.proofStatus === "VERIFYING") return "VERIFYING LOCAL INTEGRITY";
   return "UNVERIFIED — select Verify Local Proof";
 }
 
@@ -2582,8 +2786,8 @@ function renderServerProof(brief, proof) {
 function renderDemoProofNotice() {
   const label = state.mode === DATA_MODES.replay ? "REPLAY ONLY" : "DEMO ONLY";
   const copy = state.mode === DATA_MODES.replay
-    ? "Sanitized Replay data cannot be marked Proof Valid and does not imply a new live inference."
-    : "Mock and Replay data cannot be marked Proof Valid and cannot use server Proof verification.";
+    ? "Sanitized Replay data cannot be marked as a server-issued live proof and does not imply a new live inference."
+    : "Mock and Replay data cannot be marked as a server-issued live proof and cannot use server Proof verification.";
   return `
     <article class="proof-receipt demo-proof">
       <strong>${escapeHtml(label)}</strong>
@@ -2713,6 +2917,15 @@ function summaryRow(label, value) {
 }
 
 function actionNextSteps(incident, brief) {
+  if (isReferenceSource(incident)) {
+    const contextual = [
+      "No operational response is recommended from this source alone because it contains general reference information rather than a current incident.",
+      "Obtain or verify a current incident report before operational action."
+    ];
+    const briefSteps = Array.isArray(brief?.nextSteps) ? brief.nextSteps : [];
+    const safeSteps = briefSteps.filter(step => !/breathing difficulty|medical guidance|callback path|exact location/i.test(String(step)));
+    return (safeSteps.length ? safeSteps : contextual).slice(0, 8);
+  }
   const briefSteps = Array.isArray(brief?.nextSteps) ? brief.nextSteps : [];
   const incidentSteps = Array.isArray(incident.safeNextActions) ? incident.safeNextActions : [];
   return (briefSteps.length ? briefSteps : incidentSteps).filter(Boolean).slice(0, 8);
@@ -2725,12 +2938,18 @@ function titleCaseLabel(value) {
 }
 
 function decisionOutcomeCopy(incident, brief, decision) {
+  if (isReferenceSource(incident)) {
+    return "Human decision recorded for a reference source. No current operational incident or real-world action is claimed.";
+  }
   if (brief.summary) return brief.summary;
   if (decision.reason) return decision.reason;
   return incident.recommendedAction || "A human decision was recorded for this case.";
 }
 
 function decisionRationale(incident, brief) {
+  if (isReferenceSource(incident)) {
+    return inputClassificationFor(incident).detail;
+  }
   if (brief.summary) return brief.summary;
   if (incident.recommendedAction) return incident.recommendedAction;
   return dispatchPresentation(incident).detail;
@@ -2755,7 +2974,14 @@ function proofTypeLabel(liveProof) {
 
 function proofVerificationLabel(workflow, liveProof) {
   if (!liveProof) return "Not Applicable";
-  return normalizeLabel(workflow.proofStatus || "UNVERIFIED");
+  return proofIntegrityLabel(workflow.proofStatus);
+}
+
+function proofIntegrityLabel(status) {
+  if (status === "VALID") return "LOCAL INTEGRITY VERIFIED";
+  if (status === "INVALID") return "LOCAL INTEGRITY FAILED";
+  if (status === "VERIFYING") return "VERIFYING LOCAL INTEGRITY";
+  return "UNVERIFIED";
 }
 
 function auditChainLabel(audit) {
@@ -2789,7 +3015,7 @@ function renderProofReceipt(incident, proof) {
       ${receiptRow("Human Decision", human.decision || "PENDING")}
       <h3>Evidence Chain</h3>
       ${receiptRow("Evidence hashes", evidenceHashes.map(shortHash).join("   "))}
-      <h3>AI Verification</h3>
+      <h3>AI Evidence Review</h3>
       ${receiptRow("Analyst", incident.gonka.analyst.model)}
       ${receiptRow("Analyst resp.", incident.gonka.analyst.responseId)}
       ${receiptRow("Reviewer", incident.gonka.reviewer.model)}
@@ -2940,7 +3166,7 @@ function queueSubtitle(incident) {
 }
 
 function scoreText(incident) {
-  return `V${incident.scores.verification} · U${incident.scores.urgency} · A${incident.scores.actionability}`;
+  return `T/V${incident.scores.verification} · U${incident.scores.urgency} · A${incident.scores.actionability}`;
 }
 
 function urgencyCaption(incident) {

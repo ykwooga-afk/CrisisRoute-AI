@@ -346,7 +346,7 @@ async function renderers() {
     .replace(/import\s+\{[\s\S]*?\}\s+from\s+["'][^"']+["'];\s*/g, "")
     .replace(/\binit\(\);\s*$/, "");
   const reliability = await importSource("src/ui/demoReliability.js");
-  return vm.runInNewContext(`${source}\n({ state, setDecisionWorkflow, renderCommandReadinessPanel, renderSafetyView, renderActionBriefView, renderDecisionPath, renderDispatchLockPanel, renderSafetyAssessment, renderHumanDecisionButtons, renderAuditTimeline, auditEvents });`, {
+  return vm.runInNewContext(`${source}\n({ state, setDecisionWorkflow, renderCommandReadinessPanel, renderCaseIntelligence, renderEvidenceView, renderSafetyView, renderActionBriefView, renderDecisionPath, renderDispatchLockPanel, renderSafetyAssessment, renderHumanDecisionButtons, renderAuditTimeline, auditEvents, proofVerificationLabel });`, {
     ...workflow,
     ...reliability,
     DATA_MODES: { mock: "mock", replay: "replay", live: "live" },
@@ -461,6 +461,166 @@ test("Action Brief renders recorded decision handoff with compact proof and audi
   assert.match(html, /Audit Trail/);
   assert.match(html, /View Audit Details →/);
   assert.match(html, /Demo Provenance/);
+});
+
+test("Evidence page shows explicit verdict and truthful Gonka provenance labels", async () => {
+  const ui = await renderers();
+  const reference = {
+    caseId: "CR-LIVE-ABCDE12345",
+    label: "01",
+    title: "Haze - Wikipedia",
+    rawMessage: "Public source metadata plus article text.",
+    source: "Public URL: en.wikipedia.org",
+    receivedAt: "2026-09-05T04:00:00.000Z",
+    location: "Unknown location",
+    peopleCount: null,
+    needs: [],
+    riskFlags: ["smoke exposure"],
+    knownFacts: ["Haze contains smoke and particulates"],
+    unknownFacts: ["current actionable incident report"],
+    inputClassification: {
+      kind: "REFERENCE_SOURCE",
+      label: "REFERENCE SOURCE · NO ACTIVE INCIDENT DETECTED",
+      activeIncident: false,
+      detail: "This source contains background/reference information rather than a current actionable crisis report."
+    },
+    verificationVerdict: "LIMITED SUPPORT",
+    safeNextActions: ["Obtain or verify a current incident report before operational action."],
+    claims: [
+      { id: "C-CASE01-1-1", text: "Haze can reduce visibility.", status: "reported_unverified", kind: "background", evidenceIds: ["E-CASE01-1"] }
+    ],
+    evidence: [
+      {
+        id: "E-CASE01-1",
+        type: "Public Source - Retrieved",
+        summary: "Haze can reduce visibility.",
+        retrievedAt: "2026-09-05T04:00:00.000Z",
+        reliability: "PRIMARY SOURCE - UNVERIFIED. Retrieved source; not independently verified by AI.",
+        contradictions: "None deterministically established.",
+        uncertainties: ["Current actionable incident report", "current actionable incident report."]
+      }
+    ],
+    scores: { verification: 42, urgency: 30, actionability: 20 },
+    operationalState: "QUEUED_ACTION",
+    missingFields: ["current actionable incident report"],
+    modelDebate: { agreement: ["verification scores are close"], disagreement: [], counterEvidence: [], consensus: "AGREEMENT" },
+    modelReviews: {
+      analyst: { conclusion: "Background source only.", evidenceCited: ["E-CASE01-1"], scores: { verification: 42, urgency: 30, actionability: 20 }, rationale: "Article content was retrieved." },
+      reviewer: { conclusion: "No active incident.", counterEvidence: ["No affected person"], unknowns: ["current actionable incident report"], duplicateRisk: "Low", scores: { verification: 42, urgency: 30, actionability: 20 }, rationale: "No operational request." }
+    },
+    safetyGates: [
+      { id: "G_LOCATION", label: "Actionable Location", status: "blocked", passed: false, detail: "An actionable room, lobby, hostel, block, unit, or apartment is missing." },
+      { id: "G_CONTACT", label: "Contact Path", status: "blocked", passed: false, detail: "No contact or callback path is present; none was invented." },
+      { id: "G_RESOURCE", label: "Resource Availability", status: "blocked", passed: false, detail: "No operational resource need is stated." },
+      { id: "G_CONFLICT", label: "Critical Model Conflict", status: "passed", passed: true, detail: "Consensus level: AGREEMENT." },
+      { id: "G_DISPATCH", label: "Volunteer Dispatch", status: "locked", passed: false, detail: "Dispatch remains locked." }
+    ],
+    recommendedAction: "Use as background only unless a current report is supplied.",
+    gonka: {
+      mode: "live",
+      analyst: { model: "deepseek-ai/DeepSeek-V4-Flash-0731", responseId: "chatcmpl-live-analyst", promptVersion: "analyst-v1.1-minimal", latencyMs: 1200 },
+      reviewer: { model: "MiniMaxAI/MiniMax-M2.7", responseId: "chatcmpl-live-reviewer", promptVersion: "reviewer-v1.1-minimal", latencyMs: 2100 }
+    },
+    humanDecision: null
+  };
+  ui.state.mode = "live";
+  ui.state.incidents = [reference];
+  ui.state.selectedCaseId = reference.caseId;
+  ui.state.selectedEvidenceId = "E-CASE01-1";
+  const html = ui.renderEvidenceView(reference);
+  assert.match(html, /Verification Result/);
+  assert.match(html, /Truth \/ Verification/);
+  assert.match(html, /LIMITED SUPPORT/);
+  assert.match(html, /REFERENCE SOURCE · NO ACTIVE INCIDENT DETECTED/);
+  assert.match(html, /BACKGROUND CLAIM/);
+  assert.match(html, /PRIMARY SOURCE - UNVERIFIED/);
+  assert.match(html, /Gonka Request ID/);
+  assert.match(html, /Not exposed by gateway/);
+  assert.match(html, /Gonka Response ID/);
+  assert.match(html, /chatcmpl-live-reviewer/);
+  assert.equal((html.match(/current actionable incident report/g) || []).length >= 1, true);
+});
+
+test("Safety reason placeholder follows actual blocked gates without inventing contact gaps", async () => {
+  const caseValue = {
+    ...incident("URGENT_VERIFICATION", { location: false, contact: true }),
+    caseId: "CR-LIVE-1234567890",
+    label: "01",
+    title: "Crisis report under review",
+    scores: { verification: 56, urgency: 92, actionability: 42 },
+    location: "Shah Alam · Exact location unknown",
+    modelDebate: { consensus: "AGREEMENT" },
+    safetyGates: [
+      { id: "G_LOCATION", label: "Actionable Location", status: "blocked", passed: false, detail: "Known area: Shah Alam. Exact actionable location is missing." },
+      { id: "G_CONTACT", label: "Contact Path", status: "passed", passed: true, detail: "A contact channel is available, but an exact callback detail may still need verification." },
+      { id: "G_RESOURCE", label: "Resource Availability", status: "passed", passed: true, detail: "Matched demo resources: Medical volunteer." },
+      { id: "G_CONFLICT", label: "Critical Model Conflict", status: "passed", passed: true, detail: "Consensus level: AGREEMENT." },
+      { id: "G_DISPATCH", label: "Volunteer Dispatch", status: "locked", passed: false, detail: "Dispatch remains locked." }
+    ]
+  };
+  const ui = await renderers();
+  const html = ui.renderHumanDecisionButtons(caseValue);
+  assert.match(html, /placeholder="exact location needs review before dispatch\."/);
+  assert.doesNotMatch(html, /verified contact is missing|contact\/callback detail needs review/);
+});
+
+test("Action Brief uses reference context and local integrity wording without changing workflow status", async () => {
+  const ui = await renderers();
+  const reference = {
+    ...incident("QUEUED_ACTION", { location: false, contact: false, resource: false }),
+    caseId: "CR-LIVE-ABCDE12345",
+    label: "01",
+    title: "Haze - Wikipedia",
+    location: "Unknown location",
+    source: "Public URL: en.wikipedia.org",
+    receivedAt: "2026-09-05T04:00:00.000Z",
+    scores: { verification: 42, urgency: 30, actionability: 20 },
+    inputClassification: {
+      kind: "REFERENCE_SOURCE",
+      label: "REFERENCE SOURCE · NO ACTIVE INCIDENT DETECTED",
+      activeIncident: false,
+      detail: "This source contains background/reference information rather than a current actionable crisis report."
+    },
+    claims: [],
+    evidence: [{ id: "E-CASE01-1", type: "Public Source - Retrieved", summary: "Haze can reduce visibility.", retrievedAt: "2026-09-05T04:00:00.000Z" }],
+    modelDebate: { consensus: "AGREEMENT", agreement: [], disagreement: [], counterEvidence: [] },
+    safeNextActions: ["Obtain or verify a current incident report before operational action."],
+    gonka: { analyst: {}, reviewer: {} }
+  };
+  const decision = { caseId: reference.caseId, action: "REQUEST_VERIFICATION", reason: "", recordedAt: "2026-09-05T04:10:00.000Z", recordStatus: "RECORDED", executionStatus: "NOT_EXECUTED" };
+  const brief = {
+    caseId: reference.caseId,
+    decisionAction: "REQUEST_VERIFICATION",
+    priority: "LOW",
+    summary: "Urgent verification was requested. Low verification does not reduce medical urgency.",
+    nextSteps: [
+      "An authorized external operator should obtain the exact location and a reliable callback path.",
+      "An authorized external operator should follow official medical guidance if breathing difficulty is reported."
+    ],
+    recordStatus: "RECORDED",
+    executionStatus: "NOT_EXECUTED",
+    generatedAt: "2026-09-05T04:11:00.000Z"
+  };
+  ui.state.mode = "live";
+  ui.state.incidents = [reference];
+  ui.state.selectedCaseId = reference.caseId;
+  ui.setDecisionWorkflow(reference.caseId, {
+    ...workflow.createWorkflowState(reference, "live"),
+    decision,
+    brief,
+    proofCapsule: { capsuleId: "CAP-LIVE", capsuleHash: "a".repeat(64) },
+    audit: { entryCount: 1, entries: [], chainValid: true, persistence: "ephemeral", externalAnchoring: "none" },
+    decisionStatus: "RECORDED",
+    briefStatus: "READY",
+    auditStatus: "VALID",
+    proofStatus: "VALID"
+  });
+  const html = ui.renderActionBriefView(reference);
+  assert.match(html, /No current operational incident or real-world action is claimed/);
+  assert.match(html, /No operational response is recommended from this source alone/);
+  assert.doesNotMatch(html, /follow official medical guidance if breathing difficulty is reported/i);
+  assert.match(html, /LOCAL INTEGRITY VERIFIED/);
+  assert.doesNotMatch(html, />VALID<\/strong>/);
 });
 
 test("dispatch passed presentation requires explicit human approval and zero blocked/review counts", () => {

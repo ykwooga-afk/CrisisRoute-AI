@@ -262,7 +262,7 @@ function makeDraftIncident(message, index, mode) {
     label: String.fromCharCode(65 + index),
     title: `Custom report ${index + 1}`,
     rawMessage: message,
-    source: "Manual intake",
+    source: "Source Report - User Submitted",
     receivedAt: new Date().toISOString(),
     location: hasLocation ? extractLocationHint(message) : "Unknown location",
     peopleCount: lower.match(/\b\d+\b/) ? Number(lower.match(/\b\d+\b/)[0]) : null,
@@ -279,9 +279,10 @@ function makeDraftIncident(message, index, mode) {
     evidence: [
       {
         id: `${id}_E1`,
-        type: "manual_input",
+        type: "Source Report - User Submitted",
         summary: "Raw text provided by coordinator for analysis.",
-        retrievedAt: new Date().toISOString()
+        retrievedAt: new Date().toISOString(),
+        reliability: "PRIMARY SOURCE - UNVERIFIED. User-submitted report; not independently verified by AI."
       }
     ],
     scores: { verification, urgency, actionability },
@@ -343,6 +344,10 @@ function makeDraftUrlIncident(url, mode) {
   incident.missingFields = ["live page extraction", "independent evidence", "coordinator review"];
   incident.riskFlags = ["public URL demo placeholder"];
   incident.recommendedAction = "Switch to Live to extract the public page through the server-side safe URL pipeline.";
+  if (incident.evidence?.[0]) {
+    incident.evidence[0].type = "Public Source - Retrieved";
+    incident.evidence[0].reliability = "PRIMARY SOURCE - UNVERIFIED. Retrieved source; not independently verified by AI.";
+  }
   incident.gonka.analyst.responseId = "demo-response-public-url-analyst-001";
   incident.gonka.reviewer.responseId = "demo-response-public-url-reviewer-001";
   return incident;

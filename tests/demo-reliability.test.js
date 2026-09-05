@@ -195,7 +195,7 @@ test("three modes expose exact trust labels and proof boundaries", () => {
   const replayMode = reliability.modeProvenance("replay");
   const demo = reliability.modeProvenance("mock");
   assert.equal(live.title, "Live Gonka analysis");
-  assert.deepEqual(live.lines, ["Two model requests", "Human action still required"]);
+  assert.deepEqual(live.lines, ["Two live Gonka model requests", "Human decision recorded; real-world execution remains external"]);
   assert.equal(replayMode.title, "Sanitized recorded acceptance replay");
   assert.ok(replayMode.lines.includes("No network request in this load"));
   assert.ok(replayMode.lines.includes("Response IDs redacted"));

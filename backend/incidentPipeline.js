@@ -702,17 +702,124 @@ function computeConsensus(analystScores, reviewerScores) {
 }
 
 function hasMedicalRedFlag(messages, assessment = {}) {
-  const searchable = [...messages, ...(assessment.riskFlags || [])].join(" ").toLowerCase();
-  return /breathing difficulty|cannot breathe|unconscious|asthma|severe coughing|active fire|smoke inhalation/.test(searchable);
+  const raw = Array.isArray(messages) ? messages.join("\n") : String(messages || "");
+  const searchable = [sourceMainContent(messages), ...(assessment.riskFlags || [])].join(" ").toLowerCase();
+  const immediateRedFlag = /cannot breathe|unconscious|active fire/.test(searchable);
+  const contextualStrongRedFlag = /breathing difficulty|smoke inhalation/.test(searchable);
+  const contextualRedFlag = /asthma|severe coughing/.test(searchable);
+  if (!/^Public source URL:/im.test(raw)) return immediateRedFlag || contextualStrongRedFlag || contextualRedFlag;
+  const currentReportCue =
+    /\b(?:today|now|currently|urgent|emergency|report says|message says|getting worse|cannot breathe|breathing difficulty|trapped|injured|missing|contactable|callback)\b/.test(searchable) ||
+    /\b(?:student|resident|person|people|patient|family|parent|elderly|child|children|man|woman)\b.{0,80}\breport(?:s|ed)?\b/.test(searchable);
+  return immediateRedFlag || ((contextualStrongRedFlag || contextualRedFlag) && currentReportCue);
+}
+
+const LOCATION_STOPWORDS = new Set([
+  "a", "an", "and", "are", "at", "by", "for", "from", "in", "is", "near", "of", "on",
+  "the", "this", "to", "unknown", "view", "where", "with", "number", "detail", "details",
+  "address", "location"
+]);
+
+const JUNK_LOCATION_PHRASES = new Set([
+  "block the",
+  "the location",
+  "unknown",
+  "near the",
+  "at the",
+  "location is"
+]);
+
+function collapseSpaces(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function toTitleLocation(value) {
+  return collapseSpaces(value)
+    .replace(/\bblock\b/gi, "Block")
+    .replace(/\bhostel\b/gi, "Hostel")
+    .replace(/\broom\b/gi, "Room")
+    .replace(/\blobby\b/gi, "lobby")
+    .replace(/\bapartment\b/gi, "Apartment")
+    .replace(/\bapt\b/gi, "Apt")
+    .replace(/\bunit\b/gi, "Unit")
+    .replace(/\bshah alam\b/gi, "Shah Alam")
+    .replace(/\bkuala lumpur\b/gi, "Kuala Lumpur")
+    .replace(/\bpetaling jaya\b/gi, "Petaling Jaya");
+}
+
+function normalizeLocationCandidate(value) {
+  const cleaned = toTitleLocation(value)
+    .replace(/^[\s,.;:()"'`-]+|[\s,.;:()"'`-]+$/g, "")
+    .replace(/\s*,\s*/g, ", ");
+  const lower = cleaned.toLowerCase();
+  if (!cleaned || JUNK_LOCATION_PHRASES.has(lower)) return null;
+  if (/^(?:unknown|unclear|not provided|n\/a|nearby|somewhere)$/i.test(cleaned)) return null;
+  if (/^(?:block|hostel|room|apartment|apt|unit|near|at|location)\s+(?:a|an|the|is|unknown|view|area|content|number|detail|details|address|location)$/i.test(cleaned)) {
+    return null;
+  }
+  const words = lower.split(/[\s,]+/).filter(Boolean);
+  if (words.some((word, index) =>
+    index > 0 &&
+    ["block", "hostel", "room", "apartment", "apt", "unit", "near", "at", "location"].includes(words[index - 1]) &&
+    LOCATION_STOPWORDS.has(word)
+  )) {
+    return null;
+  }
+  if (LOCATION_STOPWORDS.has(words[words.length - 1])) return null;
+  return cleaned;
+}
+
+function sourceMainContent(messages) {
+  const text = Array.isArray(messages) ? messages.join("\n") : String(messages || "");
+  const marker = text.match(/Extracted main content:\s*([\s\S]*)$/i);
+  if (marker) return marker[1].trim();
+  return text
+    .split(/\n+/)
+    .filter(line => !/^(?:Public source URL|Original submitted URL|Page title|Source hostname):/i.test(line.trim()))
+    .join("\n")
+    .trim();
+}
+
+function publicSourceTitle(messages) {
+  const text = Array.isArray(messages) ? messages.join("\n") : String(messages || "");
+  const match = text.match(/^Page title:\s*(.+)$/im);
+  return match ? collapseSpaces(match[1]).slice(0, 120) : "";
+}
+
+function isPublicSourceRequest(request) {
+  return request.messages.some(message => /^Public source URL:/im.test(message));
+}
+
+function deriveKnownArea(messages) {
+  const evidence = sourceMainContent(messages);
+  const areaPatterns = [
+    [/\bshah\s+alam\b/i, "Shah Alam"],
+    [/\bkuala\s+lumpur\b/i, "Kuala Lumpur"],
+    [/\bpetaling\s+jaya\b/i, "Petaling Jaya"],
+    [/\bcampus\s+grounds?\b/i, "Campus grounds"]
+  ];
+  for (const [pattern, label] of areaPatterns) {
+    if (pattern.test(evidence)) return label;
+  }
+  return null;
 }
 
 function deriveLocation(request) {
-  const evidence = request.messages.join(" ");
+  const evidence = sourceMainContent(request.messages);
   if (request.isScenario && /block\s+c/i.test(evidence)) {
     return /lobby/i.test(evidence) ? "Block C lobby" : "Hostel Block C";
   }
-  const match = evidence.match(/\b(?:(?:hostel\s+)?block\s+[A-Za-z0-9-]+(?:\s+lobby)?|room\s+[A-Za-z0-9-]+|hostel\s+[A-Za-z0-9-]+)\b/i);
-  if (match) return match[0];
+  const exactPattern = /\b(?:(?:apartment|apt|unit|room)\s+[A-Za-z0-9][A-Za-z0-9-]*(?:\s*[,/-]\s*(?:hostel\s+)?block\s+[A-Za-z0-9][A-Za-z0-9-]*)?|(?:hostel\s+)?block\s+[A-Za-z0-9][A-Za-z0-9-]*(?:\s+lobby)?|hostel\s+[A-Za-z0-9][A-Za-z0-9-]*)\b/ig;
+  const knownArea = deriveKnownArea(request.messages);
+  for (const match of evidence.matchAll(exactPattern)) {
+    const normalized = normalizeLocationCandidate(match[0]);
+    if (normalized) {
+      return knownArea && !new RegExp(`\\b${knownArea.replace(/\s+/g, "\\s+")}\\b`, "i").test(normalized)
+        ? `${normalized}, ${knownArea}`
+        : normalized;
+    }
+  }
+  if (knownArea) return `${knownArea} · Exact location unknown`;
   return "Unknown location";
 }
 
@@ -721,15 +828,17 @@ function extractPeopleCount(messages) {
     one: 1, two: 2, three: 3, four: 4, five: 5,
     six: 6, seven: 7, eight: 8, nine: 9, ten: 10
   });
-  const evidence = messages.join(" ");
+  const evidence = sourceMainContent(messages);
   const match = evidence.match(/\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:students?|residents?|people|persons?|patients?)\b/i);
-  if (!match) return null;
+  if (!match) {
+    return /\belderly\s+(?:man|woman|parent|person|patient)\b/i.test(evidence) ? 1 : null;
+  }
   const numeric = Number(match[1]);
   return Number.isFinite(numeric) ? numeric : numberWords[match[1].toLowerCase()] ?? null;
 }
 
 function extractNeeds(messages) {
-  const evidence = messages.join(" ");
+  const evidence = sourceMainContent(messages);
   const needs = [];
   if (/\bn95\b|\bmasks?\b/i.test(evidence)) needs.push("N95 masks");
   if (/\bwater\b|hydration/i.test(evidence)) needs.push("Water packs");
@@ -740,7 +849,7 @@ function extractNeeds(messages) {
 }
 
 function extractRiskFlags(messages) {
-  const evidence = messages.join(" ");
+  const evidence = sourceMainContent(messages);
   const flags = [];
   if (/coughing\s+badly|severe\s+cough/i.test(evidence)) flags.push("severe coughing");
   if (/\basthma\b/i.test(evidence)) flags.push("asthma");
@@ -751,18 +860,41 @@ function extractRiskFlags(messages) {
 }
 
 function isActionableLocation(request, location) {
-  if (typeof location !== "string" ||
-      /^(?:unknown|unclear|not provided|n\/a)|\bnearby\b|\bsomewhere\b/i.test(location.trim())) {
-    return false;
+  const normalized = normalizeLocationCandidate(location);
+  if (!normalized || /Exact location unknown/i.test(normalized)) return false;
+  return /\b(?:hostel\s+)?block\s+[A-Za-z0-9][A-Za-z0-9-]*(?:\s+lobby)?\b|\b(?:apartment|apt|unit|room)\s+[A-Za-z0-9][A-Za-z0-9-]*\b|\bhostel\s+[A-Za-z0-9][A-Za-z0-9-]*\b/i
+    .test(normalized);
+}
+
+function contactSemantics(request) {
+  if (request.isScenario) {
+    return {
+      contactPassed: true,
+      channelAvailable: true,
+      verifiedCallbackDetail: true,
+      detail: "Hostel Telegram coordinator contact path is available."
+    };
   }
-  const evidence = request.messages.join(" ");
-  return /\b(?:hostel|block|room|lobby)\s+[A-Za-z0-9-]+/i.test(evidence);
+  const evidence = sourceMainContent(request.messages);
+  const hasPhoneNumber = /\+?\d[\d\s().-]{6,}\d/.test(evidence);
+  const hasNamedChannel = /\b(?:telegram|whatsapp|coordinator|warden|email)\b/i.test(evidence);
+  const hasContactableChannel = /\b(?:contactable|contacted|can be contacted|reachable|call(?:ed)?|phone|callback)\b/i.test(evidence);
+  const channelAvailable = hasPhoneNumber || hasNamedChannel || hasContactableChannel;
+  return {
+    contactPassed: channelAvailable,
+    channelAvailable,
+    verifiedCallbackDetail: hasPhoneNumber || hasNamedChannel,
+    callbackDetailMissing: channelAvailable && !hasPhoneNumber,
+    detail: channelAvailable
+      ? hasPhoneNumber
+        ? "A callback detail is present in the submitted evidence."
+        : "A contact channel is available, but an exact callback detail may still need verification."
+      : "No contact or callback path is present; none was invented."
+  };
 }
 
 function hasContactPath(request) {
-  if (request.isScenario) return true;
-  return /\b(?:telegram|whatsapp|coordinator|warden|callback|contact|phone|email)\b|\+?\d[\d\s-]{6,}\d/i
-    .test(request.messages.join(" "));
+  return contactSemantics(request).contactPassed;
 }
 
 function canonicalResource(need) {
@@ -779,17 +911,48 @@ function availableResourcesForNeeds(needs) {
   return [...new Set(needs.map(canonicalResource).filter(Boolean))];
 }
 
+function locationSemantics(request, location) {
+  const normalized = normalizeLocationCandidate(location);
+  const locationPassed = isActionableLocation(request, location);
+  const knownArea = normalized?.match(/^(.+?)\s+·\s+Exact location unknown$/i)?.[1] || deriveKnownArea(request.messages);
+  return {
+    locationPassed,
+    knownArea: knownArea || null,
+    exactLocationMissing: !locationPassed && Boolean(knownArea),
+    detail: locationPassed
+      ? `${normalized} is actionable.`
+      : knownArea
+        ? `Known area: ${knownArea}. Exact actionable location is missing.`
+        : "An actionable room, lobby, hostel, block, unit, or apartment is missing."
+  };
+}
+
 function buildSafetyGates({ request, assessment, consensus, location }) {
   const medical = hasMedicalRedFlag(request.messages, assessment);
-  const locationPassed = isActionableLocation(request, location);
-  const contactPassed = hasContactPath(request);
+  const locationContext = locationSemantics(request, location);
+  const locationPassed = locationContext.locationPassed;
+  const contactContext = contactSemantics(request);
+  const contactPassed = contactContext.contactPassed;
   const matchedResources = availableResourcesForNeeds(assessment.needs);
   const resourcePassed = assessment.needs.length > 0 && matchedResources.length === assessment.needs.length;
   const conflictPassed = consensus.level !== "CRITICAL_CONFLICT";
   const dispatchPassed = locationPassed && contactPassed && resourcePassed && conflictPassed;
 
   return {
-    flags: { medical, locationPassed, contactPassed, resourcePassed, conflictPassed, dispatchPassed },
+    flags: {
+      medical,
+      locationPassed,
+      locationKnown: Boolean(locationContext.knownArea),
+      knownArea: locationContext.knownArea,
+      exactLocationMissing: locationContext.exactLocationMissing,
+      contactPassed,
+      contactChannelAvailable: contactContext.channelAvailable,
+      verifiedCallbackDetail: contactContext.verifiedCallbackDetail,
+      callbackDetailMissing: contactContext.callbackDetailMissing === true,
+      resourcePassed,
+      conflictPassed,
+      dispatchPassed
+    },
     matchedResources,
     gates: [
       {
@@ -806,18 +969,14 @@ function buildSafetyGates({ request, assessment, consensus, location }) {
         label: "Actionable Location",
         status: locationPassed ? "passed" : "blocked",
         passed: locationPassed,
-        detail: locationPassed ? `${location} is actionable.` : "An actionable room, lobby, hostel, or block is missing."
+        detail: locationContext.detail
       },
       {
         id: "G_CONTACT",
         label: "Contact Path",
         status: contactPassed ? "passed" : "blocked",
         passed: contactPassed,
-        detail: contactPassed
-          ? request.isScenario
-            ? "Hostel Telegram coordinator contact path is available."
-            : "A contact path is present in the submitted evidence."
-          : "No contact or callback path is present; none was invented."
+        detail: contactContext.detail
       },
       {
         id: "G_RESOURCE",
@@ -826,7 +985,9 @@ function buildSafetyGates({ request, assessment, consensus, location }) {
         passed: resourcePassed,
         detail: resourcePassed
           ? `Matched demo resources: ${matchedResources.join(", ")}.`
-          : "One or more stated needs do not match available CASE 01 resources."
+          : assessment.needs.length
+            ? "One or more stated needs do not match available CASE 01 resources."
+            : "No operational resource need is stated in the supplied evidence."
       },
       {
         id: "G_CONFLICT",
@@ -878,12 +1039,50 @@ function stableCaseId(request) {
   return `CR-LIVE-${digest}`;
 }
 
-function buildMissingFields(flags, analyst, reviewer) {
-  const missing = new Set([...analyst.unknownFacts, ...reviewer.unknowns]);
-  if (!flags.locationPassed) missing.add("actionable location");
-  if (!flags.contactPassed) missing.add("contact or callback path");
-  if (!flags.resourcePassed) missing.add("matched available resource");
-  return [...missing];
+function normalizeMissingItem(value, flags = {}) {
+  const text = collapseSpaces(value).replace(/[.;:]+$/g, "");
+  const lower = text.toLowerCase();
+  if (!lower) return null;
+  if (/\b(?:apartment|address|gps|location|room|unit|floor|block|lobby)\b/.test(lower)) {
+    return flags.knownArea ? `exact location within ${flags.knownArea}` : "exact actionable location";
+  }
+  if (/\b(?:callback|contact|phone|telephone|number|reachable)\b/.test(lower)) {
+    return flags.contactChannelAvailable ? "verified callback detail" : "contact or callback path";
+  }
+  if (/\b(?:independent|corroborat|source)\b/.test(lower)) return "independent corroboration";
+  if (/\b(?:resource|mask|n95|water|transport|safe room|clinic)\b/.test(lower)) return "matched available resource";
+  if (/\b(?:medical|clinical|severity|status|condition)\b/.test(lower)) return "current medical status";
+  return text.slice(0, 160);
+}
+
+function normalizeMissingFields(values, flags = {}) {
+  const output = [];
+  const seen = new Set();
+  for (const value of values || []) {
+    const item = normalizeMissingItem(value, flags);
+    if (!item) continue;
+    const key = item.toLowerCase();
+    if (!seen.has(key)) {
+      output.push(item);
+      seen.add(key);
+    }
+  }
+  return output;
+}
+
+function buildMissingFields(flags, analyst, reviewer, inputClassification) {
+  const missing = [...analyst.unknownFacts, ...reviewer.unknowns];
+  if (inputClassification?.activeIncident === false) {
+    missing.push("current actionable incident report");
+    return normalizeMissingFields(missing, flags);
+  }
+  if (!flags.locationPassed) {
+    missing.push(flags.knownArea ? `exact location within ${flags.knownArea}` : "exact actionable location");
+  }
+  if (!flags.contactPassed) missing.push("contact or callback path");
+  else if (flags.callbackDetailMissing) missing.push("verified callback detail");
+  if (!flags.resourcePassed) missing.push("matched available resource");
+  return normalizeMissingFields(missing, flags);
 }
 
 function buildActionPlan(operationalState, location, resources) {
@@ -899,7 +1098,89 @@ function buildActionPlan(operationalState, location, resources) {
   };
 }
 
-function buildDeterministicClaims(request, evidence) {
+function claimSourceText(message) {
+  return sourceMainContent([message])
+    .replace(/^Public source URL:.*$/gim, "")
+    .replace(/^Original submitted URL:.*$/gim, "")
+    .replace(/^Page title:.*$/gim, "")
+    .replace(/^Source hostname:.*$/gim, "")
+    .trim();
+}
+
+function compactClaimText(value) {
+  const text = collapseSpaces(value)
+    .replace(/^\W+|\W+$/g, "")
+    .trim();
+  if (!text || text.length < 24) return null;
+  return text.length > 260 ? `${text.slice(0, 257).trim()}...` : text;
+}
+
+function splitAtomicClaims(text) {
+  const normalized = claimSourceText(text);
+  const chunks = normalized.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [];
+  const claims = [];
+  const seen = new Set();
+  for (const chunk of chunks) {
+    const claim = compactClaimText(chunk);
+    if (!claim) continue;
+    if (/^(?:jump to content|contents|main page|navigation|languages?|donate|log in|create account|edit|view history)\b/i.test(claim)) {
+      continue;
+    }
+    const key = claim.toLowerCase();
+    if (seen.has(key)) continue;
+    claims.push(claim);
+    seen.add(key);
+    if (claims.length === 6) break;
+  }
+  if (!claims.length) {
+    const fallback = compactClaimText(normalized.slice(0, 260));
+    if (fallback) claims.push(fallback);
+  }
+  return claims;
+}
+
+function hasCurrentIncidentContext(request, context) {
+  if (!isPublicSourceRequest(request)) return true;
+  const text = sourceMainContent(request.messages).toLowerCase();
+  const hasPersonContext = context.peopleCount !== null ||
+    /\b(?:student|resident|person|people|patient|family|parent|elderly|child|children|man|woman)\b/.test(text);
+  const hasNeedContext = context.needs.length > 0 ||
+    /\b(?:need|needs|requested|requesting|asking for|send|dispatch|evacuat|rescue|shelter)\b/.test(text);
+  const currentReportLanguage =
+    /\b(?:today|now|currently|urgent|emergency|report says|message says|getting worse|cannot breathe|breathing difficulty|trapped|injured|missing|contactable|callback)\b/.test(text) ||
+    /\b(?:student|resident|person|people|patient|family|parent|elderly|child|children|man|woman)\b.{0,80}\breport(?:s|ed)?\b/.test(text) ||
+    /\breport(?:s|ed)?\b.{0,80}\b(?:student|resident|person|people|patient|family|parent|elderly|child|children|man|woman)\b/.test(text);
+  return context.locationPassed || hasNeedContext || (currentReportLanguage && (hasPersonContext || context.medical));
+}
+
+function classifyInput(request, context) {
+  const activeIncident = hasCurrentIncidentContext(request, context);
+  if (isPublicSourceRequest(request) && !activeIncident) {
+    return {
+      kind: "REFERENCE_SOURCE",
+      label: "REFERENCE SOURCE · NO ACTIVE INCIDENT DETECTED",
+      activeIncident: false,
+      detail: "This source contains background/reference information rather than a current actionable crisis report."
+    };
+  }
+  return {
+    kind: "ACTIVE_REPORT",
+    label: "ACTIVE REPORT",
+    activeIncident: true,
+    detail: "This source contains current incident signals for human review."
+  };
+}
+
+function deriveVerificationVerdict({ scores, consensus }) {
+  if (consensus?.level === "CRITICAL_CONFLICT") return "CONFLICTING";
+  const verification = Number(scores?.verification);
+  if (!Number.isFinite(verification)) return "UNVERIFIED";
+  if (verification >= 60) return "SUPPORTED";
+  if (verification >= 30) return "LIMITED SUPPORT";
+  return "UNVERIFIED";
+}
+
+function buildDeterministicClaims(request, evidence, inputClassification) {
   if (request.isScenario) {
     return [
       {
@@ -916,22 +1197,35 @@ function buildDeterministicClaims(request, evidence) {
       }
     ];
   }
-  return request.messages.map((message, index) => ({
-    id: `C-CASE01-${index + 1}`,
-    text: message.slice(0, 720),
-    status: "reported",
-    evidenceIds: [evidence[index].id]
-  }));
+  const background = inputClassification?.activeIncident === false;
+  return request.messages.flatMap((message, messageIndex) =>
+    splitAtomicClaims(message).map((text, claimIndex) => ({
+      id: `C-CASE01-${messageIndex + 1}-${claimIndex + 1}`,
+      text,
+      status: background ? "reported_unverified" : "reported",
+      kind: background ? "background" : "reported",
+      evidenceIds: [evidence[messageIndex].id]
+    }))
+  );
 }
 
-function buildPriorityRationale(flags, consensus) {
+function buildPriorityRationale(flags, consensus, inputClassification) {
+  if (inputClassification?.activeIncident === false) {
+    return "This source appears to provide background information rather than a current actionable crisis report. Scores reflect evidence support and model review; they do not authorize operational response.";
+  }
   const urgency = flags.medical
     ? "Input-derived respiratory red flags require urgent human verification."
     : "The supplied reports require bounded human verification.";
   return `${urgency} Independent model score consensus is ${consensus.level}; AI advice does not authorize dispatch.`;
 }
 
-function buildSafeNextActions(flags) {
+function buildSafeNextActions(flags, inputClassification) {
+  if (inputClassification?.activeIncident === false) {
+    return [
+      "No operational response is recommended from this source alone because it contains general reference information rather than a current incident.",
+      "Obtain or verify a current incident report before operational action."
+    ];
+  }
   const actions = [
     flags.contactPassed
       ? "Verify the current situation through the available coordinator or contact path."
@@ -953,29 +1247,51 @@ function buildIncident({ request, analyst, reviewer, analystTrace, reviewerTrace
   const assessment = { needs, riskFlags };
   const safety = buildSafetyGates({ request, assessment, consensus, location });
   const operationalState = determineOperationalState(safety.flags, consensus.level);
+  const inputClassification = classifyInput(request, {
+    locationPassed: safety.flags.locationPassed,
+    peopleCount,
+    needs,
+    medical: safety.flags.medical
+  });
   const receivedAt = now.toISOString();
-  const uncertainties = [...new Set([...analyst.unknownFacts, ...reviewer.unknowns])];
+  const uncertainties = normalizeMissingFields([...analyst.unknownFacts, ...reviewer.unknowns], safety.flags);
+  const publicSource = isPublicSourceRequest(request);
+  const evidenceType = request.isScenario
+    ? "Hostel Telegram report"
+    : publicSource
+      ? "Public Source - Retrieved"
+      : "Source Report - User Submitted";
+  const evidenceReliability = request.isScenario
+    ? "Reported source; not independently verified by AI."
+    : publicSource
+      ? "PRIMARY SOURCE - UNVERIFIED. Retrieved source; not independently verified by AI."
+      : "PRIMARY SOURCE - UNVERIFIED. User-submitted report; not independently verified by AI.";
   const evidence = request.messages.map((message, index) => ({
     id: `E-CASE01-${index + 1}`,
-    type: request.isScenario ? "Hostel Telegram report" : "Manual intake report",
-    summary: message,
+    type: evidenceType,
+    summary: publicSource ? claimSourceText(message) : message,
     retrievedAt: receivedAt,
     reliability: index === 0
-      ? "Reported source; not independently verified by AI."
+      ? evidenceReliability
       : "Separate supplied report; source identity not independently verified by AI.",
     contradictions: "None deterministically established.",
     uncertainties
   }));
-  const claims = buildDeterministicClaims(request, evidence);
+  const claims = buildDeterministicClaims(request, evidence, inputClassification);
   const disagreementAxes = SCORE_AXES.filter(axis => consensus.gaps[axis] > 15);
   const agreementAxes = SCORE_AXES.filter(axis => consensus.gaps[axis] <= 15);
-  const priorityRationale = buildPriorityRationale(safety.flags, consensus);
-  const safeNextActions = buildSafeNextActions(safety.flags);
+  const priorityRationale = buildPriorityRationale(safety.flags, consensus, inputClassification);
+  const safeNextActions = buildSafeNextActions(safety.flags, inputClassification);
+  const publicTitle = publicSourceTitle(request.messages);
 
   return {
     caseId: stableCaseId(request),
     label: "01",
-    title: request.isScenario ? "Block C Respiratory Cluster" : "Crisis report under review",
+    title: request.isScenario
+      ? "Block C Respiratory Cluster"
+      : inputClassification.activeIncident === false
+        ? publicTitle || "Reference source under review"
+        : "Crisis report under review",
     rawMessage: request.messages.join("\n"),
     source: request.source,
     receivedAt,
@@ -984,14 +1300,16 @@ function buildIncident({ request, analyst, reviewer, analystTrace, reviewerTrace
     needs,
     riskFlags,
     knownFacts: analyst.knownFacts,
-    unknownFacts: analyst.unknownFacts,
+    unknownFacts: normalizeMissingFields(analyst.unknownFacts, safety.flags),
+    inputClassification,
+    verificationVerdict: deriveVerificationVerdict({ scores: consensus.scores, consensus }),
     priorityRationale,
     safeNextActions,
     claims,
     evidence,
     scores: consensus.scores,
     operationalState,
-    missingFields: buildMissingFields(safety.flags, analyst, reviewer),
+    missingFields: buildMissingFields(safety.flags, analyst, reviewer, inputClassification),
     modelDebate: {
       agreement: agreementAxes.map(axis => `${axis} scores are within the agreement threshold.`),
       disagreement: disagreementAxes.map(axis => `${axis} score gap is ${consensus.gaps[axis]}.`),
@@ -1263,6 +1581,13 @@ function buildFullScenarioIncident({ caseDefinition, analyst, reviewer, analystT
     riskFlags,
     knownFacts: [...caseDefinition.facts],
     unknownFacts,
+    inputClassification: {
+      kind: "ACTIVE_REPORT",
+      label: "ACTIVE REPORT",
+      activeIncident: true,
+      detail: "This source contains current incident signals for human review."
+    },
+    verificationVerdict: deriveVerificationVerdict({ scores: consensus.scores, consensus }),
     priorityRationale: `${recommendation} Operational state and gates are assigned by deterministic scenario rules.`,
     insight: caseDefinition.label === "03"
       ? "Low verification does not reduce the urgency of a reported breathing emergency."
@@ -1671,11 +1996,17 @@ module.exports = {
   validateReviewerData,
   computeConsensus,
   hasMedicalRedFlag,
+  normalizeLocationCandidate,
   deriveLocation,
   extractPeopleCount,
   extractNeeds,
   extractRiskFlags,
+  contactSemantics,
   buildSafetyGates,
+  normalizeMissingFields,
+  classifyInput,
+  deriveVerificationVerdict,
+  splitAtomicClaims,
   determineOperationalState,
   buildBatchEvidencePrompt,
   determineFullScenarioState,

@@ -124,6 +124,58 @@ function batchRoleData(role) {
   };
 }
 
+async function reviewerParseDiagnostic(t, {
+  content,
+  finishReason = "stop",
+  stopReason
+}) {
+  const requests = [];
+  const upstream = http.createServer(async (req, res) => {
+    const request = JSON.parse(await readBody(req));
+    requests.push(request);
+    const role = request.model === DEFAULT_MODELS.analyst ? "analyst" : "reviewer";
+    const choice = {
+      message: {
+        role: "assistant",
+        content: role === "analyst" ? JSON.stringify(batchRoleData("analyst")) : content
+      },
+      finish_reason: role === "analyst" ? "stop" : finishReason
+    };
+    if (role === "reviewer" && stopReason !== undefined) choice.stop_reason = stopReason;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: `${role}-parse-diagnostic-id`,
+      model: request.model,
+      choices: [choice],
+      usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 }
+    }));
+  });
+  const upstreamBaseUrl = await startServer(t, upstream);
+  const baseUrl = await startServer(t, createServer({
+    gonkaClientFactory: () => new GonkaClient({
+      apiKey: "server-api-fake-token",
+      baseUrl: `${upstreamBaseUrl}/v1`
+    })
+  }));
+
+  const response = await fetch(`${baseUrl}/api/incidents/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(scenarioPayload())
+  });
+  const publicBody = await response.json();
+  const diagnosticResponse = await fetch(`${baseUrl}/api/diagnostics/last-gonka-failure`);
+  const diagnosticBody = await diagnosticResponse.json();
+  return {
+    response,
+    publicBody,
+    diagnosticResponse,
+    diagnosticBody,
+    diagnostic: diagnosticBody.diagnostic,
+    requests
+  };
+}
+
 function unsafeUpstreamError(code = "NETWORK_ERROR") {
   const error = new GonkaClientError(code, { retryable: true });
   error.stack = "STACK sk-TEST-SECRET-MUST-NOT-LEAK";
@@ -357,6 +409,118 @@ test("temporary Gonka diagnostic endpoint reports MiniMax reviewer response shap
   assert.doesNotMatch(
     JSON.stringify(body),
     /RAW_MINIMAX_CONTENT|PRIVATE_REASONING|messages|system|user|prompt|authorization|Bearer/i
+  );
+});
+
+test("temporary Gonka diagnostic classifies length-limited unbalanced Reviewer output as OUTPUT_TRUNCATION", async t => {
+  const rawSentinel = "RAW_TRUNCATED_JSON_MUST_NOT_LEAK";
+  const reviewerContent = `{"cases":[{"label":"${rawSentinel}`;
+  const { response, diagnosticResponse, diagnosticBody, diagnostic, requests } = await reviewerParseDiagnostic(t, {
+    content: reviewerContent,
+    finishReason: "length",
+    stopReason: "max_tokens"
+  });
+  const reviewerRequest = requests.find(request => request.model === DEFAULT_MODELS.reviewer);
+
+  assert.equal(response.status, 502);
+  assert.equal(diagnosticResponse.status, 200);
+  assert.equal(diagnosticBody.ok, true);
+  assert.equal(diagnostic.role, "reviewer");
+  assert.equal(diagnostic.model, DEFAULT_MODELS.reviewer);
+  assert.equal(diagnostic.failureStage, "parse");
+  assert.equal(diagnostic.sanitizedErrorCode, "INVALID_JSON");
+  assert.equal(diagnostic.finishReason, "length");
+  assert.equal(diagnostic.stopReason, "max_tokens");
+  assert.equal(diagnostic.configuredMaxTokens, 500);
+  assert.equal(reviewerRequest.max_tokens, 500);
+  assert.equal(diagnostic.contentLength, reviewerContent.length);
+  assert.equal(diagnostic.firstNonWhitespaceCharacterType, "object_open");
+  assert.equal(diagnostic.containsJsonFence, false);
+  assert.ok(diagnostic.openingBraceCount > diagnostic.closingBraceCount);
+  assert.ok(diagnostic.openingBracketCount > diagnostic.closingBracketCount);
+  assert.equal(diagnostic.bracesBalanced, false);
+  assert.equal(diagnostic.bracketsBalanced, false);
+  assert.equal(diagnostic.appearsToStartWithJson, true);
+  assert.equal(diagnostic.appearsToEndWithJson, false);
+  assert.equal(diagnostic.likelyTruncatedJson, true);
+  assert.equal(diagnostic.parseFailureClassification, "OUTPUT_TRUNCATION");
+  assert.doesNotMatch(
+    JSON.stringify(diagnosticBody),
+    /RAW_TRUNCATED_JSON|cases|verification|note|messages|system|user|prompt|authorization|Bearer/i
+  );
+});
+
+test("temporary Gonka diagnostic classifies normal-stop non-JSON Reviewer prose as NON_JSON_MODEL_OUTPUT", async t => {
+  const rawSentinel = "RAW_NON_JSON_PROSE_MUST_NOT_LEAK";
+  const reviewerContent = `I cannot return structured JSON for this request. ${rawSentinel}`;
+  const { response, diagnosticBody, diagnostic } = await reviewerParseDiagnostic(t, {
+    content: reviewerContent,
+    finishReason: "stop",
+    stopReason: "stop"
+  });
+
+  assert.equal(response.status, 502);
+  assert.equal(diagnosticBody.ok, true);
+  assert.equal(diagnostic.role, "reviewer");
+  assert.equal(diagnostic.failureStage, "parse");
+  assert.equal(diagnostic.sanitizedErrorCode, "INVALID_JSON");
+  assert.equal(diagnostic.finishReason, "stop");
+  assert.equal(diagnostic.stopReason, "stop");
+  assert.equal(diagnostic.configuredMaxTokens, 500);
+  assert.equal(diagnostic.contentLength, reviewerContent.length);
+  assert.equal(diagnostic.firstNonWhitespaceCharacterType, "other");
+  assert.equal(diagnostic.containsJsonFence, false);
+  assert.equal(diagnostic.openingBraceCount, 0);
+  assert.equal(diagnostic.closingBraceCount, 0);
+  assert.equal(diagnostic.openingBracketCount, 0);
+  assert.equal(diagnostic.closingBracketCount, 0);
+  assert.equal(diagnostic.bracesBalanced, true);
+  assert.equal(diagnostic.bracketsBalanced, true);
+  assert.equal(diagnostic.appearsToStartWithJson, false);
+  assert.equal(diagnostic.appearsToEndWithJson, false);
+  assert.equal(diagnostic.likelyTruncatedJson, false);
+  assert.equal(diagnostic.parseFailureClassification, "NON_JSON_MODEL_OUTPUT");
+  assert.doesNotMatch(
+    JSON.stringify(diagnosticBody),
+    /RAW_NON_JSON_PROSE|cannot return structured JSON|messages|system|user|prompt|authorization|Bearer/i
+  );
+});
+
+test("temporary Gonka diagnostic does not classify balanced valid Reviewer JSON as truncation", async t => {
+  const rawSentinel = "RAW_BALANCED_JSON_MUST_NOT_LEAK";
+  const reviewerContent = JSON.stringify({
+    response: {
+      entries: [
+        { case: "01", value: rawSentinel },
+        { case: "02", value: "not the reviewer contract" }
+      ]
+    }
+  });
+  const { response, diagnosticBody, diagnostic } = await reviewerParseDiagnostic(t, {
+    content: reviewerContent,
+    finishReason: "stop"
+  });
+
+  assert.equal(response.status, 502);
+  assert.equal(diagnosticBody.ok, true);
+  assert.equal(diagnostic.role, "reviewer");
+  assert.equal(diagnostic.failureStage, "parse");
+  assert.equal(diagnostic.sanitizedErrorCode, "INVALID_MODEL_DATA");
+  assert.equal(diagnostic.finishReason, "stop");
+  assert.equal(diagnostic.configuredMaxTokens, 500);
+  assert.equal(diagnostic.contentLength, reviewerContent.length);
+  assert.equal(diagnostic.firstNonWhitespaceCharacterType, "object_open");
+  assert.equal(diagnostic.containsJsonFence, false);
+  assert.equal(diagnostic.bracesBalanced, true);
+  assert.equal(diagnostic.bracketsBalanced, true);
+  assert.equal(diagnostic.appearsToStartWithJson, true);
+  assert.equal(diagnostic.appearsToEndWithJson, true);
+  assert.equal(diagnostic.likelyTruncatedJson, false);
+  assert.equal(diagnostic.parseFailureClassification, "NON_JSON_MODEL_OUTPUT");
+  assert.notEqual(diagnostic.parseFailureClassification, "OUTPUT_TRUNCATION");
+  assert.doesNotMatch(
+    JSON.stringify(diagnosticBody),
+    /RAW_BALANCED_JSON|not the reviewer contract|messages|system|user|prompt|authorization|Bearer/i
   );
 });
 

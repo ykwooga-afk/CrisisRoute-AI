@@ -415,6 +415,123 @@ function contentParseShape(content) {
   }
 }
 
+function firstNonWhitespaceCharacterType(content) {
+  if (typeof content !== "string") return "empty";
+  const trimmed = content.trimStart();
+  if (!trimmed) return "empty";
+  if (trimmed.startsWith("```")) return "code_fence";
+  if (trimmed[0] === "{") return "object_open";
+  if (trimmed[0] === "[") return "array_open";
+  return "other";
+}
+
+function stripOuterCodeFenceContent(content) {
+  if (typeof content !== "string") return "";
+  const match = content.trim().match(/^```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*?)\r?\n?```$/);
+  return match ? match[1].trim() : "";
+}
+
+function structuralDelimiterCounts(content) {
+  const counts = {
+    openingBraceCount: 0,
+    closingBraceCount: 0,
+    openingBracketCount: 0,
+    closingBracketCount: 0
+  };
+  if (typeof content !== "string") return counts;
+
+  let inString = false;
+  let escaped = false;
+  for (const character of content) {
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (character === "\"") {
+      inString = true;
+    } else if (character === "{") {
+      counts.openingBraceCount += 1;
+    } else if (character === "}") {
+      counts.closingBraceCount += 1;
+    } else if (character === "[") {
+      counts.openingBracketCount += 1;
+    } else if (character === "]") {
+      counts.closingBracketCount += 1;
+    }
+  }
+  return counts;
+}
+
+function reasonIndicatesOutputLength(value) {
+  const reason = safeDiagnosticCode(value, "").toLowerCase();
+  return reason === "length" ||
+    reason.includes("max_token") ||
+    reason.includes("max_completion") ||
+    reason.includes("max_output") ||
+    reason.includes("token_limit");
+}
+
+function reasonIndicatesNormalStop(value) {
+  const reason = safeDiagnosticCode(value, "").toLowerCase();
+  return ["stop", "end_turn", "complete", "completed"].includes(reason);
+}
+
+function buildParseTruncationDiagnostics({ choice, content, configuredMaxTokens } = {}) {
+  const finishReason = safeDiagnosticCode(choice?.finish_reason || choice?.finishReason, "");
+  const stopReason = safeDiagnosticCode(choice?.stop_reason || choice?.stopReason, "");
+  const contentLength = safeDiagnosticLength(content);
+  const firstType = firstNonWhitespaceCharacterType(content);
+  const fenced = typeof content === "string" && content.includes("```");
+  const counts = structuralDelimiterCounts(content);
+  const bracesBalanced = counts.openingBraceCount === counts.closingBraceCount;
+  const bracketsBalanced = counts.openingBracketCount === counts.closingBracketCount;
+  const trimmed = typeof content === "string" ? content.trim() : "";
+  const fenceContent = stripOuterCodeFenceContent(content);
+  const contentForEndCheck = fenceContent || trimmed;
+  const appearsToStartWithJson = firstType === "object_open" ||
+    firstType === "array_open" ||
+    (firstType === "code_fence" && ["object_open", "array_open"].includes(firstNonWhitespaceCharacterType(fenceContent)));
+  const appearsToEndWithJson = /[}\]]$/.test(contentForEndCheck);
+  const unbalancedJsonDelimiters = !bracesBalanced || !bracketsBalanced;
+  const nearConfiguredLimit = Number.isInteger(configuredMaxTokens) &&
+    Number.isInteger(contentLength) &&
+    contentLength >= configuredMaxTokens * 2;
+  const lengthLimited = reasonIndicatesOutputLength(finishReason) || reasonIndicatesOutputLength(stopReason);
+  const likelyTruncatedJson = (
+    lengthLimited ||
+    (appearsToStartWithJson && nearConfiguredLimit)
+  ) && unbalancedJsonDelimiters;
+  const parseFailureClassification = (lengthLimited || likelyTruncatedJson)
+    ? "OUTPUT_TRUNCATION"
+    : (reasonIndicatesNormalStop(finishReason) || reasonIndicatesNormalStop(stopReason)) &&
+        (!appearsToStartWithJson || (bracesBalanced && bracketsBalanced))
+      ? "NON_JSON_MODEL_OUTPUT"
+      : "UNRESOLVED_PARSE_FAILURE";
+
+  return {
+    finishReason,
+    stopReason,
+    configuredMaxTokens,
+    contentLength,
+    firstNonWhitespaceCharacterType: firstType,
+    containsJsonFence: fenced,
+    ...counts,
+    bracesBalanced,
+    bracketsBalanced,
+    appearsToStartWithJson,
+    appearsToEndWithJson,
+    likelyTruncatedJson,
+    parseFailureClassification
+  };
+}
+
 function pickReasoningContent(choice, message) {
   for (const source of [message, choice]) {
     if (!isJsonObject(source)) continue;
@@ -425,7 +542,7 @@ function pickReasoningContent(choice, message) {
   return undefined;
 }
 
-function buildGonkaResponseShapeDiagnostics({ payload, choice, extracted } = {}) {
+function buildGonkaResponseShapeDiagnostics({ payload, choice, extracted, configuredMaxTokens, includeParseDiagnostics = false } = {}) {
   const safeChoice = isJsonObject(choice) ? choice : {};
   const message = isJsonObject(safeChoice.message) ? safeChoice.message : null;
   const content = message ? message.content : undefined;
@@ -435,7 +552,7 @@ function buildGonkaResponseShapeDiagnostics({ payload, choice, extracted } = {})
   const parseShape = contentParseShape(content);
   const candidates = Array.isArray(extracted?.candidates) ? extracted.candidates : [];
 
-  return {
+  const diagnostics = {
     choicesCount: Array.isArray(payload?.choices) ? payload.choices.length : undefined,
     firstChoiceKeys: safeDiagnosticKeys(safeChoice),
     messagePresent: message !== null,
@@ -455,6 +572,13 @@ function buildGonkaResponseShapeDiagnostics({ payload, choice, extracted } = {})
       : candidates.length,
     candidateTopLevelKeys: candidates.map(candidate => candidateTopLevelKey(candidate.value))
   };
+
+  return includeParseDiagnostics
+    ? {
+        ...diagnostics,
+        ...buildParseTruncationDiagnostics({ choice: safeChoice, content, configuredMaxTokens })
+      }
+    : diagnostics;
 }
 
 function sanitizeShapeDiagnostics(value) {
@@ -465,13 +589,25 @@ function sanitizeShapeDiagnostics(value) {
     "reasoningContentLength",
     "toolCallsCount",
     "extractedJsonCandidateCount",
-    "contractCandidateCount"
+    "contractCandidateCount",
+    "configuredMaxTokens",
+    "contentLength",
+    "openingBraceCount",
+    "closingBraceCount",
+    "openingBracketCount",
+    "closingBracketCount"
   ]);
   const booleanFields = new Set([
     "messagePresent",
     "reasoningContentPresent",
     "toolCallsPresent",
-    "functionCallPresent"
+    "functionCallPresent",
+    "containsJsonFence",
+    "bracesBalanced",
+    "bracketsBalanced",
+    "appearsToStartWithJson",
+    "appearsToEndWithJson",
+    "likelyTruncatedJson"
   ]);
   const listFields = new Set([
     "firstChoiceKeys",
@@ -483,7 +619,11 @@ function sanitizeShapeDiagnostics(value) {
   const stringFields = new Set([
     "messageContentType",
     "reasoningContentType",
-    "parsedPayloadType"
+    "parsedPayloadType",
+    "finishReason",
+    "stopReason",
+    "firstNonWhitespaceCharacterType",
+    "parseFailureClassification"
   ]);
 
   for (const [key, diagnosticValue] of Object.entries(value || {})) {
@@ -503,7 +643,10 @@ function sanitizeShapeDiagnostics(value) {
       continue;
     }
     if (stringFields.has(key)) {
-      const text = safeDiagnosticCode(diagnosticValue, "unknown");
+      const fallback = ["messageContentType", "reasoningContentType", "parsedPayloadType"].includes(key)
+        ? "unknown"
+        : "";
+      const text = safeDiagnosticCode(diagnosticValue, fallback);
       if (text) safe[key] = text;
     }
   }
@@ -930,7 +1073,7 @@ class GonkaClient {
             candidateCount: error.candidateCount,
             candidates: [],
             candidateKinds: error.candidateKinds || []
-          } });
+          }, configuredMaxTokens: maxTokens, includeParseDiagnostics: role === "reviewer" });
         }
         throw error;
       }
@@ -948,7 +1091,13 @@ class GonkaClient {
       };
 
       return returnCandidates
-        ? { candidates: extracted, trace, diagnostics: buildGonkaResponseShapeDiagnostics({ payload, choice, extracted }) }
+        ? { candidates: extracted, trace, diagnostics: buildGonkaResponseShapeDiagnostics({
+            payload,
+            choice,
+            extracted,
+            configuredMaxTokens: maxTokens,
+            includeParseDiagnostics: role === "reviewer"
+          }) }
         : { data, trace };
     } catch (error) {
       if (controller.signal.aborted) {

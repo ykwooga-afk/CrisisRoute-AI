@@ -8,15 +8,141 @@ const DEFAULT_MAX_BYTES = 2_500_000;
 const DEFAULT_MAX_REDIRECTS = 3;
 const MAX_ANALYSIS_TEXT = 3_800;
 const ACCEPTED_CONTENT_TYPES = new Set(["text/html", "text/plain", "application/xhtml+xml"]);
+const MAX_DIAGNOSTIC_MESSAGE = 200;
+let lastPublicUrlFailureDiagnostic = null;
 
 class PublicSourceError extends Error {
-  constructor(code, message, { status = 400, retryable = false } = {}) {
+  constructor(code, message, { status = 400, retryable = false, diagnostic } = {}) {
     super(message);
     this.name = "PublicSourceError";
     this.code = code;
     this.status = status;
     this.retryable = retryable === true;
+    this.diagnostic = sanitizeDiagnostic(diagnostic);
   }
+}
+
+function sanitizeDiagnosticText(value, maxLength = MAX_DIAGNOSTIC_MESSAGE) {
+  return String(value || "")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [redacted]")
+    .replace(/\b(?:sk|gk|pk|rk)_[A-Za-z0-9._-]{12,}\b/g, "[redacted-token]")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function sanitizeDiagnosticCode(value, fallback = "") {
+  return sanitizeDiagnosticText(value || fallback, 80).replace(/[^\w:./-]+/g, "_").slice(0, 80);
+}
+
+function sanitizeHostname(value) {
+  return sanitizeDiagnosticText(String(value || "").toLowerCase(), 180)
+    .replace(/[^a-z0-9.:[\]-]+/g, "")
+    .slice(0, 180);
+}
+
+function safeInteger(value) {
+  return Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+function safeBoolean(value) {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function sanitizeAddressClassification(value) {
+  return ["public", "private", "blocked", "unknown"].includes(value) ? value : undefined;
+}
+
+function sanitizeFailureStage(value) {
+  return [
+    "url_validation",
+    "dns_resolution",
+    "ssrf_check",
+    "redirect",
+    "request",
+    "http_status",
+    "content_type",
+    "size_limit",
+    "timeout",
+    "text_extraction",
+    "unknown"
+  ].includes(value) ? value : "unknown";
+}
+
+function sanitizeDiagnostic(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const safe = {
+    hostname: sanitizeHostname(value.hostname),
+    failureStage: sanitizeFailureStage(value.failureStage),
+    failureCode: sanitizeDiagnosticCode(value.failureCode),
+    sanitizedMessage: sanitizeDiagnosticText(value.sanitizedMessage),
+    httpStatus: safeInteger(value.httpStatus),
+    contentType: sanitizeDiagnosticText(value.contentType, 120),
+    redirectCount: safeInteger(value.redirectCount),
+    durationMs: safeInteger(value.durationMs),
+    dnsResolved: safeBoolean(value.dnsResolved),
+    addressClassification: sanitizeAddressClassification(value.addressClassification),
+    timeout: safeBoolean(value.timeout)
+  };
+  for (const key of Object.keys(safe)) {
+    if (safe[key] === undefined || safe[key] === "") delete safe[key];
+  }
+  return safe;
+}
+
+function createDiagnosticContext(rawUrl) {
+  const context = {
+    startedAt: Date.now(),
+    failureStage: "unknown",
+    redirectCount: 0,
+    dnsResolved: false,
+    addressClassification: "unknown",
+    timeout: false
+  };
+  try {
+    context.hostname = new URL(String(rawUrl || "").trim()).hostname;
+  } catch {}
+  return context;
+}
+
+function diagnosticSnapshot(context, values = {}) {
+  const startedAt = Number.isInteger(context?.startedAt) ? context.startedAt : Date.now();
+  return sanitizeDiagnostic({
+    ...context,
+    ...values,
+    durationMs: Date.now() - startedAt
+  });
+}
+
+function attachDiagnostic(error, context, values = {}) {
+  if (!(error instanceof PublicSourceError)) return error;
+  error.diagnostic = sanitizeDiagnostic({
+    ...context,
+    ...error.diagnostic,
+    ...values,
+    failureCode: error.code,
+    sanitizedMessage: values.sanitizedMessage || error.diagnostic?.sanitizedMessage || error.message
+  });
+  return error;
+}
+
+function recordPublicUrlFailureDiagnostic(error) {
+  if (!(error instanceof PublicSourceError)) return;
+  lastPublicUrlFailureDiagnostic = {
+    timestamp: new Date().toISOString(),
+    ...sanitizeDiagnostic({
+      ...error.diagnostic,
+      failureCode: error.code,
+      sanitizedMessage: error.diagnostic?.sanitizedMessage || error.message
+    })
+  };
+}
+
+function getLastPublicUrlFailureDiagnostic() {
+  return lastPublicUrlFailureDiagnostic
+    ? { ...lastPublicUrlFailureDiagnostic }
+    : null;
 }
 
 async function extractPublicSource(rawUrl, {
@@ -25,48 +151,63 @@ async function extractPublicSource(rawUrl, {
   maxRedirects = DEFAULT_MAX_REDIRECTS,
   dnsLookup = dns.promises.lookup
 } = {}) {
-  const originalUrl = parsePublicUrl(rawUrl);
-  const response = await fetchReadableText(originalUrl, {
-    timeoutMs,
-    maxBytes,
-    maxRedirects,
-    dnsLookup
-  });
-  const extracted = extractReadableContent(response.body, response.contentType);
-  if (extracted.text.length < 40) {
-    throw new PublicSourceError(
-      "PUBLIC_URL_EMPTY_TEXT",
-      "This public page did not expose enough readable text. Paste the report text instead.",
-      { status: 422 }
-    );
+  const diagnostics = createDiagnosticContext(rawUrl);
+  try {
+    const originalUrl = parsePublicUrl(rawUrl);
+    diagnostics.hostname = originalUrl.hostname;
+    const response = await fetchReadableText(originalUrl, {
+      timeoutMs,
+      maxBytes,
+      maxRedirects,
+      dnsLookup,
+      diagnostics
+    });
+    const extracted = extractReadableContent(response.body, response.contentType);
+    if (extracted.text.length < 40) {
+      throw new PublicSourceError(
+        "PUBLIC_URL_EMPTY_TEXT",
+        "This public page did not expose enough readable text. Paste the report text instead.",
+        { status: 422, diagnostic: diagnosticSnapshot(diagnostics, { failureStage: "text_extraction" }) }
+      );
+    }
+    const analysisText = buildAnalysisText({
+      originalUrl: originalUrl.toString(),
+      finalUrl: response.finalUrl.toString(),
+      title: extracted.title,
+      text: extracted.text
+    });
+    return {
+      originalUrl: originalUrl.toString(),
+      finalUrl: response.finalUrl.toString(),
+      title: extracted.title,
+      text: extracted.text,
+      analysisText,
+      contentType: response.contentType,
+      bytesRead: response.bytesRead,
+      redirected: originalUrl.toString() !== response.finalUrl.toString()
+    };
+  } catch (error) {
+    throw attachDiagnostic(error, diagnostics);
   }
-  const analysisText = buildAnalysisText({
-    originalUrl: originalUrl.toString(),
-    finalUrl: response.finalUrl.toString(),
-    title: extracted.title,
-    text: extracted.text
-  });
-  return {
-    originalUrl: originalUrl.toString(),
-    finalUrl: response.finalUrl.toString(),
-    title: extracted.title,
-    text: extracted.text,
-    analysisText,
-    contentType: response.contentType,
-    bytesRead: response.bytesRead,
-    redirected: originalUrl.toString() !== response.finalUrl.toString()
-  };
 }
 
 async function fetchReadableText(startUrl, options, redirectCount = 0) {
-  await assertPublicTarget(startUrl, options.dnsLookup);
+  if (options.diagnostics) {
+    options.diagnostics.hostname = startUrl.hostname;
+    options.diagnostics.redirectCount = redirectCount;
+  }
+  await assertPublicTarget(startUrl, options.dnsLookup, options.diagnostics);
   const response = await requestOnce(startUrl, options);
   if (response.redirectUrl) {
     if (redirectCount >= options.maxRedirects) {
       throw new PublicSourceError(
         "PUBLIC_URL_REDIRECT_LIMIT",
         "This public page redirects too many times. Paste the report text instead.",
-        { status: 400 }
+        { status: 400, diagnostic: diagnosticSnapshot(options.diagnostics, {
+          failureStage: "redirect",
+          httpStatus: response.httpStatus,
+          redirectCount
+        }) }
       );
     }
     return fetchReadableText(response.redirectUrl, options, redirectCount + 1);
@@ -74,7 +215,7 @@ async function fetchReadableText(startUrl, options, redirectCount = 0) {
   return response;
 }
 
-function requestOnce(url, { timeoutMs, maxBytes, dnsLookup }) {
+function requestOnce(url, { timeoutMs, maxBytes, dnsLookup, diagnostics }) {
   return new Promise((resolve, reject) => {
     const requestModule = url.protocol === "https:" ? https : http;
     let settled = false;
@@ -92,7 +233,7 @@ function requestOnce(url, { timeoutMs, maxBytes, dnsLookup }) {
         "User-Agent": "CrisisRouteAI-PublicSourceExtractor/1.0"
       },
       lookup(hostname, opts, callback) {
-        safeLookup(hostname, opts, dnsLookup).then(
+        safeLookup(hostname, opts, dnsLookup, diagnostics).then(
           result => callback(null, result.address, result.family),
           error => callback(error)
         );
@@ -102,7 +243,10 @@ function requestOnce(url, { timeoutMs, maxBytes, dnsLookup }) {
       if (response.statusCode >= 300 && response.statusCode < 400 && location) {
         response.resume();
         try {
-          finish(resolve, { redirectUrl: parsePublicUrl(new URL(location, url).toString()) });
+          finish(resolve, {
+            redirectUrl: parsePublicUrl(new URL(location, url).toString()),
+            httpStatus: response.statusCode
+          });
         } catch (error) {
           finish(reject, error);
         }
@@ -110,11 +254,20 @@ function requestOnce(url, { timeoutMs, maxBytes, dnsLookup }) {
       }
 
       if (response.statusCode < 200 || response.statusCode >= 300) {
+        const contentType = normalizeContentType(response.headers["content-type"]);
         response.resume();
         finish(reject, new PublicSourceError(
           "PUBLIC_URL_HTTP_ERROR",
           "This page is not publicly accessible. Paste the report text instead.",
-          { status: response.statusCode >= 400 && response.statusCode <= 499 ? 400 : 502, retryable: response.statusCode >= 500 }
+          {
+            status: response.statusCode >= 400 && response.statusCode <= 499 ? 400 : 502,
+            retryable: response.statusCode >= 500,
+            diagnostic: diagnosticSnapshot(diagnostics, {
+              failureStage: "http_status",
+              httpStatus: response.statusCode,
+              contentType
+            })
+          }
         ));
         return;
       }
@@ -125,7 +278,11 @@ function requestOnce(url, { timeoutMs, maxBytes, dnsLookup }) {
         finish(reject, new PublicSourceError(
           "PUBLIC_URL_UNSUPPORTED_CONTENT_TYPE",
           "This public source is not readable text or HTML. Paste the report text instead.",
-          { status: 415 }
+          { status: 415, diagnostic: diagnosticSnapshot(diagnostics, {
+            failureStage: "content_type",
+            httpStatus: response.statusCode,
+            contentType
+          }) }
         ));
         return;
       }
@@ -136,7 +293,11 @@ function requestOnce(url, { timeoutMs, maxBytes, dnsLookup }) {
         finish(reject, new PublicSourceError(
           "PUBLIC_URL_TOO_LARGE",
           "This public page is too large to process safely. Paste the relevant report text instead.",
-          { status: 413 }
+          { status: 413, diagnostic: diagnosticSnapshot(diagnostics, {
+            failureStage: "size_limit",
+            httpStatus: response.statusCode,
+            contentType
+          }) }
         ));
         return;
       }
@@ -149,7 +310,11 @@ function requestOnce(url, { timeoutMs, maxBytes, dnsLookup }) {
           request.destroy(new PublicSourceError(
             "PUBLIC_URL_TOO_LARGE",
             "This public page is too large to process safely. Paste the relevant report text instead.",
-            { status: 413 }
+            { status: 413, diagnostic: diagnosticSnapshot(diagnostics, {
+              failureStage: "size_limit",
+              httpStatus: response.statusCode,
+              contentType
+            }) }
           ));
           return;
         }
@@ -169,62 +334,112 @@ function requestOnce(url, { timeoutMs, maxBytes, dnsLookup }) {
       request.destroy(new PublicSourceError(
         "PUBLIC_URL_TIMEOUT",
         "This public page took too long to respond. Paste the report text instead.",
-        { status: 504, retryable: true }
+        { status: 504, retryable: true, diagnostic: diagnosticSnapshot(diagnostics, {
+          failureStage: "timeout",
+          timeout: true
+        }) }
       ));
     });
     request.on("error", error => {
       finish(reject, error instanceof PublicSourceError
-        ? error
+        ? attachDiagnostic(error, diagnostics)
         : new PublicSourceError(
           "PUBLIC_URL_FETCH_FAILED",
           "This public page could not be fetched safely. Paste the report text instead.",
-          { status: 502, retryable: true }
+          { status: 502, retryable: true, diagnostic: diagnosticSnapshot(diagnostics, {
+            failureStage: classifyRequestErrorStage(error),
+            sanitizedMessage: sanitizedRequestErrorMessage(error),
+            timeout: false
+          }) }
         ));
     });
     request.end();
   });
 }
 
-async function assertPublicTarget(url, dnsLookup) {
+async function assertPublicTarget(url, dnsLookup, diagnostics) {
   if (!["http:", "https:"].includes(url.protocol)) {
     throw new PublicSourceError(
       "PUBLIC_URL_UNSUPPORTED_PROTOCOL",
       "Only public HTTP and HTTPS pages can be analyzed.",
-      { status: 400 }
+      { status: 400, diagnostic: diagnosticSnapshot(diagnostics, {
+        failureStage: "url_validation",
+        addressClassification: "blocked"
+      }) }
     );
   }
   if (url.username || url.password) {
     throw new PublicSourceError(
       "PUBLIC_URL_CREDENTIALS_BLOCKED",
       "URLs with embedded credentials are not allowed.",
-      { status: 400 }
+      { status: 400, diagnostic: diagnosticSnapshot(diagnostics, {
+        failureStage: "url_validation",
+        addressClassification: "blocked"
+      }) }
     );
   }
   const hostname = url.hostname.toLowerCase();
+  if (diagnostics) diagnostics.hostname = hostname;
   const hostAddress = hostname.replace(/^\[|\]$/g, "");
   if (net.isIP(hostAddress)) {
-    if (isPrivateAddress(hostAddress)) throw privateAddressError();
+    if (isPrivateAddress(hostAddress)) throw privateAddressError(diagnostics);
+    if (diagnostics) {
+      diagnostics.addressClassification = "public";
+      diagnostics.dnsResolved = false;
+    }
     return;
   }
   if (isBlockedHostname(hostname)) {
     throw new PublicSourceError(
       "PUBLIC_URL_PRIVATE_HOST_BLOCKED",
       "Private, local, or internal URLs are blocked. Paste the report text instead.",
-      { status: 400 }
+      { status: 400, diagnostic: diagnosticSnapshot(diagnostics, {
+        failureStage: "ssrf_check",
+        addressClassification: "blocked",
+        dnsResolved: false
+      }) }
     );
   }
-  const addresses = await lookupAll(hostname, dnsLookup);
-  if (!addresses.length || addresses.some(item => isPrivateAddress(item.address))) {
-    throw privateAddressError();
+  let addresses;
+  try {
+    addresses = await lookupAll(hostname, dnsLookup);
+  } catch (error) {
+    throw new PublicSourceError(
+      "PUBLIC_URL_FETCH_FAILED",
+      "This public page could not be fetched safely. Paste the report text instead.",
+      { status: 502, retryable: true, diagnostic: diagnosticSnapshot(diagnostics, {
+        failureStage: "dns_resolution",
+        dnsResolved: false,
+        sanitizedMessage: sanitizedRequestErrorMessage(error)
+      }) }
+    );
   }
+  if (diagnostics) diagnostics.dnsResolved = addresses.length > 0;
+  if (!addresses.length || addresses.some(item => isPrivateAddress(item.address))) {
+    throw privateAddressError(diagnostics);
+  }
+  if (diagnostics) diagnostics.addressClassification = "public";
 }
 
-async function safeLookup(hostname, opts, dnsLookup) {
+async function safeLookup(hostname, opts, dnsLookup, diagnostics) {
   const url = parsePublicUrl(`http://${hostname}`);
-  await assertPublicTarget(url, dnsLookup);
+  await assertPublicTarget(url, dnsLookup, diagnostics);
   const addresses = await lookupAll(hostname, dnsLookup);
   const family = opts?.family === 4 || opts?.family === 6 ? opts.family : null;
   return addresses.find(item => !family || item.family === family) || addresses[0];
+}
+
+function classifyRequestErrorStage(error) {
+  const code = typeof error?.code === "string" ? error.code : "";
+  if (["ENOTFOUND", "EAI_AGAIN", "ETIMEOUT"].includes(code)) return "dns_resolution";
+  if (/CERT|TLS|SSL|PROTO|HANDSHAKE/i.test(code)) return "request";
+  return "request";
+}
+
+function sanitizedRequestErrorMessage(error) {
+  const code = typeof error?.code === "string" ? error.code : "";
+  if (!code) return "Network failure before HTTP response.";
+  return `Network failure before HTTP response: ${sanitizeDiagnosticCode(code)}.`;
 }
 
 async function lookupAll(hostname, dnsLookup) {
@@ -301,11 +516,14 @@ function isPrivateAddress(address) {
   return true;
 }
 
-function privateAddressError() {
+function privateAddressError(diagnostics) {
   return new PublicSourceError(
     "PUBLIC_URL_PRIVATE_ADDRESS_BLOCKED",
     "Private, local, or internal network addresses are blocked. Paste the report text instead.",
-    { status: 400 }
+    { status: 400, diagnostic: diagnosticSnapshot(diagnostics, {
+      failureStage: "ssrf_check",
+      addressClassification: "private"
+    }) }
   );
 }
 
@@ -374,7 +592,9 @@ function trimToAnalysisLimit(value, limit = MAX_ANALYSIS_TEXT) {
 module.exports = {
   PublicSourceError,
   extractPublicSource,
+  getLastPublicUrlFailureDiagnostic,
   parsePublicUrl,
+  recordPublicUrlFailureDiagnostic,
   isPrivateAddress,
   extractReadableContent
 };

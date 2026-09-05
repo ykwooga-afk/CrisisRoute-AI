@@ -55,16 +55,48 @@ test("private, loopback, link-local and metadata addresses are blocked by defaul
   }
   await assert.rejects(
     extractPublicSource("http://127.0.0.1/private"),
-    error => error instanceof PublicSourceError && error.code === "PUBLIC_URL_PRIVATE_ADDRESS_BLOCKED"
+    error => error instanceof PublicSourceError
+      && error.code === "PUBLIC_URL_PRIVATE_ADDRESS_BLOCKED"
+      && error.diagnostic?.failureStage === "ssrf_check"
+      && error.diagnostic?.addressClassification === "private"
   );
   await assert.rejects(
     extractPublicSource("http://localhost/private"),
-    error => error instanceof PublicSourceError && error.code === "PUBLIC_URL_PRIVATE_HOST_BLOCKED"
+    error => error instanceof PublicSourceError
+      && error.code === "PUBLIC_URL_PRIVATE_HOST_BLOCKED"
+      && error.diagnostic?.failureStage === "ssrf_check"
+      && error.diagnostic?.addressClassification === "blocked"
   );
   await assert.rejects(
     extractPublicSource("http://[::1]/private"),
     error => error instanceof PublicSourceError && error.code === "PUBLIC_URL_PRIVATE_ADDRESS_BLOCKED"
   );
+});
+
+test("DNS failures attach safe diagnostic metadata without exposing full URLs", async () => {
+  let caught;
+  try {
+    await extractPublicSource("https://example.test/news?token=do-not-leak", {
+      dnsLookup: async () => {
+        const error = new Error("getaddrinfo ENOTFOUND example.test");
+        error.code = "ENOTFOUND";
+        throw error;
+      }
+    });
+  } catch (error) {
+    caught = error;
+  }
+
+  assert.ok(caught instanceof PublicSourceError);
+  assert.equal(caught.code, "PUBLIC_URL_FETCH_FAILED");
+  assert.equal(caught.diagnostic.hostname, "example.test");
+  assert.equal(caught.diagnostic.failureStage, "dns_resolution");
+  assert.equal(caught.diagnostic.failureCode, "PUBLIC_URL_FETCH_FAILED");
+  assert.equal(caught.diagnostic.dnsResolved, false);
+  assert.equal(caught.diagnostic.addressClassification, "unknown");
+  assert.equal(caught.diagnostic.timeout, false);
+  assert.match(caught.diagnostic.sanitizedMessage, /ENOTFOUND/);
+  assert.doesNotMatch(JSON.stringify(caught.diagnostic), /do-not-leak|\/news/i);
 });
 
 test("readable HTML extraction strips active chrome and preserves useful article text", () => {
@@ -165,6 +197,85 @@ test("Public URL API returns a safe public extraction error without analyzing", 
   assert.equal(body.error.code, "PUBLIC_URL_UNSUPPORTED_CONTENT_TYPE");
   assert.equal(body.error.retryable, false);
   assert.equal(analyzeCalls, 0);
+});
+
+test("Public URL diagnostic endpoint exposes only sanitized latest failure metadata", async t => {
+  const allowedKeys = new Set([
+    "timestamp",
+    "hostname",
+    "failureStage",
+    "failureCode",
+    "sanitizedMessage",
+    "httpStatus",
+    "contentType",
+    "redirectCount",
+    "durationMs",
+    "dnsResolved",
+    "addressClassification",
+    "timeout"
+  ]);
+  const app = createServer({
+    env: { NODE_ENV: "development" },
+    publicSourceExtractor: async () => {
+      throw new PublicSourceError(
+        "PUBLIC_URL_FETCH_FAILED",
+        "This public page could not be fetched safely. Paste the report text instead.",
+        {
+          status: 502,
+          retryable: true,
+          diagnostic: {
+            hostname: "en.wikipedia.org",
+            failureStage: "request",
+            sanitizedMessage: "Network failure before HTTP response: ECONNRESET.",
+            httpStatus: 502,
+            contentType: "text/html; charset=utf-8",
+            redirectCount: 1,
+            durationMs: 1234,
+            dnsResolved: true,
+            addressClassification: "public",
+            timeout: false
+          }
+        }
+      );
+    },
+    analyzeIncidentsFn: async () => {
+      throw new Error("should not analyze");
+    },
+    ...safeServices()
+  });
+  const baseUrl = await startServer(t, app);
+  const response = await postPublicUrl(baseUrl, "https://en.wikipedia.org/wiki/Haze?private=do-not-leak");
+  const publicBody = await response.json();
+
+  assert.equal(response.status, 502);
+  assert.equal(publicBody.error.code, "PUBLIC_URL_FETCH_FAILED");
+  assert.equal(publicBody.error.retryable, true);
+  assert.equal(publicBody.error.diagnostic, undefined);
+  assert.equal(publicBody.diagnostic, undefined);
+
+  const diagnosticResponse = await fetch(`${baseUrl}/api/diagnostics/last-public-url-failure`);
+  const diagnosticBody = await diagnosticResponse.json();
+  const diagnostic = diagnosticBody.diagnostic;
+
+  assert.equal(diagnosticResponse.status, 200);
+  assert.equal(diagnosticBody.ok, true);
+  assert.match(diagnostic.timestamp, /^\d{4}-\d{2}-\d{2}T/);
+  for (const key of Object.keys(diagnostic)) {
+    assert.equal(allowedKeys.has(key), true, `unexpected diagnostic key: ${key}`);
+  }
+  assert.equal(diagnostic.hostname, "en.wikipedia.org");
+  assert.equal(diagnostic.failureStage, "request");
+  assert.equal(diagnostic.failureCode, "PUBLIC_URL_FETCH_FAILED");
+  assert.equal(diagnostic.sanitizedMessage, "Network failure before HTTP response: ECONNRESET.");
+  assert.equal(diagnostic.httpStatus, 502);
+  assert.equal(diagnostic.contentType, "text/html; charset=utf-8");
+  assert.equal(diagnostic.redirectCount, 1);
+  assert.equal(diagnostic.durationMs, 1234);
+  assert.equal(diagnostic.dnsResolved, true);
+  assert.equal(diagnostic.addressClassification, "public");
+  assert.equal(diagnostic.timeout, false);
+  assert.doesNotMatch(JSON.stringify(publicBody), /do-not-leak|wiki\/Haze|ECONNRESET/i);
+  assert.doesNotMatch(JSON.stringify(diagnosticBody), /do-not-leak|wiki\/Haze/i);
 });
 
 test("Production disabled Live blocks Public URL extraction before fetch or model calls", async t => {

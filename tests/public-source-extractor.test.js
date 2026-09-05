@@ -165,19 +165,29 @@ test("validated public DNS results are handed to HTTPS lookup in Node-compatible
   });
   assert.equal(result.finalUrl, "https://example.test/report");
   assert.match(result.text, /readable crisis report text/);
+  assert.match(result.analysisText, /Public source URL: https:\/\/example\.test\/report/);
+  assert.match(result.analysisText, /Source hostname: example\.test/);
+  assert.match(result.analysisText, /Page title: Public weather report/);
+  assert.match(result.analysisText, /Extracted main content:/);
 });
 
-test("readable HTML extraction strips active chrome and preserves useful article text", () => {
+test("readable HTML extraction prefers article content and removes surrounding page chrome", () => {
   const html = `
     <html>
-      <head><title>Campus haze alert</title><style>.x{}</style></head>
+      <head><title>Campus haze alert</title><style>.x{color:red}</style></head>
       <body>
-        <nav>Home Login Cookie banner</nav>
+        <header>Donate Create account Log in</header>
+        <nav>Jump to content Main page Contents Languages</nav>
         <main>
-          <h1>Campus haze alert</h1>
-          <p>Students near Shah Alam report smoke exposure and breathing difficulty.</p>
-          <p>Volunteers should verify location before any dispatch.</p>
+          <div class="vector-menu">Read Edit View history Tools</div>
+          <article>
+            <h1>Campus haze alert</h1>
+            <p>Students near Shah Alam report smoke exposure and breathing difficulty.</p>
+            <p>Volunteers should verify location before any dispatch.</p>
+          </article>
+          <aside>Language selector Donate Footer links</aside>
         </main>
+        <footer>Privacy policy Developers Statistics Cookie statement</footer>
         <script>window.secret = "do not keep";</script>
       </body>
     </html>
@@ -186,7 +196,34 @@ test("readable HTML extraction strips active chrome and preserves useful article
   assert.equal(result.title, "Campus haze alert");
   assert.match(result.text, /Students near Shah Alam report smoke exposure/);
   assert.match(result.text, /verify location before any dispatch/);
-  assert.doesNotMatch(result.text, /window\.secret|Cookie banner/);
+  assert.doesNotMatch(
+    result.text,
+    /window\.secret|Jump to content|Main page|Donate|Create account|View history|Language selector|Privacy policy|Cookie statement/i
+  );
+});
+
+test("readable HTML extraction falls back to cleaned body text without semantic article markup", () => {
+  const html = `
+    <html>
+      <head><title>Community flood update</title></head>
+      <body>
+        <div class="top-nav">Home Donate Account Login</div>
+        <section>
+          <h1>Community flood update</h1>
+          <p>Residents report water entering three homes near the riverside market.</p>
+          <p>The local coordinator requested verification of affected households.</p>
+        </section>
+        <style>.hidden{display:none}</style>
+        <script>window.analyticsToken = "not article text";</script>
+        <footer>Footer links Privacy policy</footer>
+      </body>
+    </html>
+  `;
+  const result = extractReadableContent(html, "text/html");
+  assert.equal(result.title, "Community flood update");
+  assert.match(result.text, /Residents report water entering three homes/);
+  assert.match(result.text, /verification of affected households/);
+  assert.doesNotMatch(result.text, /analyticsToken|Donate|Account Login|Footer links|Privacy policy/i);
 });
 
 test("Public URL API sends extracted text into the existing analyze pipeline and decorates source metadata", async t => {
@@ -199,7 +236,7 @@ test("Public URL API sends extracted text into the existing analyze pipeline and
       finalUrl: "https://news.example/haze-alert",
       title: "Campus haze alert",
       text: "Students near Shah Alam report smoke exposure and breathing difficulty.",
-      analysisText: "Public source URL: https://news.example/haze-alert\nExtracted public page text:\nStudents near Shah Alam report smoke exposure.",
+      analysisText: "Public source URL: https://news.example/haze-alert\nPage title: Campus haze alert\nSource hostname: news.example\nExtracted main content:\nStudents near Shah Alam report smoke exposure.",
       contentType: "text/html",
       bytesRead: 512,
       redirected: false
@@ -232,7 +269,7 @@ test("Public URL API sends extracted text into the existing analyze pipeline and
 
   assert.equal(response.status, 200);
   assert.deepEqual(capturedPayload.messages, [
-    "Public source URL: https://news.example/haze-alert\nExtracted public page text:\nStudents near Shah Alam report smoke exposure."
+    "Public source URL: https://news.example/haze-alert\nPage title: Campus haze alert\nSource hostname: news.example\nExtracted main content:\nStudents near Shah Alam report smoke exposure."
   ]);
   assert.equal(body.meta.publicSource.finalUrl, "https://news.example/haze-alert");
   assert.equal(body.incidents[0].source, "Public URL: news.example");

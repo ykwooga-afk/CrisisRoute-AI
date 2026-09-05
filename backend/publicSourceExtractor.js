@@ -9,6 +9,63 @@ const DEFAULT_MAX_REDIRECTS = 3;
 const MAX_ANALYSIS_TEXT = 3_800;
 const ACCEPTED_CONTENT_TYPES = new Set(["text/html", "text/plain", "application/xhtml+xml"]);
 const MAX_DIAGNOSTIC_MESSAGE = 200;
+const PRIMARY_CONTENT_ATTR_PATTERN = /\b(?:main|article|content|bodycontent|mw-body-content|mw-content-text|mw-parser-output|entry-content|post-content|article-body|story-body|report-body|page-content)\b/i;
+const BOILERPLATE_ATTR_PATTERN = /\b(?:nav|navigation|navbar|menu|footer|header|sidebar|aside|toc|table-of-contents|language|languages|interlanguage|account|login|logout|signup|personal-tools|user-links|toolbox|tools|toolbar|editsection|history|breadcrumb|pagination|cookie|subscribe|social|share|advert|ads|promo|search|skip-link|jump-link|mw-jump|mw-panel|mw-head|vector-menu|sitenotice|catlinks|printfooter|metadata|navbox|infobox)\b/i;
+const BOILERPLATE_LINE_EXACT = new Set([
+  "jump to content",
+  "jump to navigation",
+  "main page",
+  "contents",
+  "current events",
+  "random article",
+  "about wikipedia",
+  "contact us",
+  "donate",
+  "create account",
+  "log in",
+  "pages for logged out editors",
+  "learn more",
+  "contributions",
+  "talk",
+  "article",
+  "read",
+  "edit",
+  "view history",
+  "view source",
+  "tools",
+  "appearance",
+  "hide",
+  "languages",
+  "add links",
+  "download as pdf",
+  "printable version",
+  "permanent link",
+  "page information",
+  "cite this page",
+  "get shortened url",
+  "download qr code",
+  "wikidata item",
+  "privacy policy",
+  "disclaimers",
+  "code of conduct",
+  "developers",
+  "statistics",
+  "cookie statement",
+  "mobile view"
+]);
+const BOILERPLATE_LINE_PATTERNS = [
+  /^skip to /i,
+  /^jump to /i,
+  /^toggle (?:the )?(?:table of )?contents/i,
+  /^hide contents$/i,
+  /^move to sidebar$/i,
+  /^personal tools$/i,
+  /^print\/export$/i,
+  /^in other projects$/i,
+  /^in other languages$/i,
+  /^this page was last edited/i,
+  /^text is available under/i
+];
 let lastPublicUrlFailureDiagnostic = null;
 
 class PublicSourceError extends Error {
@@ -563,16 +620,184 @@ function extractReadableContent(body, contentType) {
   if (contentType === "text/plain") {
     return { title: "", text: trimToAnalysisLimit(normalizeWhitespace(body)) };
   }
-  const title = decodeEntities((body.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "").trim());
-  const structural = body
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
-    .replace(/<svg[\s\S]*?<\/svg>/gi, " ")
-    .replace(/<(?:nav|footer|header|form|button|aside)[\s\S]*?<\/(?:nav|footer|header|form|button|aside)>/gi, " ")
-    .replace(/<\/(?:h1|h2|h3|p|li|article|section|main|div)>/gi, "\n");
-  const text = trimToAnalysisLimit(normalizeWhitespace(decodeEntities(stripTags(structural))));
-  return { title: trimToAnalysisLimit(normalizeWhitespace(title), 220), text };
+  const html = String(body || "");
+  const title = extractTitle(html);
+  const fallbackText = htmlToReadableText(html);
+  const primaryText = choosePrimaryContent(html) || fallbackText;
+  return { title, text: trimToAnalysisLimit(primaryText || fallbackText) };
+}
+
+function extractTitle(html) {
+  const rawTitle = String(html || "").match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "";
+  return trimToAnalysisLimit(normalizeWhitespace(decodeEntities(stripTags(rawTitle))), 220);
+}
+
+function choosePrimaryContent(html) {
+  const candidates = collectPrimaryContentCandidates(String(html || ""))
+    .map(candidate => ({
+      ...candidate,
+      text: htmlToReadableText(candidate.html)
+    }))
+    .filter(candidate => candidate.text.length >= 80);
+  if (!candidates.length) return "";
+  candidates.sort((a, b) => readableCandidateScore(b) - readableCandidateScore(a));
+  return candidates[0].text;
+}
+
+function collectPrimaryContentCandidates(html) {
+  const candidates = [];
+  const seen = new Set();
+  const pushCandidates = (blocks, priority) => {
+    for (const block of blocks) {
+      const key = `${block.start}:${block.end}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({ ...block, priority });
+    }
+  };
+
+  pushCandidates(collectElementBlocks(html, "article"), 40);
+  pushCandidates(collectElementBlocks(html, "main"), 35);
+  for (const tag of ["div", "section"]) {
+    pushCandidates(collectElementBlocks(html, tag, attrs => /\brole\s*=\s*(?:"main"|'main'|main)\b/i.test(attrs)), 32);
+  }
+  for (const tag of ["article", "main", "div", "section"]) {
+    pushCandidates(collectElementBlocks(html, tag, attrs => PRIMARY_CONTENT_ATTR_PATTERN.test(attrs)), 25);
+  }
+
+  return candidates;
+}
+
+function readableCandidateScore(candidate) {
+  const text = candidate.text || "";
+  const sentenceCount = (text.match(/[.!?](?:\s|$)/g) || []).length;
+  const boilerplateHits = BOILERPLATE_LINE_PATTERNS
+    .filter(pattern => pattern.test(text))
+    .length;
+  return (candidate.priority || 0) * 500 +
+    Math.min(text.length, MAX_ANALYSIS_TEXT) +
+    sentenceCount * 40 -
+    boilerplateHits * 200;
+}
+
+function htmlToReadableText(html) {
+  const structural = cleanHtmlFragment(html)
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "\n")
+    .replace(/<\/(?:h1|h2|h3|h4|h5|h6|p|li|article|section|main|div|tr|td|th|blockquote)>/gi, "\n");
+  return filterBoilerplateText(normalizeWhitespace(decodeEntities(stripTags(structural))));
+}
+
+function cleanHtmlFragment(html) {
+  let cleaned = String(html || "")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, " ")
+    .replace(/<(?:script|style|noscript|svg|template|iframe|object|embed)[\s\S]*?<\/(?:script|style|noscript|svg|template|iframe|object|embed)>/gi, " ")
+    .replace(/<(?:nav|footer|header|form|button|aside|dialog|select|textarea)[\s\S]*?<\/(?:nav|footer|header|form|button|aside|dialog|select|textarea)>/gi, " ")
+    .replace(/<(?:input|meta|link|base)[^>]*>/gi, " ");
+
+  cleaned = removeMatchingElementBlocks(
+    cleaned,
+    ["div", "section", "ul", "ol", "li", "table", "sup"],
+    attrs => BOILERPLATE_ATTR_PATTERN.test(attrs)
+  );
+
+  return cleaned;
+}
+
+function filterBoilerplateText(text) {
+  const seen = new Map();
+  const lines = String(text || "")
+    .split(/\n+/)
+    .map(line => line.trim())
+    .filter(line => {
+      if (isBoilerplateLine(line)) return false;
+      const key = line.toLowerCase();
+      const count = seen.get(key) || 0;
+      seen.set(key, count + 1);
+      return count < 2;
+    });
+  return normalizeWhitespace(lines.join("\n"));
+}
+
+function isBoilerplateLine(line) {
+  const normalized = String(line || "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (!normalized) return true;
+  if (normalized.length <= 2 && !/\d/.test(normalized)) return true;
+  if (BOILERPLATE_LINE_EXACT.has(normalized)) return true;
+  if (BOILERPLATE_LINE_PATTERNS.some(pattern => pattern.test(normalized))) return true;
+  return normalized.length <= 80 && /^(?:navigation|menu|search|account|login|language selector|edit links|footer links)$/i.test(normalized);
+}
+
+function removeMatchingElementBlocks(html, tags, predicate) {
+  const removals = [];
+  for (const tag of tags) {
+    for (const block of collectElementBlocks(html, tag, predicate)) {
+      removals.push({ start: block.start, end: block.end });
+    }
+  }
+  return applyRemovals(html, removals);
+}
+
+function collectElementBlocks(html, tag, predicate = () => true) {
+  const source = String(html || "");
+  const blocks = [];
+  const openingPattern = new RegExp(`<${tag}\\b[^>]*>`, "gi");
+  let match;
+  while ((match = openingPattern.exec(source))) {
+    const openingTag = match[0];
+    const attrs = openingTagAttributes(openingTag, tag);
+    if (!predicate(attrs, openingTag)) continue;
+    const close = findMatchingClose(source, tag, openingPattern.lastIndex);
+    if (!close) continue;
+    blocks.push({
+      start: match.index,
+      end: close.end,
+      html: source.slice(match.index, close.end),
+      attrs
+    });
+  }
+  return blocks;
+}
+
+function findMatchingClose(source, tag, fromIndex) {
+  const tokenPattern = new RegExp(`<\\/?${tag}\\b[^>]*>`, "gi");
+  tokenPattern.lastIndex = fromIndex;
+  let depth = 1;
+  let match;
+  while ((match = tokenPattern.exec(source))) {
+    const token = match[0];
+    if (/^<\//.test(token)) depth -= 1;
+    else if (!/\/\s*>$/.test(token)) depth += 1;
+    if (depth === 0) return { start: match.index, end: tokenPattern.lastIndex };
+  }
+  return null;
+}
+
+function openingTagAttributes(openingTag, tag) {
+  return String(openingTag || "")
+    .replace(new RegExp(`^<\\s*${tag}\\b`, "i"), "")
+    .replace(/\/?>\s*$/i, "");
+}
+
+function applyRemovals(source, removals) {
+  if (!removals.length) return source;
+  const merged = [];
+  for (const removal of removals.sort((a, b) => a.start - b.start)) {
+    const last = merged[merged.length - 1];
+    if (last && removal.start <= last.end) {
+      last.end = Math.max(last.end, removal.end);
+    } else {
+      merged.push({ ...removal });
+    }
+  }
+  let output = "";
+  let index = 0;
+  for (const removal of merged) {
+    output += source.slice(index, removal.start) + " ";
+    index = removal.end;
+  }
+  return output + source.slice(index);
 }
 
 function stripTags(value) {
@@ -586,7 +811,15 @@ function decodeEntities(value) {
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
     .replace(/&quot;/gi, "\"")
-    .replace(/&#39;/gi, "'");
+    .replace(/&#39;/gi, "'")
+    .replace(/&#(\d{1,7});/g, (_, code) => {
+      const point = Number(code);
+      return Number.isInteger(point) && point > 0 && point <= 0x10ffff ? String.fromCodePoint(point) : " ";
+    })
+    .replace(/&#x([0-9a-f]{1,6});/gi, (_, code) => {
+      const point = Number.parseInt(code, 16);
+      return Number.isInteger(point) && point > 0 && point <= 0x10ffff ? String.fromCodePoint(point) : " ";
+    });
 }
 
 function normalizeWhitespace(value) {
@@ -599,11 +832,16 @@ function normalizeWhitespace(value) {
 }
 
 function buildAnalysisText({ originalUrl, finalUrl, title, text }) {
+  let sourceHostname = "";
+  try {
+    sourceHostname = new URL(finalUrl).hostname;
+  } catch {}
   const prefix = [
     `Public source URL: ${finalUrl}`,
     originalUrl !== finalUrl ? `Original submitted URL: ${originalUrl}` : "",
     title ? `Page title: ${title}` : "",
-    "Extracted public page text:"
+    sourceHostname ? `Source hostname: ${sourceHostname}` : "",
+    "Extracted main content:"
   ].filter(Boolean).join("\n");
   const available = Math.max(600, MAX_ANALYSIS_TEXT - prefix.length - 2);
   return `${prefix}\n${trimToAnalysisLimit(text, available)}`.slice(0, MAX_ANALYSIS_TEXT);

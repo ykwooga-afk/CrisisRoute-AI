@@ -13,7 +13,7 @@
 
 For one complete five-case Analyze, the pipeline starts exactly two requests in parallel. The Analyst and Reviewer receive the same original evidence. The Reviewer request is constructed before either result returns and contains no Analyst output, response ID, score, or rationale. There is no automatic retry.
 
-The configured role timeouts are enforced independently by the Node client: CASE 01 allows 45 seconds per role; the five-case batch allows 45 seconds for the Analyst and 60 seconds for the Reviewer. The generic client default remains 20 seconds when a pipeline does not provide an override. A timeout, network failure, HTTP failure, or invalid structured response fails safely and preserves the allowlisted failed role when known. Live inference remains dependent on GonkaRouter and upstream model availability.
+The configured role timeouts are enforced independently by the Node client: CASE 01 allows 90 seconds per role; the five-case batch allows 90 seconds for the Analyst and 60 seconds for the Reviewer. The generic client default remains 20 seconds when a pipeline does not provide an override. A timeout, network failure, HTTP failure, or invalid structured response fails safely and preserves the allowlisted failed role when known. Live inference remains dependent on GonkaRouter and upstream model availability.
 
 ## Structured Contracts
 

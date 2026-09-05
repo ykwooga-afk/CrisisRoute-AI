@@ -261,7 +261,7 @@ test("CASE 01 passes role-specific bounded request settings", async () => {
   const analystCall = client.calls.find(call => call.model === DEFAULT_MODELS.analyst);
   const reviewerCall = client.calls.find(call => call.model === DEFAULT_MODELS.reviewer);
 
-  assert.equal(ANALYST_TIMEOUT_MS, 45_000);
+  assert.equal(ANALYST_TIMEOUT_MS, 90_000);
   assert.equal(SINGLE_CASE_ANALYST_TIMEOUT_MS, 90_000);
   assert.equal(REVIEWER_TIMEOUT_MS, 90_000);
   assert.equal(analystCall.timeoutMs, 90_000);

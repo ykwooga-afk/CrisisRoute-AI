@@ -3,7 +3,7 @@
 CrisisRoute AI turns unverified crisis reports into evidence-backed, multi-model-reviewed, human-approved action.
 
 - Live Demo: [https://crisisroute-ai.onrender.com/](https://crisisroute-ai.onrender.com/)
-- 2-Minute Demo Video: [https://youtu.be/WN-6PgRrbKs](https://youtu.be/WN-6PgRrbKs)
+- 2-Minute Demo Video: [(https://youtu.be/6gbRJ5ldPRM)]
 - Track: Gonka Router / AI for Society
 
 CrisisRoute AI is not an emergency service, not an autonomous dispatcher, and not a generic chatbot. It is crisis-triage decision support: uncertainty stays visible, AI assists, and humans decide.

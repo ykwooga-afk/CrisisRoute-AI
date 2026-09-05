@@ -16,7 +16,7 @@ const {
 const ANALYST_PROMPT_VERSION = "analyst-v1.1-minimal";
 const REVIEWER_PROMPT_VERSION = "reviewer-v1.1-minimal";
 const ANALYST_TIMEOUT_MS = 45_000;
-const REVIEWER_TIMEOUT_MS = 45_000;
+const REVIEWER_TIMEOUT_MS = 90_000;
 const CASE_01_SCENARIO = SCENARIO_ID;
 const MAX_MESSAGE_LENGTH = 4_000;
 const ANALYST_BATCH_PROMPT_VERSION = "analyst-batch-v1.0";

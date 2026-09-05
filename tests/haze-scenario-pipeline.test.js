@@ -598,6 +598,8 @@ test("Reviewer prompt remains a low-output-burden scores-only contract", () => {
 
 test("B7-R1 uses bounded role and local smoke timeouts", () => {
   assert.equal(ANALYST_TIMEOUT_MS, 45_000);
+  assert.equal(ANALYST_BATCH_MAX_TOKENS, 1_100);
+  assert.equal(REVIEWER_BATCH_MAX_TOKENS, 1_200);
   assert.equal(BATCH_REVIEWER_TIMEOUT_MS, 60_000);
   assert.equal(LOCAL_SCENARIO_TIMEOUT_MS, 75_000);
 });

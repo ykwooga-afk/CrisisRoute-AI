@@ -265,7 +265,7 @@ test("CASE 01 passes role-specific bounded request settings", async () => {
   assert.equal(analystCall.timeoutMs, 45_000);
   assert.equal(reviewerCall.timeoutMs, 45_000);
   assert.equal(analystCall.maxTokens, 600);
-  assert.equal(reviewerCall.maxTokens, 500);
+  assert.equal(reviewerCall.maxTokens, 1_200);
   assert.match(analystCall.messages[0].content, /knownFacts<=3.*unknownFacts<=3.*riskFlags<=3/s);
   assert.match(reviewerCall.messages[0].content, /counterEvidence<=3.*unknowns<=3/s);
   for (const call of [analystCall, reviewerCall]) {

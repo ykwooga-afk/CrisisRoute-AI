@@ -431,8 +431,8 @@ test("temporary Gonka diagnostic classifies length-limited unbalanced Reviewer o
   assert.equal(diagnostic.sanitizedErrorCode, "INVALID_JSON");
   assert.equal(diagnostic.finishReason, "length");
   assert.equal(diagnostic.stopReason, "max_tokens");
-  assert.equal(diagnostic.configuredMaxTokens, 500);
-  assert.equal(reviewerRequest.max_tokens, 500);
+  assert.equal(diagnostic.configuredMaxTokens, 1_200);
+  assert.equal(reviewerRequest.max_tokens, 1_200);
   assert.equal(diagnostic.contentLength, reviewerContent.length);
   assert.equal(diagnostic.firstNonWhitespaceCharacterType, "object_open");
   assert.equal(diagnostic.containsJsonFence, false);
@@ -466,7 +466,7 @@ test("temporary Gonka diagnostic classifies normal-stop non-JSON Reviewer prose 
   assert.equal(diagnostic.sanitizedErrorCode, "INVALID_JSON");
   assert.equal(diagnostic.finishReason, "stop");
   assert.equal(diagnostic.stopReason, "stop");
-  assert.equal(diagnostic.configuredMaxTokens, 500);
+  assert.equal(diagnostic.configuredMaxTokens, 1_200);
   assert.equal(diagnostic.contentLength, reviewerContent.length);
   assert.equal(diagnostic.firstNonWhitespaceCharacterType, "other");
   assert.equal(diagnostic.containsJsonFence, false);
@@ -507,7 +507,7 @@ test("temporary Gonka diagnostic does not classify balanced valid Reviewer JSON 
   assert.equal(diagnostic.failureStage, "parse");
   assert.equal(diagnostic.sanitizedErrorCode, "INVALID_MODEL_DATA");
   assert.equal(diagnostic.finishReason, "stop");
-  assert.equal(diagnostic.configuredMaxTokens, 500);
+  assert.equal(diagnostic.configuredMaxTokens, 1_200);
   assert.equal(diagnostic.contentLength, reviewerContent.length);
   assert.equal(diagnostic.firstNonWhitespaceCharacterType, "object_open");
   assert.equal(diagnostic.containsJsonFence, false);

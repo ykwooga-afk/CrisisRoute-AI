@@ -22,7 +22,7 @@ const MAX_MESSAGE_LENGTH = 4_000;
 const ANALYST_BATCH_PROMPT_VERSION = "analyst-batch-v1.0";
 const REVIEWER_BATCH_PROMPT_VERSION = "reviewer-batch-v1.1-minimal-scores";
 const ANALYST_BATCH_MAX_TOKENS = 1_100;
-const REVIEWER_BATCH_MAX_TOKENS = 500;
+const REVIEWER_BATCH_MAX_TOKENS = 1_200;
 const BATCH_REVIEWER_TIMEOUT_MS = 60_000;
 
 const SCORE_AXES = ["verification", "urgency", "actionability"];
@@ -1498,7 +1498,7 @@ async function analyzeCase01({ payload, client, now = new Date() }) {
       { role: "user", content: evidencePrompt }
     ],
     temperature: 0,
-    maxTokens: 500,
+    maxTokens: 1_200,
     timeoutMs: REVIEWER_TIMEOUT_MS,
     returnCandidates: true,
     diagnosticRole: "reviewer"

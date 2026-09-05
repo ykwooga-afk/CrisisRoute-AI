@@ -301,20 +301,6 @@ blockquote {
   white-space: nowrap;
 }
 
-.brand-area > span:last-child {
-  margin-left: 13px;
-  border-left: 1px solid rgba(155, 231, 189, 0.24);
-  padding-left: 23px;
-  overflow: hidden;
-  color: rgba(155, 231, 189, 0.70);
-  font-size: 13px;
-  font-weight: 800;
-  letter-spacing: 0.20em;
-  text-overflow: ellipsis;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-
 .mode-area {
   gap: 10px;
   justify-content: flex-end;
@@ -3691,16 +3677,6 @@ blockquote {
     padding-left: 18px;
   }
 
-  .brand-area {
-    flex-wrap: wrap;
-  }
-
-  .brand-area > span:last-child {
-    width: 100%;
-    margin-left: 42px;
-    font-size: 11px;
-  }
-
   .status-line,
   .workflow-rail {
     gap: 10px;
@@ -5411,10 +5387,6 @@ blockquote {
 }
 
 @media (max-width: 1024px) {
-  .brand-area > span:last-child {
-    max-width: 240px;
-  }
-
   .mode-area {
     flex-wrap: wrap;
   }

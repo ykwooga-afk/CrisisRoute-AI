@@ -203,7 +203,51 @@ test("HOLD_FOR_REVIEW brief keeps public instructions unresolved", () => {
   record(value);
   const result = value.service.generateBrief(value.caseId);
   assert.match(result.brief.summary, /No definitive public instruction is authorized/i);
-  assert.ok(result.brief.safetyConstraints.some(item => /Conflict gate: review/.test(item)));
+  assert.ok(result.brief.safetyConstraints.some(item => /Model conflict requires human review/.test(item)));
+  assert.ok(!result.brief.safetyConstraints.some(item => /Conflict gate: passed/.test(item)));
+});
+
+test("HOLD_FOR_REVIEW conflict constraints follow actual gate and consensus semantics", () => {
+  const disagreement = setup({
+    incidentValue: incident({
+      caseId: "CR-LIVE-CASE-04",
+      operationalState: "NEEDS_HUMAN_REVIEW",
+      consensus: "DISAGREEMENT",
+      conflictStatus: "review"
+    }),
+    action: "HOLD_FOR_REVIEW",
+    reason: "Human reviewed the unresolved conflict.",
+    acknowledgeReview: true
+  });
+  record(disagreement);
+  const disagreementBrief = disagreement.service.generateBrief(disagreement.caseId).brief;
+  assert.ok(!disagreementBrief.safetyConstraints.some(item => item === "Conflict gate: passed"));
+  assert.ok(disagreementBrief.safetyConstraints.some(item => item === "Model conflict requires human review."));
+
+  const passed = setup({
+    incidentValue: incident({ caseId: "CR-LIVE-CASE-01", consensus: "AGREEMENT", conflictStatus: "passed" }),
+    action: "HOLD_FOR_REVIEW",
+    acknowledgeReview: true
+  });
+  record(passed);
+  const passedBrief = passed.service.generateBrief(passed.caseId).brief;
+  assert.ok(passedBrief.safetyConstraints.some(item => item === "Conflict gate: passed"));
+
+  const critical = setup({
+    incidentValue: incident({
+      caseId: "CR-LIVE-AABBCCDDEE",
+      operationalState: "NEEDS_HUMAN_REVIEW",
+      consensus: "CRITICAL_CONFLICT",
+      conflictStatus: "blocked"
+    }),
+    action: "HOLD_FOR_REVIEW",
+    reason: "Critical conflict requires review.",
+    acknowledgeReview: true
+  });
+  record(critical);
+  const criticalBrief = critical.service.generateBrief(critical.caseId).brief;
+  assert.ok(!criticalBrief.safetyConstraints.some(item => item === "Conflict gate: passed"));
+  assert.ok(criticalBrief.safetyConstraints.some(item => item === "Model conflict blocks dispatch approval."));
 });
 
 test("QUEUE_ACTION brief distinguishes planning from delivery", () => {

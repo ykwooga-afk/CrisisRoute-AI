@@ -63,6 +63,22 @@ function formatGate(snapshot, gateId, label) {
   return `${label}: ${status}`;
 }
 
+function formatConflictGate(snapshot) {
+  const gate = snapshot.safetyGates.find(item => item.id === "G_CONFLICT");
+  const status = String(gate?.status || "").toLowerCase();
+  const consensus = String(snapshot.consensus || "").toUpperCase();
+  if (gate?.passed === true && status === "passed" && consensus !== "DISAGREEMENT" && consensus !== "CRITICAL_CONFLICT") {
+    return "Conflict gate: passed";
+  }
+  if (status === "blocked" || consensus === "CRITICAL_CONFLICT") {
+    return "Model conflict blocks dispatch approval.";
+  }
+  if (status === "review" || status === "review_required" || consensus === "DISAGREEMENT") {
+    return "Model conflict requires human review.";
+  }
+  return `Conflict gate: ${status || "not_available"}`;
+}
+
 function isReferenceSnapshot(snapshot) {
   return snapshot?.inputClassification?.activeIncident === false;
 }
@@ -133,7 +149,7 @@ function actionContent(snapshot, decision) {
       title: "Human review hold",
       summary: "A human review hold was recorded. No definitive public instruction is authorized by this brief.",
       safetyConstraints: [
-        formatGate(snapshot, "G_CONFLICT", "Conflict gate"),
+        formatConflictGate(snapshot),
         `Human reason recorded: ${decision.reason || "No additional reason supplied"}`,
         "Resolve material conflicts before any definitive public instruction.",
         baseConstraint

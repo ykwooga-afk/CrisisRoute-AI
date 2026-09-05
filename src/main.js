@@ -865,7 +865,6 @@ function renderTopNavigation() {
         <div class="brand-area">
           <img class="brand-logo" src="src/assets/crisisroute-logo.png" alt="" aria-hidden="true" />
           <strong>CrisisRoute AI</strong>
-          <span>Malaysia Haze Response</span>
         </div>
         <div class="mode-area">
           <div class="mode-switch" aria-label="Mode selector">
